@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlyBrain · Live Connectome — FlyWire v783</title>
+<meta name="description" content="A fruit-fly brain, running live, turning a room temperature reading into a light colour.">
+<link rel="stylesheet" href="/app.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three/three.module.js",
+    "three/addons/controls/OrbitControls.js": "/vendor/three/OrbitControls.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<!-- ===================================================== 3D stage ======= -->
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <div id="vignette"></div>
+</div>
+
+<!-- ==================================================== header ========== -->
+<header id="topbar">
+  <div class="brand">
+    <div class="glyph"></div>
+    <div class="brand-text">
+      <div class="title">FLYBRAIN<span class="dim"> / LIVE CONNECTOME</span></div>
+      <div class="sub" id="dataset-id">initialising…</div>
+    </div>
+  </div>
+
+  <div class="top-spacer"></div>
+
+  <div class="topstats">
+    <div class="topstat">
+      <span class="k">FPS</span>
+      <span class="v" id="ts-fps">—</span>
+    </div>
+  </div>
+
+  <div class="conn" id="conn" data-state="connecting" title="Activity stream status">
+    <span class="dot"></span><span id="conn-label">connecting</span>
+  </div>
+</header>
+
+<!-- ==================================================== hud ============= -->
+<main id="hud">
+
+  <!-- ------------------------------------------------ left column ----- -->
+  <aside class="col left">
+
+    <section class="panel" id="panel-loop">
+      <h2>Room <span class="arrow">→</span> light colour
+        <span class="tag" id="loop-mode">—</span>
+      </h2>
+      <div class="body">
+        <div class="flow">
+          <div class="flow-side">
+            <div class="flow-k">Sensor reads</div>
+            <div class="flow-v" id="loop-temp">—<small>°C</small></div>
+            <div class="flow-sub" id="loop-entity">—</div>
+          </div>
+          <div class="flow-mid" title="The reading has to travel through the fly brain to get here">
+            <span class="flow-brain">brain</span>
+            <span class="flow-window" id="loop-window">—</span>
+          </div>
+          <div class="flow-side">
+            <div class="flow-k">Light set to</div>
+            <div class="flow-v" id="loop-kelvin">—<small>K</small></div>
+            <div class="flow-sub" id="loop-band">—</div>
+          </div>
+        </div>
+
+        <div class="swatch">
+          <div class="swatch-chip" id="loop-swatch"></div>
+          <div class="swatch-text">
+            <div class="swatch-title" id="loop-swatch-title">waiting for the first reading…</div>
+            <div class="swatch-sub" id="loop-swatch-sub">—</div>
+          </div>
+        </div>
+
+        <div class="kv"><span class="k">Ideal colour</span>
+          <span class="v" id="loop-ideal">—</span></div>
+        <div class="kv"><span class="k">Driven · readout neurons</span>
+          <span class="v" id="loop-drive">—</span></div>
+        <div class="note" id="loop-note">Waiting for the control loop to produce its first decision.</div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-senses">
+      <h2>Senses wired to the brain <span class="tag" id="senses-tag">—</span></h2>
+      <div class="body tight">
+        <div class="note">Every sensor feeding the brain, and which part of the fly it drives.
+          Each gets its own neurons — no two senses share cells, so their spikes stay
+          distinguishable.</div>
+        <div class="rows" id="sense-rows">
+          <div class="empty">awaiting the first window…</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-history">
+      <h2>Colour chosen <span class="h2-right" id="history-span">collecting…</span></h2>
+      <div class="body tight">
+        <div class="chart-wrap"><canvas id="chart"></canvas></div>
+        <div class="legend">
+          <span class="item"><i class="sw colour"></i> brain chose</span>
+          <span class="item"><i class="sw temp"></i> perfect mapping</span>
+        </div>
+      </div>
+    </section>
+
+  </aside>
+
+  <!-- ----------------------------------------------- right column ----- -->
+  <aside class="col right">
+
+    <section class="panel" id="panel-brain">
+      <h2>Brain activity <span class="tag" id="brain-tag">idle</span></h2>
+      <div class="body">
+        <p class="plain" id="brain-plain">Waiting for the brain to start turning.</p>
+        <div class="stats">
+          <div class="stat hot">
+            <div class="k">Active neurons</div>
+            <div class="v" id="st-active">—</div>
+          </div>
+          <div class="stat">
+            <div class="k">Spikes this window</div>
+            <div class="v" id="st-spikes">—</div>
+          </div>
+          <div class="stat amber">
+            <div class="k">Simulated time</div>
+            <div class="v" id="st-sim">—<small>ms</small></div>
+          </div>
+          <div class="stat">
+            <div class="k">Frames rendered</div>
+            <div class="v" id="st-seq">—</div>
+          </div>
+        </div>
+        <div class="note">These are counts, not percentages — read them as “how much of the
+          brain is joining in”.</div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-connect">
+      <h2>Light connection <span class="tag" id="connect-state">—</span></h2>
+      <div class="body">
+        <div class="ctl">
+          <div class="ctl-top"><span class="name">Sensitivity</span>
+            <span class="val" id="sens-note">—</span></div>
+          <div class="range-row">
+            <label>Room reads<input class="num" type="number" id="src-min" step="0.1"><span class="unit">°C</span></label>
+            <span class="range-dash">to</span>
+            <label><input class="num" type="number" id="src-max" step="0.1"><span class="unit">°C</span></label>
+          </div>
+          <div class="grad" id="src-grad"></div>
+          <div class="note">Nothing outside this span changes the light any further. Narrow it
+            and a small room swing drives the whole colour range.</div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top"><span class="name">Colour range sent</span>
+            <span class="val" id="k-note">—</span></div>
+          <div class="range-row">
+            <label><input class="num" type="number" id="k-min" step="50"><span class="unit">K</span></label>
+            <span class="range-dash">to</span>
+            <label><input class="num" type="number" id="k-max" step="50"><span class="unit">K</span></label>
+          </div>
+          <div class="grad" id="k-grad"><i id="k-marker"></i></div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top"><span class="name">How often it decides</span>
+            <span class="val" id="pace-note">—</span></div>
+          <div class="range-row">
+            <label>one every<input class="num" type="number" id="interval" step="1" min="0"><span class="unit">s</span></label>
+          </div>
+          <div class="note">The brain steps as fast as the GPU allows, then waits this long before
+            deciding again. <b>0 runs flat out (~165 W); 15 s averages ~40 W</b>, and a room does
+            not change faster than that. This is the setting that decides what it costs to leave
+            running.</div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top"><span class="name">Smoothing</span>
+            <span class="val"><input class="num" type="number" id="smooth" step="1" min="0"><span class="unit">s</span></span></div>
+          <div class="note">Averaging time on the sensor. Real sensors jitter; this stops the
+            light twitching. 0 turns it off.</div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top"><span class="name">Ignore changes under</span>
+            <span class="val"><input class="num" type="number" id="deadband" step="10" min="0"><span class="unit">K</span></span></div>
+          <div class="note">Stops the light being re-sent for changes you could not see. The
+            chart still shows every decision.</div>
+        </div>
+
+        <div class="btn-col">
+          <button id="btn-invert">Reverse direction</button>
+          <button id="btn-dryrun">Dry run (never touch a real light)</button>
+          <button id="btn-fit">Fit sensitivity to this room</button>
+        </div>
+        <div class="note" id="connect-note">—</div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-usage">
+      <h2>Which regions are busy <span class="tag">top 12</span>
+        <span class="h2-right" id="usage-poll">—</span>
+      </h2>
+      <div class="body tight">
+        <div class="rows" id="usage-rows">
+          <div class="empty">awaiting /api/regions …</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-view">
+      <h2>The brain itself <span class="tag" id="view-tag">live</span></h2>
+      <div class="body tight">
+        <div class="note">Each dot is one neuron. Brightness is how hard it is firing right
+          now. Drag to orbit · scroll to zoom · right-drag to pan.</div>
+        <div class="btn-row">
+          <button id="btn-pause">Pause</button>
+          <button id="btn-reset">Reset view</button>
+        </div>
+        <div class="note">Pausing really stops the brain — the GPU drops from ~165 W to idle.
+          Space bar toggles it.</div>
+      </div>
+    </section>
+
+  </aside>
+</main>
+
+<!-- ==================================================== footer ========== -->
+<footer id="footbar">
+  <span class="lic">FlyWire FAFB v783 — <b>CC BY-NC 4.0, non-commercial use</b></span>
+  <span class="meta" id="foot-meta">—</span>
+</footer>
+
+<!-- ==================================================== overlays ======== -->
+<div id="notice" hidden></div>
+
+<div id="boot">
+  <div class="glyph"></div>
+  <div class="b-title">FlyBrain</div>
+  <div class="b-msg" id="boot-msg">contacting backend…</div>
+  <div class="b-bar"><i></i></div>
+</div>
+
+<div id="fatal" hidden>
+  <div class="card">
+    <div class="f-kicker">Connection failure</div>
+    <h1 id="fatal-title">Cannot reach the flybrain backend</h1>
+    <p id="fatal-msg">The dashboard could not load <code style="display:inline;padding:1px 5px">/api/config</code>.</p>
+    <code id="fatal-detail"></code>
+    <div class="btn-row" style="max-width:220px">
+      <button id="fatal-retry">Retry</button>
+    </div>
+    <p class="hint" style="margin-top:14px">
+      Start the backend from the repository root with
+      <code>.venv/bin/python -m flybrain.server</code> — it binds
+      <code>127.0.0.1:8765</code> and takes a few seconds to load the connectome.
+    </p>
+  </div>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

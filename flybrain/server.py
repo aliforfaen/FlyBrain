@@ -1,0 +1,622 @@
+"""Live brain view: FastAPI server for the FlyWire connectome dashboard.
+
+Architecture notes
+------------------
+The single most important performance decision is that **Python never sits in the
+per-frame rendering path**. The neuron point cloud is uploaded to the GPU once; per frame
+we push one compact ``uint8`` intensity buffer per neuron (~139 KB) over a **binary**
+WebSocket, and a GLSL shader maps intensity to colour on the GPU. Sending JSON numbers
+would be roughly 1 MB per frame plus a 139k-element parse, and would cap the dashboard far
+below its frame budget.
+
+Endpoints
+---------
+``GET  /``                    dashboard (static files)
+``GET  /api/config``          connectome metadata + settings schema
+``GET  /api/positions``       float32 LE, n*3, neuron soma positions (3D units)
+``GET  /api/regions``         per-cell-class usage snapshot
+``GET  /api/settings``        current settings
+``POST /api/settings``        update settings
+``POST /api/drive``           set/clear input drive on a neuron population
+``WS   /ws/activity``         binary heat frames + JSON events
+
+Wire protocol (must match ``web/app.js``)
+-----------------------------------------
+Server -> client, binary frame::
+
+    uint32 magic = 0x4642524E ("FBRN")
+    uint32 seq
+    uint32 n_neurons
+    float32 sim_ms
+    uint32 total_spikes
+    uint32 active_neurons
+    uint8  intensity[n_neurons]        # 0..255, one byte per neuron
+
+Server -> client, text frames: JSON ``{"type": ...}`` for ``hello``, ``metrics``,
+``regions``, ``settings``, ``info``.
+
+Client -> server: JSON ``{"type": ...}`` for ``settings``, ``drive``, ``pause``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import struct
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import numpy as np
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
+
+from flybrain.activity import ActivitySettings, MemoryBrain
+from flybrain.env import load_dotenv
+from flybrain.mapping import RoleResolver, default_output_roles, default_sensor_roles
+
+logger = logging.getLogger(__name__)
+
+ROOT = Path(__file__).resolve().parents[1]
+WEB_DIR = ROOT / "web"
+POSITIONS = ROOT / "data/codex/positions_normalized.npy"
+MAGIC = 0x4642524E  # "FBRN"
+
+HEADER = struct.Struct("<III f II")
+
+
+class BrainService:
+    """Owns the simulator and the stepping loop, decoupled from the web layer."""
+
+    def __init__(self) -> None:
+        self.sim = None
+        self.brain: MemoryBrain | None = None
+        self.settings = ActivitySettings()
+        self.paused = False
+        self.positions: np.ndarray | None = None
+        self.roles: RoleResolver | None = None
+        self._frame: dict | None = None
+        self._clients: set[WebSocket] = set()
+        self._lock = asyncio.Lock()
+        self._task: asyncio.Task | None = None
+        self._drive_role: str | None = None
+        # Live control loop state.
+        #: Step the brain even with no dashboard watching. Off by default: the simulator
+        #: is ~7.7x slower than wall-clock, so running it permanently is a real cost, and
+        #: for a demo the GPU is better spent while someone is looking. Turn it on with
+        #: ``FLYBRAIN_ALWAYS_ON=1`` when the loop is meant to control something for real.
+        self.always_on = os.environ.get("FLYBRAIN_ALWAYS_ON", "0") not in {"0", "false", "no"}
+        self.loop = None
+        self.loop_cfg = None
+        #: Optional recording of every completed window, so new readouts can be trained later.
+        #: Off unless ``FLYBRAIN_RECORD=1``: it writes to disk continuously and holds a record of
+        #: the inside of a real house, which should be an opt-in.
+        self.recorder = None
+        self._accum: np.ndarray | None = None
+        self._accum_ms = 0.0
+        self._last_mock_tick: float | None = None
+        #: Extra sensory channels are discovered once, from the first real read of the house.
+        self._channels_ready = False
+        #: When the last decision completed, for wall-clock pacing (see ``interval_s``).
+        self._last_decision_at: float | None = None
+
+    # ----------------------------------------------------------------- setup
+
+    def load(self) -> None:
+        from flybrain.sim import ConnectomeSim
+
+        logger.info("loading connectome ...")
+        self.sim = ConnectomeSim().load()
+        self.brain = MemoryBrain(self.sim, self.settings)
+        self.roles = RoleResolver.from_sim(self.sim)
+        if POSITIONS.exists():
+            self.positions = np.load(POSITIONS).astype(np.float32)
+            if self.positions.shape[0] != self.sim.n_neurons:
+                logger.warning(
+                    "position count %d != neuron count %d; view will be degenerate",
+                    self.positions.shape[0],
+                    self.sim.n_neurons,
+                )
+        else:
+            logger.warning("no positions file at %s; using origin cloud", POSITIONS)
+            self.positions = np.zeros((self.sim.n_neurons, 3), dtype=np.float32)
+        logger.info("ready: %d neurons, %d synapses", self.sim.n_neurons, self.sim._W.values().numel())
+        self._setup_loop()
+
+    def _setup_loop(self) -> None:
+        """Build the temperature -> colour loop, if a trained readout exists.
+
+        A missing readout is not fatal: the brain view is still worth serving, and the
+        dashboard explains what to run. Failing to start would be a worse outcome than
+        running with the loop marked unavailable.
+        """
+        from flybrain.ha import Scenario
+        from flybrain.loop import LoopConfig, build_loop
+
+        cfg = LoopConfig.from_env()
+        self.loop_cfg = cfg
+        try:
+            self.loop = build_loop(self.sim, cfg)
+        except Exception:
+            logger.exception("live loop failed to start; the brain view will still serve")
+            self.loop = None
+            return
+        if self.loop is None:
+            return
+        # Give the simulated room a visible swing so the whole chain can be watched.
+        if cfg.is_mock and getattr(self.loop, "ha", None) is not None:
+            scenario = Scenario(
+                temperature_start=22.5, temperature_swing_c=11.0, temperature_period_s=180.0
+            )
+            self.loop.ha.scenario = scenario
+            self.loop.ha.states["sensor.living_room_temperature"] = (
+                f"{scenario.temperature_start:.2f}"
+            )
+        self._accum = np.zeros(self.sim.n_neurons, dtype=np.int64)
+        self._start_recorder()
+
+    def _start_recorder(self) -> None:
+        """Open a recording session for the control loop, if one was asked for.
+
+        Opt-in via ``FLYBRAIN_RECORD=1``, and never fatal: a read-only disk or a bad name must
+        not stop the brain from running.
+        """
+        if os.environ.get("FLYBRAIN_RECORD", "0") in {"0", "false", "no"}:
+            return
+        from flybrain.recorder import DEFAULT_ROOT, Recorder
+
+        name = os.environ.get("FLYBRAIN_RECORD_NAME") or time.strftime("session-%Y%m%d-%H%M%S")
+        # Careful: on LiveLoop, ``.config`` is the ExperimentConfig (readout/window settings) and
+        # ``.loop`` is the LoopConfig (entities, sensitivity, dry-run). The names invite a mix-up
+        # and the AttributeError is only raised when recording is switched on.
+        loop_cfg = self.loop.loop
+        try:
+            self.recorder = Recorder(
+                DEFAULT_ROOT / name,
+                feature_dim=int(self.loop.readout_indices.size),
+                window_ms=float(self.loop.config.window_ms),
+                meta={
+                    "temperature_entity": loop_cfg.temperature_entity,
+                    "light_entity": loop_cfg.light_entity,
+                    "mode": loop_cfg.mode,
+                },
+            )
+        except Exception:
+            logger.exception("could not open a recording; continuing without one")
+            self.recorder = None
+            return
+        logger.info("recording windows to %s", self.recorder.root)
+
+    # ------------------------------------------------------------ broadcast
+
+    async def register(self, ws: WebSocket) -> None:
+        self._clients.add(ws)
+
+    def unregister(self, ws: WebSocket) -> None:
+        self._clients.discard(ws)
+
+    async def broadcast_binary(self, payload: bytes) -> None:
+        dead = []
+        for ws in list(self._clients):
+            try:
+                await ws.send_bytes(payload)
+            except Exception:  # noqa: BLE001 - a dead socket must not kill the broadcast
+                dead.append(ws)
+        for ws in dead:
+            self._clients.discard(ws)
+
+    async def broadcast_json(self, message: dict) -> None:
+        dead = []
+        for ws in list(self._clients):
+            try:
+                await ws.send_text(json.dumps(message))
+            except Exception:  # noqa: BLE001 - a dead socket must not kill the broadcast
+                dead.append(ws)
+        for ws in dead:
+            self._clients.discard(ws)
+
+    # ----------------------------------------------------------------- loop
+
+    async def _advance_mock(self) -> None:
+        """Move the simulated room clock on by the real time that has elapsed.
+
+        The mock's sensors evolve in *simulated* minutes, so without this the temperature
+        would never change and the dashboard would have nothing to show.
+        """
+        ha = getattr(self.loop, "ha", None)
+        if ha is None or self.loop_cfg is None or not self.loop_cfg.is_mock:
+            return
+        now = time.monotonic()
+        if self._last_mock_tick is not None:
+            ha.advance(max(0.0, min(now - self._last_mock_tick, 5.0)))
+        self._last_mock_tick = now
+
+    async def begin_window(self) -> None:
+        """Read the sensor and apply it as the drive for the window about to run.
+
+        The drive is set *before* the window it will be judged on, so a decision is caused
+        by the temperature it was given rather than by the one after it.
+        """
+        if self.loop is None:
+            return
+        await self._advance_mock()
+        signals = await self.loop.read_signals()
+        if signals and not self._channels_ready:
+            self._configure_channels(signals)
+        # One call for every channel: set_drive replaces the whole drive map, so driving
+        # temperature and then the extras separately would silently cancel the first.
+        self.loop.drive_channels(signals)
+
+    def _configure_channels(self, signals) -> None:
+        """Attach the extra sensory pathways discovery finds, if they were asked for.
+
+        Off unless ``FLYBRAIN_CHANNELS`` is set. It is opt-in because of a real caveat: the
+        colour readout was fitted with **only** the temperature channel driving the brain, and
+        the readout is a function of the whole reservoir state. Driving the brain from motion
+        and illuminance as well changes that state, so the decoded colour is no longer the
+        thing that was trained until the readout is re-fitted. This is documented, not hidden.
+        """
+        self._channels_ready = True
+        if os.environ.get("FLYBRAIN_CHANNELS", "off").strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "",
+        }:
+            return
+        from flybrain.wiring import discover
+
+        try:
+            wiring = discover(signals)
+            channels = wiring.to_channels(self.roles, neurons_per_pathway=64)
+            self.loop.configure_channels(channels)
+        except Exception:
+            logger.exception("could not configure extra sensory channels; continuing without")
+            return
+        if self.loop.channels:
+            logger.warning(
+                "driving %d extra sensory channel(s): %s. The colour readout was fitted on "
+                "temperature alone, so its output is not trustworthy until it is re-fitted.",
+                len(self.loop.channels),
+                ", ".join(c.entity_id for c in self.loop.channels),
+            )
+
+    async def finish_window(self, counts, window_ms: float) -> None:
+        """Decode the completed window, emit the action, and open the next window."""
+        if self.loop is None:
+            return
+        try:
+            entry = await self.loop.decide(counts, window_ms)
+        except Exception:
+            logger.exception("control decision failed")
+            return
+        # Record before begin_window(): the sensor snapshot must be the one that *drove* the
+        # window just decoded, not the next window's reading.
+        self._record_window(counts, window_ms)
+        self._last_decision_at = time.monotonic()
+        if entry is not None:
+            await self.broadcast_json({"type": "loop", "loop": self.loop.snapshot()})
+        await self.begin_window()
+
+    def _record_window(self, counts, window_ms: float) -> None:
+        """Append one completed window to the recording, if recording is on.
+
+        A failure here disables recording rather than repeating: a full disk would otherwise log
+        an exception every couple of seconds for as long as the dashboard stays open.
+        """
+        if self.recorder is None or self.loop is None:
+            return
+        try:
+            self.recorder.record(
+                self.loop.features(counts, window_ms),
+                sensors=self.loop.sensor_snapshot(),
+            )
+        except Exception:
+            logger.exception("failed to record a window; recording is now off")
+            self.recorder = None
+
+    async def run_loop(self) -> None:
+        """Step the brain, publish frames, and make one colour decision per window."""
+        assert self.brain is not None
+        window_ms = float(self.loop.config.window_ms) if self.loop is not None else 0.0
+        await self.begin_window()
+
+        while True:
+            fps = max(1.0, float(self.settings.fps))
+            await asyncio.sleep(1.0 / fps)
+            if self.paused or not (self._clients or self.always_on):
+                continue
+            # Wall-clock pacing. Running flat out holds the GPU at ~165 W continuously,
+            # because the brain steps as fast as it can to advance brain time. A context
+            # layer needs a decision every few seconds at most, so pace the *decisions* and
+            # let the GPU idle in between: average power falls roughly with the duty cycle.
+            interval = float(self.loop.loop.interval_s) if self.loop is not None else 0.0
+            if interval > 0.0 and self._last_decision_at is not None:
+                remaining = interval - (time.monotonic() - self._last_decision_at)
+                if remaining > 0.0:
+                    await asyncio.sleep(min(remaining, interval))
+                    continue
+            try:
+                done = False
+                counts = None
+                async with self._lock:
+                    frame = await asyncio.to_thread(self.brain.advance)
+                    self._frame = {
+                        "seq": frame.seq,
+                        "sim_ms": frame.sim_ms,
+                        "total_spikes": frame.total_spikes,
+                        "active_neurons": frame.active_neurons,
+                        "metrics": frame.metrics,
+                    }
+                    payload = self.encode_frame(frame)
+                    if self._accum is not None and window_ms > 0:
+                        self._accum += frame.counts
+                        self._accum_ms += float(frame.metrics.get("window_ms", 0.0))
+                        if self._accum_ms >= window_ms:
+                            counts, ms = self._accum, self._accum_ms
+                            self._accum = np.zeros_like(self._accum)
+                            self._accum_ms = 0.0
+                            done = True
+                if self._clients:
+                    await self.broadcast_binary(payload)
+                if done and counts is not None:
+                    await self.finish_window(counts, ms)
+            except Exception:  # keep the dashboard alive on a transient failure
+                logger.exception("activity loop iteration failed")
+
+    @staticmethod
+    def encode_frame(frame) -> bytes:
+        """Pack a :class:`flybrain.activity.Frame` into the binary wire format."""
+        intensity = np.ascontiguousarray(frame.intensity, dtype=np.uint8)
+        header = HEADER.pack(
+            MAGIC,
+            int(frame.seq),
+            int(intensity.size),
+            float(frame.sim_ms),
+            int(frame.total_spikes),
+            int(frame.active_neurons),
+        )
+        return header + intensity.tobytes()
+
+    def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    def release_gpu_cache(self) -> None:
+        """Hand cached GPU blocks back to the driver while the brain is not stepping.
+
+        This does **not** unload the connectome — the weights stay resident, which is why VRAM
+        stays around 1.8 GB even when idle (measured). It only returns the allocator's unused
+        cached blocks, which is worth doing and costs nothing. Freeing the model itself would
+        mean reloading the connectome from disk on resume, which is far slower than leaving it.
+        """
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            logger.debug("could not release cached GPU memory", exc_info=True)
+
+    def set_paused(self, value: bool) -> bool:
+        """Pause or resume, releasing the GPU cache when stopping."""
+        self.paused = bool(value)
+        if self.paused:
+            self.release_gpu_cache()
+        return self.paused
+
+
+service = BrainService()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await asyncio.to_thread(service.load)
+    service._task = asyncio.create_task(service.run_loop())
+    try:
+        yield
+    finally:
+        service.stop()
+
+
+app = FastAPI(title="flybrain live view", lifespan=lifespan)
+
+
+# ------------------------------------------------------------------- routes
+
+
+@app.get("/api/config")
+async def get_config() -> dict:
+    sim = service.sim
+    if sim is None:
+        raise HTTPException(503, "brain still loading")
+    return {
+        "n_neurons": int(sim.n_neurons),
+        "n_synapses": int(sim._W.values().numel()),
+        "device": sim.device,
+        "dt_ms": sim.params.dt_ms,
+        "settings": service.settings.to_dict(),
+        "roles": {k: int(v) for k, v in service.roles.summary().items()},
+        "sensor_roles": default_sensor_roles(),
+        "output_roles": default_output_roles(),
+        "wire": {"magic": MAGIC, "header_bytes": HEADER.size, "dtype": "uint8"},
+    }
+
+
+@app.get("/api/positions")
+async def get_positions() -> Response:
+    if service.positions is None:
+        raise HTTPException(503, "positions not loaded")
+    return Response(
+        content=service.positions.astype("<f4").tobytes(),
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/api/regions")
+async def get_regions() -> dict:
+    if service.brain is None:
+        raise HTTPException(503, "brain still loading")
+    return {"regions": await asyncio.to_thread(service.brain.region_usage)}
+
+
+@app.get("/api/settings")
+async def get_settings() -> dict:
+    return service.settings.to_dict()
+
+
+@app.post("/api/settings")
+async def post_settings(patch: dict) -> dict:
+    allowed = set(ActivitySettings.__dataclass_fields__)
+    unknown = set(patch) - allowed
+    if unknown:
+        raise HTTPException(400, f"unknown settings: {sorted(unknown)}")
+    for key, value in patch.items():
+        current = getattr(service.settings, key)
+        try:
+            setattr(service.settings, key, type(current)(value))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"bad value for {key}: {value!r}") from exc
+    await service.broadcast_json({"type": "settings", "settings": service.settings.to_dict()})
+    return service.settings.to_dict()
+
+
+@app.post("/api/drive")
+async def post_drive(body: dict) -> dict:
+    """Set or clear a persistent input drive on a named role."""
+    if service.brain is None or service.roles is None:
+        raise HTTPException(503, "brain still loading")
+    role = body.get("role")
+    current = float(body.get("current_mv", 0.0))
+    if not role or current == 0.0:
+        service.brain.clear_input_drive()
+        service._drive_role = None
+        return {"role": None, "current_mv": 0.0, "neurons": 0}
+    resolved = service.roles.resolve(role)
+    service.brain.set_input_drive(resolved.indices, current)
+    service._drive_role = role
+    return {"role": role, "current_mv": current, "neurons": len(resolved)}
+
+
+@app.get("/api/frame")
+async def get_frame() -> dict:
+    return service._frame or {}
+
+
+@app.get("/api/loop")
+async def get_loop() -> dict:
+    """Current state of the temperature -> colour control loop."""
+    if service.loop is None:
+        return {
+            "available": False,
+            "paused": bool(service.paused),
+            "reason": (
+                "no trained colour readout yet - run "
+                "`.venv/bin/python -m flybrain.experiment` to build one"
+            ),
+        }
+    return {"available": True, "paused": bool(service.paused), **service.loop.snapshot()}
+
+
+@app.post("/api/pause")
+async def post_pause(payload: dict | None = None) -> dict:
+    """Pause or resume the brain.
+
+    Exposed over REST as well as the websocket so it is scriptable: a phone shortcut, a cron
+    job, or an automation can stop the GPU without opening the dashboard. Pausing releases the
+    allocator's cached GPU blocks; the connectome itself stays resident.
+    """
+    body = payload or {}
+    return {"paused": service.set_paused(bool(body.get("value", True)))}
+
+
+@app.post("/api/loop/settings")
+async def post_loop_settings(patch: dict) -> dict:
+    """Update the loop's connection settings: sensitivity, limits, entities, dry run."""
+    if service.loop is None:
+        raise HTTPException(503, "the control loop is not running")
+    try:
+        service.loop.update_settings(patch)
+    except KeyError as exc:
+        raise HTTPException(400, f"unknown or unsettable setting: {exc}") from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"bad value in {patch!r}") from exc
+    snapshot = service.loop.snapshot()
+    await service.broadcast_json({"type": "loop", "loop": snapshot})
+    return snapshot
+
+
+@app.post("/api/loop/fit-range")
+async def post_fit_range() -> dict:
+    """Fit the sensitivity span to the readings this room has actually produced."""
+    if service.loop is None:
+        raise HTTPException(503, "the control loop is not running")
+    service.loop.fit_range_to_observed()
+    snapshot = service.loop.snapshot()
+    await service.broadcast_json({"type": "loop", "loop": snapshot})
+    return snapshot
+
+
+@app.websocket("/ws/activity")
+async def ws_activity(ws: WebSocket) -> None:
+    await ws.accept()
+    await service.register(ws)
+    try:
+        if service.sim is not None:
+            hello = {
+                "type": "hello",
+                "n_neurons": int(service.sim.n_neurons),
+                "dt_ms": service.sim.params.dt_ms,
+                "settings": service.settings.to_dict(),
+                "roles": {k: int(v) for k, v in service.roles.summary().items()},
+            }
+            if service.loop is not None:
+                hello["loop"] = service.loop.snapshot()
+            await ws.send_text(json.dumps(hello))
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            kind = msg.get("type")
+            if kind == "pause":
+                service.set_paused(bool(msg.get("value", True)))
+            elif kind == "settings":
+                for key, value in msg.get("settings", {}).items():
+                    if key in ActivitySettings.__dataclass_fields__:
+                        setattr(service.settings, key, type(getattr(service.settings, key))(value))
+            elif kind == "drive":
+                await post_drive(msg)
+            elif kind == "ping":
+                await ws.send_text(json.dumps({"type": "pong"}))
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("websocket failed")
+    finally:
+        service.unregister(ws)
+
+
+app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
+
+
+def main() -> None:
+    import uvicorn
+
+    # Before anything reads configuration, so `.env` drives the whole process without the
+    # operator having to `source` it first. Real environment variables still take precedence.
+    load_dotenv()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,43 @@
+[project]
+name = "flybrain-ha"
+version = "0.1.0"
+description = "A fruit-fly brain wired to a home: the FlyWire v783 connectome as a spiking network driving Home Assistant"
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    # Simulation
+    "numpy>=1.26",
+    "torch>=2.2",
+    # The connectome, annotation tables and cached joins are parquet, read through pandas.
+    "pandas>=2.1",
+    "pyarrow>=15",
+    # Home Assistant (REST) and the dashboard.
+    "httpx>=0.27",
+    "requests>=2.31",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    # Not imported directly: uvicorn needs a WebSocket implementation to serve the
+    # dashboard's live activity stream.
+    "websockets>=12.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+# PyTorch wheels are large and built per CUDA version, so the default PyPI wheel is not
+# necessarily the one this was measured on. `explicit = true` means this index is used only for
+# the package named in [tool.uv.sources], and nothing else is resolved from it.
+#
+# Developed and benchmarked against torch 2.14.0+cu130 (RTX 3070). For CPU or a different CUDA
+# version, change the URL — or delete both blocks and let torch come from PyPI instead.
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

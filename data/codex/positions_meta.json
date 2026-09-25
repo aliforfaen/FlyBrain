@@ -1,0 +1,10 @@
+{
+  "n": 138639,
+  "scale_um": 6544.5009765625,
+  "voxel_nm": [
+    4,
+    4,
+    40
+  ],
+  "source": "codex fafb 783 coordinates.csv.gz"
+}

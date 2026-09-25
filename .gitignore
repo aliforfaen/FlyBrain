@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-validation/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Vendored upstream data and clones (large; re-fetchable). Anchored to the repository root so
+# it does NOT also swallow web/vendor/, which holds the three.js build the dashboard needs.
+/vendor/
+
+# Large/generated data products
+data/annotations/*.tsv
+data/annotations/*.indexed.parquet
+data/codex/*.csv.gz
+data/codex/*.npy
+# Raw brian2/torch spike-count dumps: reproducible in minutes via validation/, and each
+# is 30-60 KB. The trained readout in data/experiments/ is deliberately NOT ignored - it
+# is a few KB and lets the demo run without retraining.
+data/validation/*.npz
+
+# Runtime artifacts
+runs/
+*.log
+nohup.out
+# Only left behind if tools/fetch_data.py is killed mid-download.
+*.part
+
+# Secrets: Home Assistant base URL and long-lived token.
+.env
+.env.*
+!.env.example
+
+# Recordings of the live loop. These describe the inside of a real house over time and grow
+# without bound, so they are never committed.
+data/recordings/
