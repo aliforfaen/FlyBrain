@@ -19,15 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-================================================================================
-
-NOTE — this licence covers the source code in this repository only.
-
-The FlyWire v783 connectome and its annotation tables are NOT covered by the MIT
-licence above and are NOT distributed in this repository. They are downloaded by
-`tools/fetch_data.py` and remain under their own terms, principally
-**CC BY-NC 4.0 (non-commercial)**. Personal and homelab use is fine; do not sell
-anything built on that data.
-
-See `docs/licensing.md` for the full audit.

@@ -253,9 +253,11 @@ The interesting parts are the mistakes, so they are written down.
 
 **Code: MIT. Data: CC BY-NC 4.0 — non-commercial.**
 
-The connectome and annotation data are licensed for **non-commercial use only**. Personal and
-homelab use is fine; do not sell this. Details, including two popular fly-brain projects that must
-not be copied from, are in [`docs/licensing.md`](docs/licensing.md).
+[`LICENSE`](LICENSE) covers the source code in this repository only. The connectome and
+annotation data are **not distributed here** — `tools/fetch_data.py` downloads them — and are
+licensed for **non-commercial use only**. Personal and homelab use is fine; do not sell this.
+Details, including two popular fly-brain projects that must not be copied from, are in
+[`docs/licensing.md`](docs/licensing.md).
 
 ## Citation
 
