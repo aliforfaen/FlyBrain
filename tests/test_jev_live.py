@@ -46,7 +46,8 @@ def test_the_network_floor_is_measurable_without_a_credential() -> None:
     account — and why it should be re-run whenever the answer "is Jev fast enough?" comes up.
     """
     floor = measure_network_floor_ms()
-    print(f"\nnetwork floor to api.typesafe.ai: {floor:.1f} ms")
+    host = JevConfig.from_env().base_url.split("//", 1)[-1].split("/", 1)[0]
+    print(f"\nnetwork floor to {host}: {floor:.1f} ms")
     assert 0.0 < floor < 5000.0, "a floor outside this range means the measurement itself is wrong"
 
 

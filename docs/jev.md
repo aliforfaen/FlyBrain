@@ -106,19 +106,22 @@ document, which is why they are spelled out:
 | Accuracy | 27/27, tying `mistral-small-3.2-24b` | Jev does **not** win on accuracy |
 | Route matters more than the model | first-party p50 **313 ms** / p90 423 ms — OpenRouter p50 734 ms / p90 **1739 ms** | **We call first-party.** See below |
 
-Measured **on this machine**, by `flybrain.jev.measure_network_floor_ms()`:
+Measured **on this machine**, by `flybrain.jev.measure_network_floor_ms()`, which defaults to the
+configured host. The floor belongs to the *path*, not to the vendor, so both hosts are listed:
 
 | Measurement | Value |
 |---|---|
-| Network floor, first (cold) sample | **154.4 ms** |
-| Network floor, 9 warm samples | **44.6–51.6 ms, median 46.6 ms** |
-| Unauthenticated `POST /v1/systemone` | **HTTP 403** — `"Must supply an API key!"` |
-| `GET /v1/models` with a rejected key | **HTTP 401** — `"Cannot authenticate with the server"` |
+| **Working host**, `jevtypesafeai.com`, 9 warm samples | **45.4–68.4 ms, median 49.0 ms** (first sample 55.5 ms) |
+| Abandoned host, `api.typesafe.ai`, 9 warm samples | 44.6–51.6 ms, median 46.6 ms |
+| Abandoned host, the first request ever made to it | **154.4 ms** |
+| Abandoned host: unauthenticated `POST /v1/systemone` | **HTTP 403** — `"Must supply an API key!"` |
+| Abandoned host: `GET /v1/models` with a rejected key | **HTTP 401** — `"Cannot authenticate with the server"` |
 
-**The cold/warm gap is the lesson.** A single floor measurement — and especially the first one on
-a machine — is inflated roughly 3× by DNS and the initial TLS handshake. Quoting 154 ms as "the
-floor" would have overstated the geography by 100 ms and made Jev look slower than it is. Measure
-it repeatedly, take the median, and say how it was measured.
+**The cold/warm gap is real, but it is a first-contact effect and not a per-process one.** The
+154.4 ms sample was the first request this machine ever made to that host — DNS plus a full TLS
+handshake. Re-measured against the working host, the first sample was 55.5 ms against a 49.0 ms
+median, only ~1.1×. So the honest rule is still *measure repeatedly, take the median, and say how it
+was measured* — a single number is a claim about when it was taken as much as about the network.
 
 **Two corrections this project should not repeat.**
 
@@ -358,11 +361,11 @@ of the silent failures being the expensive ones.
 
 Two measured caveats:
 
-- **The confidence margin is narrower than it looks.** Measured confidence was 0.979 on clear
-  cases and 0.841 on deliberately ambiguous ones — calibrated in the right direction, but by a
-  smaller margin than a threshold router would like. **Thresholds must be calibrated on this
-  project's own data before they are trusted**, exactly as the docs advise: start conservative,
-  test with your own data, then adjust.
+- **A single answer's confidence is noisy even when the state is fixed.** Six byte-identical
+  requests moved a `choice` confidence by **0.170** (0.49–0.66). The separation *between*
+  determined and under-determined states is wide (0.94–0.99 vs 0.34), but the number attached to
+  any one call is not precise to two decimals. So a threshold must sit **with margin**, never on a
+  measured value — and a decision that turns on a 0.02 difference is not one this data supports.
 - **`noul` returns no confidence.** Any judgment that will be gated must therefore be a `choice`
   or a `score`. A `noul` is fine as a *composed fact* — a piece of ordinary logic — but the moment
   its answer needs to gate a write on its own certainty, it has to become a two-option `choice`.
@@ -519,7 +522,7 @@ systemd unit or container env block works unchanged. See [`.env.example`](../.en
 | `JEV_NETWORK_FLOOR_MS` | The measured floor, recorded beside every latency figure. Unset ⇒ reported as "not measured", never as `0` |
 | `JEV_STRICT_MODEL` | Default `1`. Refuse an answer from a version other than the pinned one |
 | `JEV_PAINT_ACT` / `_CONFIRM` | Thresholds for a judgment that only paints a verdict on screen |
-| `JEV_LABEL_ACT` / `_CONFIRM` | The ones that matter: a wrong label silently corrupts the training set. Default act `0.95` — the measured clear case (0.979) writes, the measured ambiguous case (0.841) only proposes |
+| `JEV_LABEL_ACT` / `_CONFIRM` | The ones that matter: a wrong label silently corrupts the training set. Default act `0.95` — above the under-determined case (0.34) so it can never write, and below the top of the determined range (0.99) so a maximally determined answer can |
 | `JEV_HA_ACT` / `_CONFIRM` | Thresholds for a judgment that gates a Home Assistant action. Default act `0.98` |
 
 An unusable threshold — non-numeric, out of range, or inverted so that `confirm_at` exceeds

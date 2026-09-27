@@ -149,10 +149,16 @@ class TestThresholds:
     """The thresholds are settings, not literals, because they need calibrating on our own data."""
 
     def test_the_defaults_match_the_documented_measurements(self) -> None:
+        """The floor must separate the extremes *measured here*, not the borrowed ones.
+
+        A state that determines the answer scored 0.94-0.99; a state that does not settle the
+        question scored ~0.34. The floor has to sit above the latter so it can never write, and at
+        or below the former so a determined answer can at least propose a label.
+        """
         cfg = JevConfig()
-        # 0.979 measured on clear cases writes a label; 0.841 measured on ambiguous ones does not.
-        assert cfg.risk("label").act_at > 0.841
-        assert cfg.risk("label").act_at < 0.979
+        assert cfg.risk("label").confirm_at <= 0.94, "a determined answer must at least propose"
+        assert cfg.risk("label").act_at > 0.34, "an under-determined answer must never write"
+        assert cfg.risk("label").act_at <= 0.99, "the most determined answer must be able to write"
 
     def test_every_tier_is_stricter_than_the_one_below_it(self) -> None:
         cfg = JevConfig()
@@ -347,17 +353,20 @@ class TestRouting:
         assert route(answer, LABEL).action == "act"
         assert route(answer, HA_ACTION).action == "confirm"
 
-    def test_the_measured_clear_case_can_write_a_label(self) -> None:
-        """0.979 was the measured confidence on unambiguous cases."""
-        assert route(answer_with_confidence(0.979), LABEL).action == "act"
+    def test_an_answer_at_the_label_floor_writes(self) -> None:
+        """A routing boundary probe, not a measured confidence: exactly at ``act_at``."""
+        cfg = JevConfig()
+        assert route(answer_with_confidence(cfg.risk("label").act_at), LABEL).action == "act"
 
-    def test_the_measured_ambiguous_case_cannot(self) -> None:
-        """0.841 was the measured confidence on deliberately ambiguous cases.
+    def test_an_answer_just_under_the_label_floor_only_proposes(self) -> None:
+        """One step below ``act_at`` must fall back to confirm, not write.
 
-        If this ever starts acting, the label threshold has been lowered past the point where the
-        project's own measurement says it is safe — and a wrong label corrupts the training set.
+        If this ever starts acting, the floor has been lowered to where a borderline answer writes
+        a label — and a wrong label corrupts the training set silently.
         """
-        assert route(answer_with_confidence(0.841), LABEL).action == "confirm"
+        cfg = JevConfig()
+        answer = answer_with_confidence(cfg.risk("label").act_at - 0.01)
+        assert route(answer, LABEL).action == "confirm"
 
     def test_gating_a_house_action_needs_more_than_writing_a_label(self) -> None:
         assert route(answer_with_confidence(0.96), LABEL).action == "act"

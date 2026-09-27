@@ -53,8 +53,6 @@ from flybrain.env import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-#: Root of the first-party API. ``/v1/systemone`` is the only endpoint that answers questions;
-#: ``/v1/models`` also exists and is used here as the cheap availability probe.
 #: The endpoint the configured key actually works against. Note this is **not** the host in the
 #: vendor's public quickstart: `api.typesafe.ai` served the account this was first written for and
 #: answered every request with HTTP 401, while this one works. Two differences matter and both are
@@ -140,12 +138,14 @@ class Risk:
     confirm_at: float
 
 
-#: The three tiers. The defaults are calibrated against the numbers in docs/jev.md rather than
-#: invented: the measured confidence gap is narrow — 0.979 on clear cases, 0.841 on deliberately
-#: ambiguous ones — so ``label`` is set to let the *measured clear* case write a label and the
-#: *measured ambiguous* case only propose one. The margin is thin enough that these must be
-#: re-calibrated on this project's own data before anything is trusted, which is why every tier
-#: is overridable from the environment (``JEV_LABEL_ACT`` and friends) rather than fixed here.
+#: The three tiers. The defaults come from docs/jev.md, measured on this project's own states
+#: rather than inherited: a state that *determines* the answer scores 0.94-0.99, and one that
+#: genuinely under-determines it collapses to ~0.34. ``label``'s 0.95 therefore lets the strongest
+#: answers write while a determined-but-not-maximal 0.94 only proposes, and 0.34 never acts. The
+#: separation is wide, but a **byte-identical** request varies by up to 0.17 across calls, which is
+#: why the floors sit with margin instead of on a measured value. No placement is built yet, so
+#: nothing has exercised these against real data; every tier is overridable from the environment
+#: (``JEV_LABEL_ACT`` and friends) rather than fixed here.
 PAINT = Risk("paint", act_at=0.70, confirm_at=0.50)
 LABEL = Risk("label", act_at=0.95, confirm_at=0.80)
 HA_ACTION = Risk("ha_action", act_at=0.98, confirm_at=0.90)
@@ -978,7 +978,8 @@ def measure_network_floor_ms(host: str = "", *, port: int = 443, timeout: float 
     This is the number the latency discipline exists for. Every Jev latency figure is
     ``floor + server time``, and a figure published without the floor describes the *network path*
     rather than the model — 199 ms of a ~460-560 ms measurement in the original source, and
-    154 ms measured from the machine this was developed on.
+    154 ms measured from the machine this was developed on (the first request it ever made to the
+    host configured at the time; a re-measure on a warm path is ~49 ms).
 
     Measured with a raw socket rather than ``httpx`` on purpose: an HTTP request would include the
     server's own time, which is the thing that should be reported separately. It blocks, so call
