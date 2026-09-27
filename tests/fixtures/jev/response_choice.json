@@ -1,0 +1,17 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "failure_mode": {
+      "type": "choice",
+      "choice": "stale_sensor",
+      "confidence": 0.979,
+      "probabilities": {
+        "healthy": 0.006,
+        "stale_sensor": 0.979,
+        "readout_drift": 0.011,
+        "unknown": 0.004
+      }
+    }
+  },
+  "usage": {"input_tokens": 214, "output_tokens": 9}
+}

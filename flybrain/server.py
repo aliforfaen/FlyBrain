@@ -131,6 +131,9 @@ class BrainService:
         self._last_mock_tick: float | None = None
         #: Extra sensory channels are discovered once, from the first real read of the house.
         self._channels_ready = False
+        #: The Jev client is built lazily: with no API key there is nothing to build, and
+        #: constructing it at import time would make an optional feature part of startup.
+        self._jev = None
 
     # ----------------------------------------------------------------- setup
 
@@ -442,6 +445,26 @@ class BrainService:
             self._task.cancel()
             self._task = None
 
+    async def jev_status(self, *, refresh: bool = False) -> dict:
+        """Report the judgment layer's availability, building the client on first use."""
+        from flybrain.jev import JevClient, JevConfig
+
+        if self._jev is None:
+            self._jev = JevClient(JevConfig.from_env())
+        status = await self._jev.available(refresh=refresh)
+        payload = status.to_dict()
+        # The redacted config, so an operator can see *which* endpoint and model are configured
+        # without the key ever leaving the process.
+        payload["config"] = self._jev.config.redacted()
+        payload["calls"] = len(self._jev.calls)
+        return payload
+
+    async def aclose(self) -> None:
+        """Release the Jev client's connection pool, if it was ever built."""
+        if self._jev is not None:
+            await self._jev.aclose()
+            self._jev = None
+
     def release_gpu_cache(self) -> None:
         """Hand cached GPU blocks back to the driver while the brain is not stepping.
 
@@ -483,6 +506,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         service.stop()
+        await service.aclose()
 
 
 app = FastAPI(title="flybrain live view", lifespan=lifespan)
@@ -586,6 +610,22 @@ async def get_loop() -> dict:
             ),
         }
     return {"available": True, "paused": bool(service.paused), **service.loop.snapshot()}
+
+
+@app.get("/api/jev/status")
+async def get_jev_status(refresh: bool = False) -> dict:
+    """Whether the Jev judgment layer can be used, and if not, *why*.
+
+    There is no dashboard panel for this yet — the feature has no placement built, and a panel
+    would imply otherwise. The endpoint exists so the credential surface is observable from
+    ``curl`` and so "off", "misconfigured" and "unreachable" are distinguishable without reading
+    a log: with no key it says ``no_key``; with a key the server rejects it says ``unauthorized``
+    (which is what a revoked or mistyped key looks like); with no network it says ``unreachable``.
+
+    ``refresh=true`` re-probes instead of using the cached answer. The probe is a real request, so
+    it is cached — but it costs no input tokens, so a dashboard may call it freely.
+    """
+    return await service.jev_status(refresh=refresh)
 
 
 @app.post("/api/pause")

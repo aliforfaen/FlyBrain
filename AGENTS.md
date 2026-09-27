@@ -23,7 +23,7 @@ population → learned ridge readout → colour temperature (K) → HA light.tur
 ```bash
 uv sync                                        # Python 3.11 → .venv (torch + CUDA wheels)
 .venv/bin/python tools/fetch_data.py           # connectome + annotations, ~140 MB, one time
-.venv/bin/python -m pytest tests/ -q           # 252 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q           # 344 tests, no connectome needed
 
 .venv/bin/python -m flybrain.experiment        # train the readout, ~50 s
 .venv/bin/python -m flybrain.server            # dashboard + live loop
@@ -85,6 +85,7 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
 | `flybrain/server.py` | FastAPI dashboard + the loop's clock |
 | `flybrain/ha.py` | Home Assistant adapters (mock and REST) |
 | `flybrain/env.py` | Loads `.env`, so no house-specific value is ever hardcoded or hand-sourced |
+| `flybrain/jev.py` | The optional Jev judgment layer: typed questions, confidence routing, credential surface. Off unless `TYPESAFE_API_KEY` is set |
 | `tools/fetch_data.py` | Downloads and byte-verifies the connectome and annotation tables |
 | `web/` | three.js dashboard, no bundler, three.js vendored |
 | `validation/` | Brian2 comparison and a closed-form integrator test |
@@ -108,8 +109,9 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
   ordering of those rules matters
 - [`docs/vision.md`](docs/vision.md) — the camera→visual-column design, **not built**
 - [`docs/jev.md`](docs/jev.md) — the Jev judgment layer: three UI placements, their closed
-  vocabularies, the four places it must **not** be used, and the credential surface. **Not
-  built**; most of the value is in the negative recommendations
+  vocabularies, the four places it must **not** be used, and the credential surface. The client,
+  config and confidence routing are **built** (`flybrain/jev.py`); **no placement has a UI yet**,
+  and the most valuable content is still the negative recommendations
 - [`docs/licensing.md`](docs/licensing.md) — **read before shipping anything**
 - [`docs/research/`](docs/research/README.md) — asset inventory and the record of what went
   wrong along the way

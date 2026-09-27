@@ -63,31 +63,59 @@ confidence must be a `choice` or a `score`.** A `noul` gives you only distance f
 
 ### Response shapes that are easy to get wrong
 
-Measured against the live API by [`WallerChen/jev-measured`](https://github.com/WallerChen/jev-measured),
-which is the source for every number in this section. These are not guesses:
+These were taken from the vendor's **generated wire schema** (``typesafe_sdk/_schemas/models.py``
+in ``typesafe-sdk==0.7.2``, which mirrors their OpenAPI document) rather than inferred, and the
+HTTP surface was confirmed by live probe. Two of them contradicted an earlier draft of this
+document, which is why they are spelled out:
 
-- **`score` is not a `0..1` float.** It returns the probability-weighted mean of the rubric
-  **indices**, so a four-level rubric can return `2.68` — "between High and Urgent, leaning
-  Urgent". Round it for the band; the fraction tells you which way the mass leans. Recomputing
-  it from the returned `probabilities` reproduces it to within ±0.02, because those are rounded
-  to two decimals while `score` is computed from full precision. **That small mismatch is not a
-  bug.**
-- **`probabilities` is keyed by index string** (`"0"`, `"1"`, `"2"`), never by label. Use
-  `legend` to map back.
-- **`noul` ships no confidence field at all.** The entire object is
-  `{"type":"noul","noul":0.99}`. If you need to gate on it, distance from `0.5` is all you have.
+- **The envelope is ``{"model", "answers", "usage"}``.** Answers are keyed by the question ids you
+  chose; ``usage`` is ``{"input_tokens", "output_tokens"}``; ``model`` is the versioned id that
+  actually answered and *"may differ from the alias supplied in the request"*.
+- **A ``choice`` question is written with ``criteria``, a mapping of label → description.** It is
+  not ``options`` and it is not a list. The labels you supply are what come back.
+- **A ``score`` question takes ``criteria`` as an ordered sequence** of level descriptions, one per
+  level from zero. The levels are positional and unnamed, which is why the response keys them
+  ``"0"``, ``"1"``, … and why ``legend`` exists to map them back.
+- **``choice`` and ``score`` key their ``probabilities`` differently**, and this is the easiest
+  thing here to get wrong:
+  - ``choice`` → keyed by **choice label** (``{"calm": 0.8, "busy": 0.2}``)
+  - ``score`` → keyed by **level, as a string** (``{"0": 0.1, "2": 0.8}``)
+- **``score`` is not a ``0..1`` float.** It returns the probability-weighted mean of the rubric
+  levels, so a four-level rubric can return ``2.68`` — "between High and Urgent, leaning Urgent".
+  Recomputing it from the returned ``probabilities`` reproduces it to within ±0.02, because those
+  are rounded to two decimals while ``score`` is computed from full precision. **That small
+  mismatch is not a bug**, and the client asserts it live so a real disagreement is caught.
+- **``noul`` ships no confidence field at all.** The entire answer is
+  ``{"type": "noul", "noul": 0.99}``. If you need to gate on it, distance from ``0.5`` is all you
+  have — which is why the client refuses to route one and says to ask a two-option ``choice``.
+- **Errors arrive as ``{"detail": {"error_type", "message"}}``**, verified against the live
+  endpoint. ``error_type`` is ``"authentication_error"`` for both credential failures.
 
 ### The measured facts
 
 | Fact | Measured | Consequence for this project |
 |---|---|---|
 | Latency, raw wall clock | 458–563 ms median | Too slow for 20 fps (50 ms), fine for a 2.3 s control tick |
-| Network floor alone | **198.8 ms** median | "Anyone publishing a Jev latency number without measuring the floor is publishing their own geography" |
+| Network floor alone | **198.8 ms** median (their machine) | "Anyone publishing a Jev latency number without measuring the floor is publishing their own geography" |
 | Latency, head-to-head median | 352 ms | Consistent with the raw range |
 | Cost per decision | **$0.0000153–$0.0000226** | ~20× *below* the $0.0004 figure in circulation |
 | Batching | 5 questions ≈ same cost and latency as 1 (70 ms vs 74 ms server time) | **Ask everything in one call** |
 | Accuracy | 27/27, tying `mistral-small-3.2-24b` | Jev does **not** win on accuracy |
 | Route matters more than the model | first-party p50 **313 ms** / p90 423 ms — OpenRouter p50 734 ms / p90 **1739 ms** | **We call first-party.** See below |
+
+Measured **on this machine**, by `flybrain.jev.measure_network_floor_ms()`:
+
+| Measurement | Value |
+|---|---|
+| Network floor, first (cold) sample | **154.4 ms** |
+| Network floor, 9 warm samples | **44.6–51.6 ms, median 46.6 ms** |
+| Unauthenticated `POST /v1/systemone` | **HTTP 403** — `"Must supply an API key!"` |
+| `GET /v1/models` with a rejected key | **HTTP 401** — `"Cannot authenticate with the server"` |
+
+**The cold/warm gap is the lesson.** A single floor measurement — and especially the first one on
+a machine — is inflated roughly 3× by DNS and the initial TLS handshake. Quoting 154 ms as "the
+floor" would have overstated the geography by 100 ms and made Jev look slower than it is. Measure
+it repeatedly, take the median, and say how it was measured.
 
 **Two corrections this project should not repeat.**
 
@@ -437,8 +465,17 @@ systemd unit or container env block works unchanged. See [`.env.example`](../.en
 |---|---|
 | `TYPESAFE_API_KEY` | The credential, from the [TypeSafe console](https://console.typesafe.ai/keys). Absent ⇒ the whole feature is off |
 | `JEV_MODEL` | **`jev-1.13.0`** — the versioned id, deliberately, *not* the `jev-latest` alias. See below |
-| `JEV_BASE_URL` | `https://api.typesafe.ai/v1/systemone` |
+| `JEV_BASE_URL` | `https://api.typesafe.ai/v1/systemone`; the bare root also works, since the SDK treats its base as a root and both spellings turn up |
 | `JEV_TIMEOUT_S` | Request timeout; default `30` |
+| `JEV_NETWORK_FLOOR_MS` | The measured floor, recorded beside every latency figure. Unset ⇒ reported as "not measured", never as `0` |
+| `JEV_STRICT_MODEL` | Default `1`. Refuse an answer from a version other than the pinned one |
+| `JEV_PAINT_ACT` / `_CONFIRM` | Thresholds for a judgment that only paints a verdict on screen |
+| `JEV_LABEL_ACT` / `_CONFIRM` | The ones that matter: a wrong label silently corrupts the training set. Default act `0.95` — the measured clear case (0.979) writes, the measured ambiguous case (0.841) only proposes |
+| `JEV_HA_ACT` / `_CONFIRM` | Thresholds for a judgment that gates a Home Assistant action. Default act `0.98` |
+
+An unusable threshold — non-numeric, out of range, or inverted so that `confirm_at` exceeds
+`act_at` — falls back to its default and logs. A configuration typo must never *loosen* a
+threshold: the failure that matters is `JEV_LABEL_ACT` being mistyped into "write the label".
 
 ### The API surface
 
@@ -461,6 +498,34 @@ than inferred from a third party:
 - Jev accepts **text only** — a string, a JSON object, or an array of text values. English is the
   primary training language; other languages are accepted but less accurate, so watch
   `confidence` if the state is ever non-English.
+- `GET https://api.typesafe.ai/v1/models` exists, is authenticated, and **costs no input tokens**.
+  It is what the client probes to answer "is this usable, and if not why" without spending a
+  judgment.
+
+### We use `httpx`, not the SDK — and why
+
+This reverses an earlier recommendation in this document, so the reasoning is recorded rather
+than the conclusion.
+
+The SDK is real, maintained and better-built than a hand-rolled client: it retries with backoff,
+honours both `retry-after` spellings, and its `typesafe_sdk/_schemas/models.py` **is** the vendor's
+OpenAPI schema, which is what this document's wire shapes were checked against. Nothing here is a
+criticism of it.
+
+It was still not taken, for three reasons:
+
+1. **It is a second HTTP stack.** `typesafe-sdk==0.7.2` depends on `httpx2` + `httpcore2` +
+   `truststore` + `tenacity`, alongside the `httpx` this project already uses for Home Assistant.
+   (`httpx2` is legitimate — it is the Pydantic team's next-generation client, not a typosquat;
+   that was checked, because a dependency nobody recognises deserves checking.)
+2. **The feature is off by default.** Four new packages for a layer that is disabled unless an
+   API key is set is a poor trade at this size, where the alternative is ~30 lines of retry logic
+   with tests.
+3. **The vendor's SDK defaults to `jev-latest`.** Adopting it wholesale would adopt the alias by
+   default, which is the one thing [below](#pin-the-version-not-the-alias) says must not happen.
+
+So `flybrain/jev.py` is the only file that would change if this decision is reversed, and its
+tests pin the wire shapes either way.
 
 ### Pin the version, not the alias
 
@@ -487,35 +552,60 @@ next to the latency, next to the measured network floor.
 
 ## TODO
 
-Design only — nothing below exists. Ordered so that each step is testable on its own.
+**J0, J1 and J1a are built** ([`flybrain/jev.py`](../flybrain/jev.py), tested in
+`tests/test_jev.py` and `tests/test_jev_live.py`). Nothing has a UI yet, and the placements below
+still do not exist. The one thing that is *blocked* rather than unbuilt is called out below.
 
-**J0 — credential surface**
+**J0 — credential surface — done**
 - [x] Document `TYPESAFE_API_KEY` / `JEV_*` in `.env.example` and `.env`
-- [ ] A `JevConfig` reader in `flybrain/` following the `os.environ.get(...)` pattern, with tests
-- [ ] Default `JEV_MODEL` to the **versioned id `jev-1.13.0`**, never the alias, and refuse to
+- [x] A `JevConfig` reader following the `os.environ.get(...)` pattern, with tests
+- [x] Default `JEV_MODEL` to the **versioned id `jev-1.13.0`**, never the alias, and refuse to
       proceed if a response's `model` field differs from the pinned id
-- [ ] An `available()` check that reports *why* it is off (no key / key present but endpoint
-      unreachable), so the UI can say something true rather than failing silently
+- [x] An `available()` check that reports *why* it is off, with **three distinct** failure
+      reasons rather than two: `no_key` (403), `unauthorized` (401 — a key was sent and rejected),
+      and `unreachable`. The third state was not in the original plan; the live endpoint produced
+      it immediately, and it is the difference between "you forgot to configure this" and "your
+      key is being refused", which send an operator to different places.
 
-**J1 — the client, with no UI**
-- [ ] Prefer the official `typesafe_sdk` client — it retries with backoff and honours
-      `retry-after`. Fall back to `httpx` (already a dependency) only if the SDK is unusable
-- [ ] `flybrain/jev.py`: one call to `POST /v1/systemone`; typed `choice` / `score` / `noul`
-      helpers; parse `legend` and index-keyed `probabilities`
-- [ ] **Measure the network floor to `api.typesafe.ai` on this machine before recording any
-      latency number** — and always record the floor beside it
-- [ ] Reconcile `score` against `probabilities` to ±0.02 as a live assertion
-- [ ] A test that runs the whole client against recorded fixtures with no network
+**J1 — the client, with no UI — done**
+- [x] `httpx` rather than the official SDK — the reasoning is
+      [above](#we-use-httpx-not-the-sdk--and-why), and it is a reversal recorded rather than
+      quietly dropped
+- [x] `flybrain/jev.py`: one call to `POST /v1/systemone`; typed `choice` / `score` / `noul`
+      helpers; `legend` and per-kind `probabilities` parsing
+- [x] **Measured the network floor to `api.typesafe.ai` on this machine** — and found that the
+      *first* sample is ~3× the warm median, so the measurement is repeated and the method is
+      recorded
+- [x] Reconcile `score` against `probabilities` to ±0.02
+- [x] A test that runs the whole client against fixtures with no network — and one live test that
+      asserts the client's *diagnosis* is truthful, so it is useful even while the credential is
+      rejected
 
-**J1a — the three disciplines, as code rather than convention**
-- [ ] **Trim:** a `build_state()` emitting an object with named fields, changed entities only, and
-      rounded values — with a test asserting the token count stays under a documented budget
-- [ ] **Batch:** one request per UI action, never one per question — with a test asserting the
-      call count for a placement is exactly `1`
-- [ ] **Route:** a `route(answer) -> act | confirm | needs_human`, with thresholds read from
-      config rather than hard-coded, and tests at each band boundary
-- [ ] A cost log line per call: `input_tokens × $0.042/1e6`, latency, and the `model` id that
-      answered
+**J1a — the three disciplines, as code rather than convention — done**
+- [x] **Trim:** `build_state()` emits named fields, only changed values, rounded numbers, and the
+      busiest few regions — with a budget test. The budget is a character proxy for now, because
+      no successful response could be captured to read a real `usage.input_tokens` from.
+- [x] **Batch:** one request per judgment, asserted by counting calls
+- [x] **Route:** `route(answer, risk) -> act | confirm | needs_human` over three named risk tiers,
+      tested at both band boundaries, and monotone: a confidence that paints a verdict may only
+      propose a label, and may not even confirm a house action. Every tier is overridable from the
+      environment (`JEV_LABEL_ACT` and friends) rather than fixed in source, because these numbers
+      have to be calibrated on this project's own data and an unusable override falls back rather
+      than loosening the gate.
+- [x] A cost log line per call: computed cost, latency, the measured floor beside it, and the
+      `model` id that answered
+
+**Blocked on a valid credential.** The `TYPESAFE_API_KEY` in `.env` is well-formed
+(`jv_live_…`, 51 characters, no whitespace) and the server **rejects it with HTTP 401**
+persistently. Until that is re-minted at <https://console.typesafe.ai/keys>:
+
+- the confidence thresholds cannot be calibrated on real answers;
+- no live latency figure can be recorded (the floor can, and was);
+- J2's vocabulary cannot be validated against real verdicts.
+
+Everything else in J0–J1a is verified offline or against the real error paths, and
+`tests/test_jev_live.py` will begin reporting real answers the moment the key works, with no code
+change.
 
 **J2 — placement A, offline first**
 - [ ] Define the failure-mode vocabulary in code, including `unknown`
@@ -560,6 +650,11 @@ Recorded rather than smoothed over:
    like, and the docs are explicit that thresholds are domain-specific and must be tested on your
    own data. **They must be calibrated here before anything writes a label.** Until then every
    threshold stays conservative and every low-confidence answer becomes `needs_human`.
+   *Partly answered in code:* the three tiers now exist as settings rather than literals, and
+   `JEV_LABEL_ACT` defaults to `0.95` — deliberately between the two measurements, so the
+   measured *clear* case writes a label and the measured *ambiguous* case only proposes one. That
+   is a starting point that is honest about its provenance, not a calibration; the numbers still
+   come from someone else's data. Calibrating them is blocked on a working credential.
 3. **What happens when the label vocabulary is wrong?** If every option is wrong, one still
    wins. The `unknown` option is the mitigation, not a solution.
 4. **Does Jev's judgment drift?** Partly mitigated by pinning `jev-1.13.0` — a vendor release can
