@@ -95,6 +95,109 @@ It is worth being precise, because full real-time is not required for the thing 
 So the active-set port buys headroom and honesty, not the ability to do something otherwise
 impossible.
 
+## Idle cost, and adaptive pacing
+
+**The cheapest optimisation available is to not step the brain at all.** Everything above is
+about stepping it faster. This section is about stepping it *less*, which requires no new engine.
+
+### Where the energy actually goes
+
+Measured here: one decision is 300 ms of brain time, which costs **~2.3 s of continuous GPU
+work** at 0.13× realtime. Flat out that is **~165 W continuously** — and the shipped `.env`
+combines `FLYBRAIN_ALWAYS_ON=1` with an unset `FLYBRAIN_INTERVAL_S`, which is precisely that:
+full power, twenty-four hours a day, whether or not anything is watching.
+
+`interval_s` gates the *decision*, and the loop genuinely does not advance the brain while it
+waits, so average power falls roughly with the duty cycle. The duty cycle is
+`2.34 s / interval_s`, and the measured model is `mean ≈ 19 W + duty × 146 W` — checked against
+the hardware in [`live-view.md`](live-view.md#why-flat-out-is-the-default-and-why-you-should-change-it),
+which owns the measurements:
+
+| `interval_s` | Duty cycle | Mean power | Energy per day |
+|---|---|---|---|
+| `0` (flat out) | 100% | ~165 W | **~4.0 kWh** |
+| `5` | 47% | ~86 W | ~2.1 kWh |
+| `15` | 16% | ~40 W | ~1.0 kWh |
+| `60` | 4% | ~25 W | **~0.6 kWh** |
+
+**One line in `.env` is worth roughly 4×.** `FLYBRAIN_INTERVAL_S=15` takes a multi-day recording
+from ~4 kWh/day to ~1 kWh/day, and a room does not change faster than that.
+
+It is worth being clear about which knobs are *not* levers, because they look like they should
+be. `fps` barely matters: each iteration's `advance()` costs far more than the sleep it replaces,
+so the brain is the bottleneck rather than the sleep. `window_ms` moves work around without
+removing any. **Only the duty cycle materially reduces energy.**
+
+*(The 165 W figure is from the measurement earlier in this document; the operator's own
+observation is nearer 140 W, so the **ratios** in that table are the durable part and the
+absolute numbers should be re-measured alongside the network floor from
+[`jev.md`](jev.md#api-call-discipline). Everything that follows depends on the ratio only.)*
+
+### The cost of pacing badly
+
+Heavy pacing is not free, but the cost is not the one it looks like. Learning does not need
+windows to arrive quickly: a window recorded 60 seconds after the last one carries exactly as
+much information as one recorded immediately after it. What degrades is **independence**.
+
+A room changes on the scale of minutes. At a 60-second interval you collect 1,440 windows a day
+that are, for most of it, near-duplicates — so the *effective* sample size is closer to a few
+dozen independent events. That is the same autocorrelation that makes "split by day, not by
+random window" the only honest way to evaluate a readout, and the two problems have the same
+answer.
+
+The quantity to maximise is therefore not windows per day. It is **independent, labelled events
+per day, per joule**.
+
+### Adaptive pacing: a heartbeat plus a trigger
+
+A fixed interval forces a straight choice between energy and data. Asking *when is a window
+worth taking* escapes the trade:
+
+- **Heartbeat.** One window every `heartbeat_s` regardless of activity. This is not padding. The
+  brain is never reset, so a heartbeat keeps the reservoir in the regime the readout was fitted
+  on — and it produces the **quiet examples** that `house_activity` (roadmap A1) needs. Without
+  it an event-driven recorder would have no negatives to learn from, which is how this scheme
+  would fail silently.
+- **Burst.** When a trigger fires, run at full rate for `burst_s`, so an event is captured in
+  detail rather than sampled once.
+
+Power then scales with how interesting the house is, and because the windows taken are *events*
+rather than *samples*, the data is **less** redundant rather than more. Both halves are
+load-bearing: the heartbeat is what makes the scheme learnable, the trigger is what makes it
+cheap.
+
+### What the trigger should be
+
+Not Jev, and not a model. "Did something change?" is a cheap local comparison, and a threshold
+beats a model on it every time — the same rule that keeps a model out of the regime probe
+([`jev.md`](jev.md#where-jev-must-not-go)).
+
+The better trigger is one the roadmap already describes for another purpose: **`house_novelty`
+(A3), the reservoir's own prediction error.** Fit a readout to predict the next window's
+reservoir state from the current one; the prediction error is a surprise signal. It is
+multivariate and temporal — "the house is behaving unusually" rather than "one sensor crossed a
+line" — it is computed locally for nothing, and it needs no network call. That makes A3 the
+**scheduler** for pacing rather than merely a notifier, which is a better use of it than the one
+it was written for.
+
+Jev's part stays what [`jev.md`](jev.md) says it is: judging the windows the trigger selects,
+not selecting them.
+
+### Two traps
+
+**The pacing configuration is part of the training regime.** `AGENTS.md` #2 — train and run in
+the same regime — applies here in a way that is easy to miss. Event-weighted windows are a
+*different distribution* from fixed-interval ones, so a readout trained on bursts and then run
+against a steady heartbeat loses accuracy the same silent way as one trained from rest and run
+continuously. The pacing config therefore belongs in the recording's `meta.json` and has to be
+reproduced at inference time. It is not a runtime detail.
+
+**Pacing is visible, and that is a real trade.** With `interval_s` set, the 3D view advances in
+a burst and then holds still. `paintStaleness()` already reports that as "waiting" rather than
+"stalled", because the view was written expecting it. Constant motion is a *display* preference,
+not a modelling requirement — and bursting on novelty arguably makes the view more interesting
+than uniform churn, because it moves exactly when the house does.
+
 ## Gain calibration
 
 **Settled for fidelity: use the published `0.275 mV`.** `recurrent_scale` is `1.0` and the

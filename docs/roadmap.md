@@ -47,6 +47,13 @@ around.
 - **It cannot be told a rule.** You cannot write "when the sensor goes above X turn on the light"
   into it. It can only be *shown examples* and have a readout fitted. Everything it knows, it
   learned from data you had to record and label.
+- **It is not a fly.** The connectome is a **wiring graph inferred from microscopy**, not a
+  complete animal. The simulator supplies generic LIF dynamics rather than the fly's actual
+  membrane biophysics, and the mapping from a Home Assistant sensor onto sensory neurons is an
+  encoding *we* invented. The honest description of the result is a **fly-inspired house pet**,
+  not a digital fly. That does not make it less interesting — it is a fascinating reservoir — but
+  it is the difference between a claim about biology and a claim about our own construction, and
+  only one of those is true.
 
 So the honest pitch is not "an AI brain for your house". It is: **one shared, never-retrained
 feature extractor with temporal memory, that can answer many questions at once.** Build for that
@@ -83,6 +90,10 @@ Assistant sensors, and your existing automations should use them as **conditions
 ```
 
 That single design choice turns a toy into something you would actually leave running.
+
+**This posture is taken further in [§9](#9-the-house-pet-direction)**, which reaches the same
+conclusion — observation only, publish context, never own the policy — from the "house pet" framing
+rather than from the latency budget.
 
 ---
 
@@ -196,6 +207,12 @@ associative-learning circuit; there is a real analogue here, not just a metaphor
 advantage over a per-sensor threshold is that this is **multivariate and temporal** — it notices
 "the house is behaving wrongly", not "this one sensor crossed a line".
 
+**It has a second use that is arguably better than the first.** Because it answers "is anything
+unusual happening *right now*", the same signal is the natural **trigger for adaptive pacing**:
+burst at full rate when surprise is high, idle when it is not. That turns A3 from a notifier into
+the scheduler for the whole system, and it is the piece that makes multi-day recording affordable.
+See [`engine.md`](engine.md#what-the-trigger-should-be).
+
 **A4. Soft sensors.**
 Infer something you do not measure from things you do: humidity in a room with no sensor, or
 "the kitchen is in use" from temperature + humidity + motion + sound. This is genuine nonlinear
@@ -264,7 +281,7 @@ layer — the thing you glance at.
 
 ---
 
-## 6. Two honest constraints
+## 6. Three honest constraints
 
 **The fly's memory is short in brain-time.** Neural time constants here are tens of milliseconds.
 Even discounting for the slow simulation, that is well under a second of wall clock. House-relevant
@@ -282,6 +299,18 @@ also why §3 comes first, and why **teaching by demonstration** — an HA button
 is what I mean", plus a nightly refit over the recorded log — is the right UX. It is honest about
 how the thing learns, and it is the only workflow that scales past one or two readouts.
 
+**Evaluation must split by day, not by random window.** Windows from one continuous session are
+autocorrelated: a room changes over minutes, so neighbouring windows are near-duplicates of each
+other. Splitting them randomly puts a window's own twin in the test set and reports an accuracy the
+readout cannot reproduce tomorrow. Any claim that a readout — or the reservoir underneath it —
+earned its place has to be measured on **whole held-out days or sessions**, against at least one
+cheap baseline: a plain HA rule, and a linear fit on smoothed raw sensors. If the reservoir cannot
+beat smoothing-plus-a-line on held-out *days*, then it is contributing presentation rather than
+prediction, and saying so is more useful than a flattering number from a random split.
+
+This is the same autocorrelation that makes heavy pacing cheap in *effective* sample terms — see
+[`engine.md`](engine.md#the-cost-of-pacing-badly). One cause, two places it bites.
+
 ---
 
 ## 7. Phases
@@ -295,9 +324,22 @@ how the thing learns, and it is the only workflow that scales past one or two re
 | **3** | **First non-light sense.** Recommend `house_activity` (A1) — most useful, and it stress-tests multi-sensor input + multi-output publish. **Now unblocked: the recorder can collect the training data.** | Proves the context layer end to end. |
 | **4** | **Scene output** (C1) and publish state to HA as sensors (§2). | Turns it from a viewer into something your automations consume. |
 | **5** | **Engine: active-set integrator** (`engine.md`). Only if you want reactivity. | Not needed for any Tier A/B idea. Needed for motion-triggered anything. |
+| **6** | **Adaptive pacing** — a heartbeat plus a novelty trigger, so the brain runs hard when the house is interesting and idles when it is not. The zero-code version is available today: `FLYBRAIN_INTERVAL_S=15` in `.env`, worth roughly **4× less energy**. See [`engine.md`](engine.md#idle-cost-and-adaptive-pacing). | Performance is the binding constraint on multi-day recording. This is the only lever that materially moves energy — `fps` and `window_ms` do not. |
+| **J1** | **Jev client + credential surface** — `TYPESAFE_API_KEY` / `JEV_*` in `.env`, first-party at `api.typesafe.ai`, a typed client, and a **measured network floor** before any latency claim. Plus the three call disciplines as code: trim the state, batch the questions, route by confidence. See [`jev.md`](jev.md). | Zero risk, and every step below depends on it. |
+| **J2** | **Decision inspector** (Jev placement A) — clickable points in *Colour chosen*, each judged into one of seven documented failure modes. Built offline against a recording first. | The highest-value placement, and it needs no live-loop changes. |
+| **J3** | **Label proposal** (Jev placement B) — Jev proposes a label, you confirm or correct; written as `source="jev"`, with an agreement metric. | A lower-friction version of Phase 2, and it measures its own trustworthiness. |
+| **J4** | **Attention director** (Jev placement C) — a slow timer picks which region the dashboard emphasises. | Highest visual payoff; build last, once the vocabularies are proven. |
 
 Phases 0–3 are the ones that change what the project *is*. 4 is polish with high leverage. 5 is a
 separate project and should not block anything above it.
+
+**J1–J4 are a parallel track, not a competing one.** They do not block 1–5 and are not blocked by
+them, but **J3 supersedes Phase 2** — once the client exists there is no reason to build a
+type-the-label button when a confirm-or-correct one is available. The design, the closed
+vocabularies, the measured API facts, and the four places Jev must *not* be used all live in
+[`jev.md`](jev.md). The framing there is deliberately narrow: **Jev is a teacher and an auditor,
+never a narrator and never in the frame path**, and it is justified by typed decisions plus
+confidence — *not* by accuracy, which measured as a tie with a general chat model.
 
 **Also worth noting for Phase 3:** `house_activity` needs examples of the house being busy and
 quiet, and the only source of those labels is you pressing something when they happen. So the
@@ -327,3 +369,68 @@ The live instance was read on 2026-09-23; full inventory in [`ha-inventory.md`](
 The last two answers change the immediate work more than the rest combined: real-HA mode needs the
 entity set explicitly, and the warm end of the colour range can go 700 K lower than the software
 currently allows.
+
+---
+
+## 9. The house pet direction
+
+A direction rather than a feature, recorded because it is the clearest statement of what all of the
+above is *for* — and because it agrees with §2 while having arrived there from somewhere else, which
+is the most useful kind of agreement.
+
+### Observable personality, honest provenance
+
+The pitch: **let the reservoir produce slow state, and let explicit software decide how that state is
+presented.** The pet may appear curious, startled or settling. It must not *claim* to feel hunger,
+joy or intent — and the code should make that distinction structural rather than a matter of
+wording.
+
+Two rules follow:
+
+- **A small, closed vocabulary of states**, each derived from measured quantities — activity,
+  novelty, house signals — and never from a hand-written mood table. `resting`, `curious`,
+  `startled`, `settling` is a workable starting set.
+- **Every label shows its contributors.** If the pet says "curious", the panel shows which sensor
+  history and which region activity produced it. A label whose inputs are visible is a measurement;
+  a label whose inputs are hidden is a claim.
+
+That is the same discipline as [`jev.md`](jev.md#where-jev-goes): a closed vocabulary, with the
+evidence beside the answer on screen.
+
+### Observation only, to start
+
+The first version **watches and never controls anything essential**. It may read motion, illuminance,
+temperature and time of day, and express itself through a small accent light, a desk animation or a
+notification. It does not own the room's lighting policy.
+
+That is §2's conclusion reached from another direction, and it is the right one. If the fly ever does
+influence the house, it should publish slow context sensors **with confidence and freshness**
+attached and let existing automations decide what to do about them — never a whole-room policy from a
+reservoir.
+
+### A daily journal
+
+One short daily line — *"more active than usual at 18:20"* — with the sensor and spike trace that
+produced it, replayable. This is where the pet framing earns its keep: it makes behaviour legible
+over *days*, which is the timescale the reservoir's own memory cannot reach (§6). It is also the
+honest counterweight to a dashboard that only ever shows *now*.
+
+### The first real experiment
+
+Record several days with output disabled, and label three things: `quiet`, `passing through`, and
+`settled activity`. Then compare, on **whole held-out days** (§6):
+
+1. simple Home Assistant rules,
+2. a linear readout on smoothed **raw sensors**,
+3. a linear readout on **reservoir features**.
+
+If (3) wins consistently, the fly is contributing prediction rather than presentation and there is
+something worth writing down. If it does not, the honest conclusion is that this is a beautiful thing
+to watch — a legitimate result, and better to know than to assume.
+
+### Promoting a behaviour
+
+Nothing becomes pet behaviour on the strength of one good-looking session. The gate: it beat those
+baselines on days it had never seen, **and** the pacing configuration it was trained under was
+recorded and reproduced (Phase 6 — event-weighted windows are a different distribution from
+fixed-interval ones). Until then it stays a panel, not a behaviour.

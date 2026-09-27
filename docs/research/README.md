@@ -81,6 +81,49 @@ lessons:
   Two published gains from another project were read as confirmation that the weight did not
   transfer; they were about a different network and different behavioural targets.
 
+### Four defects found by an external review (2026-09-25)
+
+A second model reviewed the codebase cold. All four findings were verified against the code before
+anything was changed — none were false positives — and two of them had a cause more interesting
+than the symptom.
+
+1. **An unavailable sensor could drive a real light.** `HAClient._parse_state` substitutes a `0.0`
+   fallback for an offline entity, and `LiveLoop.drive_channels` checked only that the temperature
+   entity was *present* — while the extra-channel path a few lines below checked the state. An
+   unavailable thermometer was therefore encoded as a genuine 0 °C reading and decoded like any
+   other. The docstring three lines above the bug stated the correct principle.
+2. **A failed fetch left the loop acting on stale input.** `get_signals()` returns `[]` on failure;
+   with no signals the drive was never cleared and `_active_source_c` was never reset, so the
+   simulator kept running on the previous window's input and `decide()` kept decoding from it.
+3. **The recorder could silently misalign windows against feature rows.** `record()` appends the
+   feature row and *then* the window line, so a crash between the two leaves the files one apart;
+   and because the writer reopened in append mode, a partial row from a torn write ended up in the
+   *middle* of the file, shifting every later row by a constant offset while the row count still
+   looked correct.
+4. **A malformed settings message could kill the dashboard's activity stream.** The WebSocket
+   handler cast and assigned in one loop with no `try`; a bad value raised out of the receive loop
+   into a blanket handler that closed the connection, so one out-of-range number froze the view.
+
+Two mechanisms from these are worth carrying forward, because both are general:
+
+- **A duplicated constant is an invitation to an inconsistent check.** Finding 1 existed because
+  `{"unavailable", "unknown", "none", ""}` was defined *three* times — in `ha.py`, `wiring.py` and
+  `loop.py`. Two of the three call sites remembered to check it; the third did not. It now lives
+  once, in `types.py`, behind a shared helper.
+- **A "validated" path can still apply half of a patch.** Finding 4's server-side version cast each
+  field and assigned it inside the same loop, so `{"fps": 30, "gain": "abc"}` applied the frame rate
+  and *then* raised: a partial update the caller was told had been rejected. Coerce everything, then
+  commit everything. `LoopConfig.apply` had the same shape, and additionally read the string
+  `"false"` as `True` — `bool("false") is True` — which is how "keep the real light read-only"
+  becomes a live service call.
+
+The lesson is the same one already recorded above: **the expensive bugs here are the quiet ones.**
+None of these four produced an error, a log line, or a failed test. Finding 1 required the loop's
+own docstring to contradict its code; finding 3 required a row count that still looked plausible
+after every row had shifted. All four are now covered by tests that were confirmed to **fail**
+against the pre-fix source — because a regression test that passes either way is the degenerate
+validation described above, wearing a different hat.
+
 ## Corrections to commonly repeated claims
 
 | Claim | Reality |

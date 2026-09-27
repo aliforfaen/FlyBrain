@@ -23,7 +23,7 @@ population → learned ridge readout → colour temperature (K) → HA light.tur
 ```bash
 uv sync                                        # Python 3.11 → .venv (torch + CUDA wheels)
 .venv/bin/python tools/fetch_data.py           # connectome + annotations, ~140 MB, one time
-.venv/bin/python -m pytest tests/ -q           # 173 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q           # 197 tests, no connectome needed
 
 .venv/bin/python -m flybrain.experiment        # train the readout, ~50 s
 .venv/bin/python -m flybrain.server            # dashboard + live loop
@@ -106,6 +106,9 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
 - [`docs/wiring.md`](docs/wiring.md) — which sensor drives which fly pathway, and why the
   ordering of those rules matters
 - [`docs/vision.md`](docs/vision.md) — the camera→visual-column design, **not built**
+- [`docs/jev.md`](docs/jev.md) — the Jev judgment layer: three UI placements, their closed
+  vocabularies, the four places it must **not** be used, and the credential surface. **Not
+  built**; most of the value is in the negative recommendations
 - [`docs/licensing.md`](docs/licensing.md) — **read before shipping anything**
 - [`docs/research/`](docs/research/README.md) — asset inventory and the record of what went
   wrong along the way

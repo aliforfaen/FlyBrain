@@ -181,6 +181,25 @@ Train, then run:
 .venv/bin/python -m flybrain.server        # dashboard + live loop
 ```
 
+### When the sensor stops reporting, the loop stops acting
+
+A missing reading is not a reading of zero. When the configured temperature entity is offline,
+`unknown`, absent, or carrying a value that will not parse, the loop now takes no action at all
+and clears the drive, so the brain falls quiet rather than being fed its own last input.
+
+Two fields carry that to the dashboard, because a frozen number and a *wrong* number should not
+look the same:
+
+| Field | Meaning |
+|---|---|
+| `reading_stale` | no usable reading in this window; no service call was made |
+| `reading_age_s` | seconds since the last usable reading, so the panel can say how old it is |
+
+A stale window still returns an entry, deliberately — the dashboard has to be able to show that
+the loop has *stopped* and why. It is simply not appended to the decision history, which stays an
+X-Y plot of real decisions rather than acquiring colourless holes. `last_action.reason` is
+`sensor_stale` in that case, and `sent` is `false`.
+
 ### Training must match the regime the loop runs in
 
 This is the least obvious thing in the whole project, and getting it wrong cost real accuracy.
@@ -428,6 +447,12 @@ dashboard can show the cost next to the control.
 `interval_s` is adjustable live from the dashboard (*Light connection* → *How often it
 decides*), which displays the estimated wattage as you change it.
 
+**The next step past a fixed interval is adaptive pacing** — a slow heartbeat plus a burst when
+the house is actually interesting, so energy scales with activity instead of with the clock. The
+design, the reason a heartbeat is not optional, and why the trigger should be the reservoir's own
+prediction error (roadmap A3) rather than a model are in
+[`engine.md`](engine.md#idle-cost-and-adaptive-pacing).
+
 ### Pause
 
 Pause is the one control that really stops things, and it does so completely:
@@ -453,7 +478,7 @@ more than the memory is worth.
   `FLYBRAIN_ALWAYS_ON` is unset.
 - Pacing also dilates brain time relative to wall clock: 300 ms of brain time per 15 s is
   **0.02× realtime** rather than 0.13×. Fine for context, and the same knob discussed in
-  [`roadmap.md`](roadmap.md#6-two-honest-constraints).
+  [`roadmap.md`](roadmap.md#6-three-honest-constraints).
 
 ## Ideas for the viewer that are not built
 
@@ -474,10 +499,34 @@ Recorded so they do not have to be re-derived. Roughly in order of value per uni
   depends on. It is the most direct answer to "is the brain doing something sensible?".
 - **A "why" trace for one decision.** Record the per-neuron rates behind the current colour and
   let the user click a decision in the history to replay it. Turns the dashboard from a
-  readout into a debugger.
+  readout into a debugger. **Designed:** this is placement A in [`jev.md`](jev.md), where the
+  trace is a *classification* into one of seven failure modes this project already documents
+  (saturation, regime mismatch, deadband throttling, …) rather than a generated sentence.
+- **An attention director.** 138,639 points is more than anyone can scan, and the current
+  emphasis rule is the static `gain`/`saturation`/`gamma` threshold in
+  [`MemoryBrain.quantize()`](../flybrain/activity.py). A slow loop that picks which cell class to
+  emphasise would make the cloud readable. **Designed:** placement C in [`jev.md`](jev.md);
+  ranked below the "why" trace because it relies on the same vocabularies being good first.
 - **Real-time engine.** Everything above is cheap; this is not. 0.13× realtime means a decision
   every ~2.3 s, which is fine for a thermostat and hopeless for anything that reacts. The
   active-set integrator is the documented route (see `engine.md`).
+- **A pet card.** One expressive silhouette and a plain status sentence; a tap opens *"what
+  changed?"* — the contributing sensor history, the activity, and the readout output. Animated from
+  measured state, with the pause and stale states shown rather than hidden. It is meant to be
+  readable **at a glance**, which is the point: the 3D cloud is for looking at, a pet card is for
+  reading. The pet direction is [`roadmap.md` §9](roadmap.md#9-the-house-pet-direction).
+- **The three-layer explanation**, in this order: *"the house said"* / *"the brain did"* / *"we
+  mapped it to"*. The same ordering is specified in [`jev.md`](jev.md#where-jev-goes) for the
+  decision inspector, because it is the arrangement that keeps the middle layer genuinely the fly
+  while leaving no doubt that the third layer is ours.
+- **A memory trail.** A sparse timeline of meaningful changes, labels and corrections, where an
+  entry can be marked *"yes, that fits"* or *"no, just passing through"*. Those marks are stored as
+  **training examples, not instant weight changes** — the brain does not learn live, and a UI that
+  implied otherwise would be misrepresenting the architecture.
+- **Trust controls, obvious at a glance.** Mock or live, dry run on or off, when the sensor last
+  updated (the loop now reports `reading_stale` and `reading_age_s` — see *When the sensor stops
+  reporting* above), which session the readout was trained on, and which outputs are currently
+  allowed. Most of these exist; the work is putting them where they can be seen at once.
 - **A time-of-day prior.** A fly brain has circadian clock neurons, and as of the `clock` role fix
   they resolve correctly (48 cells — see [`roadmap.md`](roadmap.md#resolved-the-circadian-clock-role-was-unreachable)).
   Driving them from `sun.sun` elevation would be a cheap contextual input. It is not free, though:
