@@ -14,7 +14,12 @@ Endpoints
 ``GET  /``                    dashboard (static files)
 ``GET  /api/config``          connectome metadata + settings schema
 ``GET  /api/positions``       float32 LE, n*3, neuron soma positions (3D units)
-``GET  /api/regions``         per-cell-class usage snapshot
+``GET  /api/groups``          cell families + sensory pathways, with plain-English names
+``GET  /api/groups/ids``      uint8, n*2, family id then sense id per neuron
+``GET  /api/regions``         per-cell-class and per-family usage snapshot
+``GET  /api/trace``           where a family or sense sends its signals (summary geometry)
+``POST /api/jev``             classify one recorded decision (placement A)
+``POST /api/jev/enabled``     turn the judgment layer on or off for this process
 ``GET  /api/settings``        current settings
 ``POST /api/settings``        update settings
 ``POST /api/drive``           set/clear input drive on a neuron population
@@ -57,9 +62,19 @@ from fastapi.staticfiles import StaticFiles
 
 from flybrain.activity import ActivitySettings, MemoryBrain
 from flybrain.env import load_dotenv
+from flybrain.families import (
+    FAMILY_BY_KEY,
+    SENSE_BY_KEY,
+    SENSE_GROUPS,
+    family_ids,
+    group_id_buffer,
+    groups_payload,
+    sense_ids,
+)
 from flybrain.mapping import RoleResolver, default_output_roles, default_sensor_roles
 from flybrain.pet import HONESTY, STATES, PetWatcher, sensor_deltas, summarise_journal
 from flybrain.types import signal_is_dead
+from flybrain.wiring import role_for
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +152,13 @@ class BrainService:
         #: The Jev client is built lazily: with no API key there is nothing to build, and
         #: constructing it at import time would make an optional feature part of startup.
         self._jev = None
+        #: Runtime on/off for the judgment layer, overriding ``JEV_ENABLED`` for this process
+        #: only. ``None`` means "whatever the environment said". Kept separate from the config so
+        #: flipping it needs no restart, the same way the dry-run switch works.
+        self.jev_enabled_override: bool | None = None
+        #: Verdicts already paid for, keyed by brain sequence number. A decision cannot change
+        #: once recorded, so neither can its classification — which makes a re-click free.
+        self._jev_verdicts: dict[int, dict] = {}
         #: The house pet. Holds only the activity baseline and the state clock - everything it
         #: says is derived from a window that actually happened, which is why it lives here
         #: rather than in the browser: a state computed client-side from the last frame would be
@@ -151,6 +173,18 @@ class BrainService:
         #: Bursts, for the memory trail. Capped: the trail is a glance, not a log.
         self._bursts: list[dict] = []
         self._started_at = time.time()
+        #: Cell-family metadata and the 2-bytes-per-neuron id buffer. Built once on first
+        #: request: the buffer is ~277 KB and the family join touches all 138,639 rows, so
+        #: rebuilding it per poll would be the most expensive thing on the dashboard.
+        self._groups: dict | None = None
+        self._group_ids: bytes | None = None
+        #: Connection-trace state. The per-synapse arrays are built once and kept because every
+        #: trace request needs the same 15M-element expansion; the per-group answers are cached
+        #: because a decision to look at one pathway does not change what that pathway connects to.
+        self._trace_post = None
+        self._trace_pre = None
+        self._class_centroids_cache: np.ndarray | None = None
+        self._trace_cache: dict[str, dict] = {}
 
     # ----------------------------------------------------------------- setup
 
@@ -343,7 +377,9 @@ class BrainService:
         if self.loop is None:
             return
         try:
-            entry = await self.loop.decide(counts, window_ms)
+            entry = await self.loop.decide(
+                counts, window_ms, context=self._decision_context(counts)
+            )
         except Exception:
             logger.exception("control decision failed")
             # Tell the pacer anyway. Otherwise a persistent decode failure leaves the heartbeat
@@ -528,26 +564,80 @@ class BrainService:
             self._task.cancel()
             self._task = None
 
-    async def jev_status(self, *, refresh: bool = False) -> dict:
-        """Report the judgment layer's availability, building the client on first use."""
+    async def jev_status(self, *, refresh: bool = False, probe: bool = True) -> dict:
+        """Report the judgment layer's availability, building the client on first use.
+
+        ``probe`` defaults to True for the explicit endpoint and is passed False by the status
+        path, so that a dashboard being *watched* cannot spend money.
+        """
+        from flybrain.jev import session_spend
+
+        client = self._jev_client()
+        status = await client.available(refresh=refresh, probe=probe)
+        payload = status.to_dict()
+        # The redacted config, so an operator can see *which* endpoint and model are configured
+        # without the key ever leaving the process.
+        payload["config"] = client.config.redacted()
+        payload["calls"] = len(client.calls)
+        # The accounting from the most recent real call. Shown because a credit balance reaching
+        # zero is how a feature stops working without anyone noticing, and because the cost is the
+        # number that decides whether generous labelling is affordable.
+        if client.calls:
+            last = client.calls[-1]
+            payload["last_call"] = dict(last)
+            payload["spent_usd"] = session_spend(client)
+        return payload
+
+    def _jev_client(self):
+        """The Jev client, built on first use, with the runtime switch applied.
+
+        One place rather than two, because a second construction site is exactly how the status
+        badge and the inspector would end up disagreeing about whether Jev is on.
+        """
         from flybrain.jev import JevClient, JevConfig
 
         if self._jev is None:
             self._jev = JevClient(JevConfig.from_env())
-        status = await self._jev.available(refresh=refresh)
-        payload = status.to_dict()
-        # The redacted config, so an operator can see *which* endpoint and model are configured
-        # without the key ever leaving the process.
-        payload["config"] = self._jev.config.redacted()
-        payload["calls"] = len(self._jev.calls)
-        # The accounting from the most recent real call. Shown because a credit balance reaching
-        # zero is how a feature stops working without anyone noticing, and because the cost is the
-        # number that decides whether generous labelling is affordable.
-        if self._jev.calls:
-            last = self._jev.calls[-1]
-            payload["last_call"] = dict(last)
-            payload["spent_usd"] = round(sum(c.get("cost_usd") or 0.0 for c in self._jev.calls), 8)
-        return payload
+        if self.jev_enabled_override is not None:
+            self._jev.config.enabled_flag = self.jev_enabled_override
+        return self._jev
+
+    async def jev_verdict(self, seq: int) -> dict:
+        """Classify one recorded decision into a failure mode, caching per sequence number.
+
+        Cached because the same click should never cost a second question: a decision is
+        immutable once recorded, so its verdict is too.
+        """
+        from flybrain.jev import classify_decision
+
+        cached = self._jev_verdicts.get(seq)
+        if cached is not None:
+            # Still served when the layer has since been switched off: it was paid for, the
+            # decision has not changed, and re-asking would be spending to learn nothing.
+            return {**cached, "cached": True}
+
+        row = None
+        if self.loop is not None:
+            row = next((r for r in self.loop.history if r.get("seq") == seq), None)
+        if row is None:
+            raise KeyError(seq)
+
+        client = self._jev_client()
+        if not client.config.enabled:
+            # Answer with the same vocabulary the badge uses, so the card and the badge cannot
+            # tell two different stories about why there is no verdict.
+            status = await client.available(probe=False)
+            return {
+                "available": False,
+                "reason": status.reason,
+                "detail": status.detail,
+                "seq": seq,
+            }
+
+        verdict = await classify_decision(client, row)
+        verdict.update({"available": True, "seq": seq, "cached": False})
+        self._jev_verdicts[seq] = verdict
+        return verdict
 
     async def aclose(self) -> None:
         """Release the Jev client's connection pool, if it was ever built."""
@@ -747,8 +837,267 @@ class BrainService:
                 "trained": self._trained(),
                 "outputs": self._outputs(),
             },
-            "jev": await self.jev_status(),
+            "jev": await self.jev_status(probe=False),
         }
+
+    # ------------------------------------------------------------------ groups
+
+    def _decision_context(self, counts) -> dict:
+        """The parts of a decision that only the server can see, for the decision inspector.
+
+        ``seq`` is what gives a chart point and a verdict a shared identity, so clicking a point
+        names a decision the server already recorded rather than re-deriving one. ``top_regions``
+        is read here because the brain's per-window counts are overwritten by the next advance:
+        a breakdown not captured at this moment cannot be recovered from a later read, and the
+        inspector would have to send a thinner state than the design calls for.
+        """
+        brain = self.brain
+        if brain is None or counts is None:
+            return {}
+        context: dict = {"seq": brain.seq}
+        names = brain.class_names()
+        index = brain.class_index()
+        if index is not None and names:
+            totals = brain.counts_by_class(np.asarray(counts))
+            order = np.argsort(totals)[::-1][:5]
+            context["top_regions"] = [
+                {"name": names[int(i)], "spikes": int(totals[int(i)])}
+                for i in order
+                if totals[int(i)] > 0
+            ]
+        if self.loop is not None:
+            # `self.loop` is the LiveLoop; `self.loop.loop` is its LoopConfig. The names are
+            # genuinely inverted at that layer — `LiveLoop.config` is the *readout* config — so
+            # the connection settings are reached through `.loop`.
+            cfg = self.loop.loop
+            # Recorded with the row rather than read at verdict time: the settings are
+            # live-tunable, so asking later would describe the loop as it is now, not as it was
+            # when the decision was made — and `throttled` is a verdict *about* the deadband.
+            context["settings"] = {
+                "interval_s": float(cfg.interval_s),
+                "deadband_k": float(cfg.deadband_k),
+                "temp_range_c": [float(cfg.source_min_c), float(cfg.source_max_c)],
+            }
+        return context
+
+    def _wired_senses(self) -> dict[str, bool]:
+        """Which sensory pathways a live Home Assistant entity is currently driving.
+
+        Asked of :func:`flybrain.wiring.role_for` rather than mapped from the signal *kind*,
+        because that is exactly the decision the wiring code makes: ``role_for`` keys off the
+        entity *name*, since a bark detector and a motion detector both arrive as ``MOTION``.
+        Deriving it any other way here would let the legend disagree with what is actually wired.
+        """
+        wired: dict[str, bool] = {}
+        if self.loop is None:
+            return wired
+        # The trained temperature path is not in `channels` — it keeps its own encoding — so it
+        # has to be added explicitly or the pathway the light is read from would look unwired.
+        # Reached through `.loop`: `LiveLoop.config` is the readout config, not the connection one.
+        if getattr(self.loop.loop, "temperature_entity", ""):
+            wired["thermosensory"] = True
+        for channel in getattr(self.loop, "channels", []) or []:
+            match = role_for(channel.entity_id, channel.kind)
+            if match:
+                wired[str(match[0])] = True
+        return wired
+
+    def _build_groups(self) -> None:
+        """Build the family/sense ids and their metadata, once.
+
+        Every failure here degrades to "no families" rather than an exception: the point cloud
+        still renders without them, and a missing annotation table is a legitimate state (the
+        connectome is fetched separately), not an error.
+        """
+        if self._groups is not None:
+            return
+        sim, brain = self.sim, self.brain
+        if sim is None or brain is None or self.positions is None:
+            return
+        table = getattr(sim, "annotation_table", None)
+        n = int(sim.n_neurons)
+        if table is None:
+            logger.warning("no annotation table; cell families unavailable")
+            self._groups = {"n": n, "families": [], "senses": [], "orientation": {}}
+            self._group_ids = b""
+            return
+
+        family = (
+            family_ids(table["super_class"].to_numpy())
+            if "super_class" in table.columns
+            else np.zeros(n, dtype=np.uint8)
+        )
+        role_indices: dict[str, np.ndarray] = {}
+        if self.roles is not None:
+            for sense in SENSE_GROUPS:
+                try:
+                    role_indices[sense.key] = self.roles.resolve(sense.key).indices
+                except KeyError:
+                    # A role this build does not know about is a missing overlay, not a fault.
+                    logger.warning("no role %r; sense %r will have no cells", sense.key, sense.key)
+        sense = sense_ids(role_indices, n)
+        cell_type = table["cell_type"].to_numpy() if "cell_type" in table.columns else None
+
+        self._groups = groups_payload(
+            n_neurons=n,
+            family=family,
+            sense=sense,
+            positions=self.positions,
+            cell_type=cell_type,
+            wired=self._wired_senses(),
+        )
+        self._group_ids = group_id_buffer(family, sense)
+        logger.info(
+            "cell families: %d neurons, %d families, %d senses wired",
+            n,
+            len(self._groups["families"]),
+            sum(1 for s in self._groups["senses"] if s["wired"]),
+        )
+
+    def groups(self) -> dict:
+        """Family and sense metadata, plus where the orientation markers go."""
+        self._build_groups()
+        return self._groups or {}
+
+    def group_ids(self) -> bytes:
+        """Two bytes per neuron — family id then sense id — aligned with ``/api/positions``."""
+        self._build_groups()
+        return self._group_ids or b""
+
+    # ------------------------------------------------------------------- trace
+
+    def _trace_arrays(self):
+        """Per-synapse ``(post, pre)`` index arrays, expanded once and kept.
+
+        ``_W`` is stored as CSR, which is indexed by *post*, so the row each synapse belongs to
+        has to be expanded back out of ``crow_indices``. That is a single 15M-element pass, and
+        every trace request needs the same answer, so it is done once rather than per group.
+        """
+        if self._trace_post is None:
+            W = self.sim._W
+            torch = self.sim._torch
+            crow = W.crow_indices()
+            self._trace_post = torch.repeat_interleave(
+                torch.arange(crow.numel() - 1, dtype=torch.int32, device=crow.device),
+                crow.diff().to(torch.long),
+            )
+            # In CSR the column index *is* the presynaptic neuron.
+            self._trace_pre = W.col_indices()
+        return self._trace_post, self._trace_pre
+
+    def _class_centroids(self) -> np.ndarray:
+        """Mean soma position per ``cell_class``, for drawing group-to-group lines."""
+        if self._class_centroids_cache is None:
+            index = self.brain.class_index()
+            n = max(self.brain.n_classes, 1)
+            out = np.zeros((n, 3), dtype=np.float32)
+            if index is not None:
+                sizes = np.bincount(index, minlength=n)
+                for axis in range(3):
+                    out[:, axis] = np.bincount(
+                        index, weights=self.positions[:, axis], minlength=n
+                    ) / np.maximum(sizes, 1)
+            self._class_centroids_cache = out
+        return self._class_centroids_cache
+
+    def _group_indices(self, group: str) -> tuple[np.ndarray, str, str]:
+        """Resolve a family or sense key to neuron indices, a kind, and a plain-English label."""
+        family = FAMILY_BY_KEY.get(group)
+        if family is not None:
+            ids = self.brain.family_index()
+            if ids is None:
+                raise KeyError(group)
+            return np.flatnonzero(ids == family.id), "family", family.label
+        sense = SENSE_BY_KEY.get(group)
+        if sense is not None and self.roles is not None:
+            return self.roles.resolve(sense.key).indices, "sense", sense.label
+        raise KeyError(group)
+
+    def trace(self, group: str, top_k: int = 5) -> dict:
+        """Where a family or sense sends its signals, as group-to-group lines.
+
+        **This is a summary, not a synapse list.** 15,091,983 connections cannot be drawn, and a
+        picture of all of them is a hairball that answers nothing. What is drawn is one line per
+        target *cell class*, straight from the group's centre of mass to that class's centre of
+        mass, weighted by how many synapses actually run that way. The counts are exact; the
+        geometry is deliberately schematic, and the payload says so.
+        """
+        if group in self._trace_cache:
+            return {**self._trace_cache[group], "cached": True}
+        if self.sim is None or self.brain is None or self.positions is None:
+            raise RuntimeError("brain still loading")
+        indices, kind, label = self._group_indices(group)
+        if indices.size == 0:
+            raise KeyError(group)
+
+        import torch
+
+        post, pre = self._trace_arrays()
+        index = self.brain.class_index()
+        if index is None:
+            raise RuntimeError("no annotation table, so targets cannot be named")
+
+        member = torch.zeros(self.sim.n_neurons, dtype=torch.bool, device=pre.device)
+        member[torch.as_tensor(np.asarray(indices, dtype=np.int64), device=pre.device)] = True
+        targets = post[member[pre]]
+        classes = torch.as_tensor(index.astype(np.int64), device=pre.device)
+        counts = torch.bincount(classes[targets], minlength=self.brain.n_classes)
+        counts = counts.cpu().numpy()
+
+        names = self.brain.class_names()
+        order = np.argsort(counts)[::-1]
+        order = [int(i) for i in order if counts[int(i)] > 0][:top_k]
+        centroids = self._class_centroids()
+        origin = self.positions[np.asarray(indices)].mean(axis=0)
+
+        sources = self.family_index_of(indices)
+        payload = {
+            "group": group,
+            "kind": kind,
+            "label": label,
+            "neurons": int(indices.size),
+            "total_synapses": int(counts.sum()),
+            "note": (
+                "Lines join group centres of mass, not individual synapses. The synapse counts "
+                "are exact; the geometry is a summary."
+            ),
+            "targets": [
+                {
+                    "name": names[i],
+                    "synapses": int(counts[i]),
+                    "neurons": int((index == i).sum()),
+                    "from": [round(float(v), 4) for v in origin],
+                    "to": [round(float(v), 4) for v in centroids[i]],
+                }
+                for i in order
+            ],
+            "families": sources,
+            "cached": False,
+        }
+        self._trace_cache[group] = payload
+        return payload
+
+    def family_index_of(self, indices: np.ndarray) -> list[dict]:
+        """Which broad families a set of neurons falls into, largest first.
+
+        Sent with a trace so the panel can say *what* is being followed in the same words the
+        legend uses, rather than leaving the reader with a raw ``cell_class``.
+        """
+        self._build_groups()
+        if not self._groups:
+            return []
+        ids = self.brain.family_index()
+        if ids is None:
+            return []
+        present = ids[np.asarray(indices, dtype=np.int64)]
+        counts = np.bincount(present, minlength=len(self._groups["families"]) + 1)
+        out = [
+            {"key": f["key"], "label": f["label"], "neurons": int(counts[f["id"]])}
+            for f in self._groups["families"]
+            if counts[f["id"]] > 0
+        ]
+        out.sort(key=lambda d: d["neurons"], reverse=True)
+        return out
 
     def timeline(self) -> dict:
         """The memory trail: state changes, bursts, decisions, labels and actions, newest first.
@@ -896,15 +1245,68 @@ async def get_positions() -> Response:
     )
 
 
+@app.get("/api/groups")
+async def get_groups() -> dict:
+    """Broad cell families and sensory pathways, with their plain-English names.
+
+    One response rather than three: the legend, the id buffer and the orientation markers are
+    only meaningful together, and fetching them separately would let the client label families
+    with ids that do not match the buffer it is colouring.
+    """
+    if service.sim is None:
+        raise HTTPException(503, "brain still loading")
+    payload = await asyncio.to_thread(service.groups)
+    if not payload.get("families"):
+        raise HTTPException(503, "cell families unavailable (no annotation table)")
+    return payload
+
+
+@app.get("/api/groups/ids")
+async def get_group_ids() -> Response:
+    """The 2-bytes-per-neuron id buffer: family id, then sense id, in connectome order."""
+    if service.sim is None:
+        raise HTTPException(503, "brain still loading")
+    payload = await asyncio.to_thread(service.group_ids)
+    if not payload:
+        raise HTTPException(503, "cell families unavailable (no annotation table)")
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/api/trace")
+async def get_trace(group: str = "", top_k: int = 5) -> dict:
+    """Where one family or sense sends its signals — the guided-exploration connection trace.
+
+    Degrades rather than fails: a missing connectome, no annotation table or an unavailable
+    accelerator all answer 503 with a reason, and the guides that use this are required to work
+    without it. A trace is an overlay on an explanation, never the explanation itself.
+    """
+    if not group:
+        raise HTTPException(400, "group is required")
+    try:
+        return await asyncio.to_thread(service.trace, group, max(1, min(int(top_k), 12)))
+    except KeyError:
+        raise HTTPException(404, f"unknown group {group!r}") from None
+    except Exception as exc:
+        logger.warning("trace for %r unavailable: %s", group, exc)
+        raise HTTPException(503, f"trace unavailable: {exc}") from exc
+
+
 @app.get("/api/regions")
 async def get_regions() -> dict:
     if service.brain is None:
         raise HTTPException(503, "brain still loading")
     regions = await asyncio.to_thread(service.brain.region_usage)
+    # The family grouping rides along on the poll that already runs, so the legend's live
+    # activity can never be a different moment from the top-12 list beside it.
+    families = await asyncio.to_thread(service.brain.family_usage)
     # Kept so the pet's sentence can name the busiest cell class without a second, slower
     # recomputation of the same thing on the status path.
     service._last_regions = regions
-    return {"regions": regions}
+    return {"regions": regions, "families": families}
 
 
 @app.get("/api/settings")
@@ -974,14 +1376,55 @@ async def get_jev_status(refresh: bool = False) -> dict:
 
     The dashboard shows this beside the trust badges, because "Jev is off" and "Jev is broken"
     look identical in a log and identical in a UI that only renders a boolean. The endpoint
-    distinguishes them without anyone reading a file: ``no_key`` (nothing configured),
-    ``unauthorized`` (a key was sent and the server refused it), ``unreachable`` (no network).
+    keeps six reasons apart: ``disabled`` (switched off), ``no_key`` (nothing configured),
+    ``unprobed`` (nobody has asked yet), ``unauthorized`` (a key was sent and refused),
+    ``unreachable`` (no network), and ``ok``.
 
-    ``refresh=true`` re-probes instead of using the cached answer. The probe is a real request, so
-    it is cached — but it asks ``GET /v1/models``, which costs no input tokens, so a dashboard may
-    call it freely.
+    ``refresh=true`` re-probes instead of using the cached answer. **The probe is not free**: this
+    host has no ``/v1/models`` to call, so it spends one trivial *question* — which is why the
+    result is cached and why ``/api/status`` passes ``probe=False`` rather than paying for a badge
+    on a timer.
     """
     return await service.jev_status(refresh=refresh)
+
+
+@app.post("/api/jev/enabled")
+async def post_jev_enabled(body: dict) -> dict:
+    """Turn the judgment layer on or off for this process.
+
+    Runtime-only, like the dry-run switch: ``JEV_ENABLED`` in ``.env`` is the durable setting and
+    this exists so the spend can be stopped without editing a file and restarting. Switching *on*
+    re-probes, because the point of turning it on is to find out whether it works; switching off
+    needs no round trip at all.
+    """
+    value = body.get("value")
+    if not isinstance(value, bool):
+        raise HTTPException(400, "value must be true or false")
+    service.jev_enabled_override = value
+    return await service.jev_status(refresh=value, probe=value)
+
+
+@app.post("/api/jev")
+async def post_jev(body: dict) -> dict:
+    """Classify one recorded decision into a failure mode — placement A.
+
+    A ``disabled``/``no_key`` layer answers **200** with ``available: false`` rather than an
+    error: "Jev is off" and "Jev is broken" have to look different, and an HTTP failure would
+    render both as the same red message. A genuine failure to get an answer is a 502, because
+    that one *is* an error.
+    """
+    from flybrain.jev import JevError
+
+    seq = body.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise HTTPException(400, "seq must be an integer")
+    try:
+        return await service.jev_verdict(seq)
+    except KeyError:
+        raise HTTPException(404, f"no decision recorded with seq {seq}") from None
+    except JevError as exc:
+        # Nothing cached, deliberately: a transient failure must not be remembered as an answer.
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.get("/api/status")

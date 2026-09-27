@@ -51,6 +51,28 @@ logger = logging.getLogger(__name__)
 READOUT_FILE = "colour_readout.npz"
 META_FILE = "colour_meta.json"
 
+#: The fields of a history row the *browser* draws or clicks with.
+#:
+#: A row also carries the per-class spike breakdown and the settings that produced it, which only
+#: the decision inspector reads — and it reads them on the server, where the full row is kept.
+#: Sending them on every loop broadcast would add tens of kilobytes per decision to a payload the
+#: client never looks at, so the snapshot trims to this list instead.
+CHART_FIELDS: tuple[str, ...] = (
+    "t",
+    "temperature_c",
+    "kelvin",
+    "ideal_kelvin",
+    "band",
+    "seq",
+    "active_neurons",
+    "total_spikes",
+)
+
+
+def chart_row(row: dict) -> dict:
+    """A history row trimmed to what the chart needs, with missing keys kept as ``None``."""
+    return {key: row.get(key) for key in CHART_FIELDS}
+
 
 class MissingReadout(RuntimeError):
     """Raised when the trained colour readout has not been built yet."""
@@ -585,12 +607,23 @@ class LiveLoop:
         logger.warning("sensor %r not found in Home Assistant", self.loop.temperature_entity)
         return None
 
-    async def decide(self, window_counts: np.ndarray, window_ms: float) -> dict | None:
+    async def decide(
+        self,
+        window_counts: np.ndarray,
+        window_ms: float,
+        *,
+        context: dict | None = None,
+    ) -> dict | None:
         """Complete one control cycle: decode, act, record.
 
         The window being decoded must already have been driven by :meth:`drive_temperature`;
         the reading reported here is the one that actually drove it, not a fresh read. That
         ordering is what makes the decision causal rather than prophetic.
+
+        ``context`` carries what only the *caller* can know — the brain's sequence number and its
+        per-class spike breakdown — and is merged into the recorded row. It is a parameter rather
+        than a lookup because this class deliberately does not own the brain, and reaching for one
+        would make the loop and the web layer two owners of the same state.
 
         Returns ``None`` only when there is genuinely nothing to report. A *stale* reading does
         return an entry, deliberately: the dashboard has to be able to show that the loop has
@@ -661,13 +694,49 @@ class LiveLoop:
             "temperature_c": round(temperature, 3),
             "kelvin": round(kelvin),
             "band": self.band_for(kelvin),
+            # The colour this temperature *should* have produced. Stored rather than recomputed,
+            # because the sensitivity range is live-tunable and recomputing later would judge an
+            # old decision against settings that did not exist when it was made.
+            "ideal_kelvin": (
+                None if (ideal := self.ideal_kelvin(self._active_brain_c)) is None
+                else round(ideal)
+            ),
+            # What the decision inspector needs to explain *this* decision later. Captured here
+            # because the brain's per-window counts are overwritten by the next advance: a group
+            # breakdown that was not read at this moment cannot be reconstructed from a later one,
+            # and the inspector would have to send a thinner state than it should.
+            "active_neurons": int(np.count_nonzero(window_counts)),
+            "total_spikes": int(np.sum(window_counts)),
+            "window_ms": round(float(window_ms), 3),
+            "reading_age_s": (
+                None if self.last_good_reading_at is None
+                else round(now - self.last_good_reading_at, 1)
+            ),
         }
+        if context:
+            entry.update(context)
         self.history.append(entry)
         if len(self.history) > self.loop.history:
             del self.history[: len(self.history) - self.loop.history]
         return entry
 
     # ------------------------------------------------------------------- view
+
+    def ideal_kelvin(self, brain_c: float | None) -> float | None:
+        """The perfect colour for a brain temperature, on the same ramp the chart draws.
+
+        Extracted rather than left inline in :meth:`snapshot` because the decision inspector
+        compares a recorded colour against it: two implementations of "ideal" would eventually
+        disagree, and the disagreement would show up as a Jev verdict contradicted by the chart
+        directly above it.
+        """
+        if brain_c is None:
+            return None
+        lo, hi = self.band_centres[0], self.band_centres[-1]
+        u = (brain_c - self.config.temp_min_c) / max(
+            self.config.temp_max_c - self.config.temp_min_c, 1e-9
+        )
+        return float(lo + float(np.clip(u, 0.0, 1.0)) * (hi - lo))
 
     def snapshot(self) -> dict:
         """Everything the dashboard needs to draw the loop's current state."""
@@ -683,13 +752,7 @@ class LiveLoop:
         brain_c = self._active_brain_c
         if brain_c is None and reading is not None:
             brain_c = self.brain_temperature(reading)
-        ideal = None
-        if brain_c is not None:
-            lo, hi = self.band_centres[0], self.band_centres[-1]
-            u = (brain_c - self.config.temp_min_c) / max(
-                self.config.temp_max_c - self.config.temp_min_c, 1e-9
-            )
-            ideal = float(lo + float(np.clip(u, 0.0, 1.0)) * (hi - lo))
+        ideal = self.ideal_kelvin(brain_c)
         err = None if (ideal is None or self.kelvin is None) else self.kelvin - ideal
         return {
             "mode": self.loop.mode,
@@ -740,7 +803,7 @@ class LiveLoop:
             # needs the first to explain a still picture, and the second because with a trigger
             # in play the energy cost is no longer predictable from the interval alone.
             "pacing": self.pacer.snapshot(time.monotonic()),
-            "history": self.history,
+            "history": [chart_row(row) for row in self.history],
             "error": self.last_error,
             # Connection settings + what the room has actually been doing, so the
             # dashboard can show them and offer to fit the range automatically.

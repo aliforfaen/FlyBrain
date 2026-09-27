@@ -1,0 +1,15 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "ok": {
+      "type": "noul",
+      "noul": 0.41
+    }
+  },
+  "usage": {
+    "input_tokens": 283,
+    "output_tokens": 20,
+    "cost_usd": 0.000119,
+    "credits_remaining_usd": 4.978063
+  }
+}

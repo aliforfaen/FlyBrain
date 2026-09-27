@@ -94,14 +94,16 @@ class JevError(RuntimeError):
 class JevAuthError(JevError):
     """The request was refused for credential reasons.
 
-    ``reason`` is one of the two states the live endpoint actually distinguishes:
+    ``reason`` is one of the states the live endpoint actually distinguishes, plus one this
+    client adds:
 
+    * ``"disabled"`` — switched off here. Nothing was sent, and a key may well be configured.
     * ``"no_key"`` — HTTP 403, ``"Must supply an API key!"``. Nothing was sent.
     * ``"unauthorized"`` — HTTP 401, ``"Cannot authenticate with the server"``. A key is present
       and the server will not accept it: revoked, mistyped, or for a different environment.
 
-    Keeping these apart matters because the fix is different: one is a missing setting, the other
-    is a credential that looks entirely well-formed.
+    Keeping these apart matters because the fix is different: one is a switch, one is a missing
+    setting, and the other is a credential that looks entirely well-formed.
     """
 
     def __init__(self, reason: str, message: str = "") -> None:
@@ -344,6 +346,128 @@ def score(instructions: str, criteria: Sequence[Any]) -> dict:
     return {"type": "score", "instructions": instructions, "criteria": list(criteria)}
 
 
+# ------------------------------------------------------------------------ placements
+
+
+#: The closed vocabulary for the decision inspector — placement A in ``docs/jev.md``.
+#:
+#: Every entry is a failure mode this project already documents *elsewhere*, which is the whole
+#: design: Jev is used as an **auditor**, not a narrator. It does not describe a decision in
+#: prose, it sorts one into a category somebody can act on, and those categories exist because
+#: each of them has already cost this project real time. A label the rest of the docs cannot
+#: explain would be a label nobody can verify.
+FAILURE_MODES: Mapping[str, str] = {
+    "healthy": "Tracks the ideal mapping within tolerance. Nothing is wrong with this decision.",
+    "saturated_sensory": (
+        "The sensory population was at its documented ceiling, so more input cannot change the "
+        "answer. See engine.md: the antennal lobe saturates at a receptor rate of 25 Hz or more."
+    ),
+    "regime_mismatch": (
+        "The window began from rest rather than the running regime the readout was fitted on, so "
+        "the decode is being asked a question it was not trained for. See AGENTS.md #2."
+    ),
+    "too_few_spikes": (
+        "The readout population barely responded, so the decoded colour rests on very little "
+        "evidence and could be near-arbitrary."
+    ),
+    "sensor_stale": (
+        "The temperature reading driving this window was old rather than fresh, so the colour "
+        "describes the room as it was some time ago."
+    ),
+    "throttled": (
+        "The colour moved but the deadband suppressed the service call, so the light was "
+        "deliberately left where it was."
+    ),
+    "unknown": "None of the above describes this decision.",
+}
+
+#: The fields a failure-mode judgement is allowed to see.
+#:
+#: "Trim the state" is the first of the three call disciplines in ``docs/jev.md``: every field
+#: sent costs tokens and, worse, invites reasoning from something irrelevant. Each entry here is
+#: named by at least one row of :data:`FAILURE_MODES`, and nothing else is sent.
+DECISION_STATE_FIELDS: tuple[str, ...] = (
+    "temperature_c",
+    "ideal_kelvin",
+    "kelvin",
+    "band",
+    "active_neurons",
+    "total_spikes",
+    "window_ms",
+    "reading_age_s",
+    "top_regions",
+    "settings",
+)
+
+
+def decision_state(row: Mapping[str, Any]) -> dict:
+    """Trim a recorded decision to the fields the failure-mode vocabulary can use.
+
+    Missing fields are omitted rather than sent as ``null``, so the model cannot reason about a
+    value the project never measured as though it were a zero.
+    """
+    return {key: row[key] for key in DECISION_STATE_FIELDS if row.get(key) is not None}
+
+
+def session_spend(client: JevClient) -> float:
+    """Total reported cost of everything this client has asked, including probes.
+
+    Defined here rather than summed at each call site because the probe is easy to forget, and a
+    figure labelled "spent" that quietly excludes the dashboard's own requests is worse than no
+    figure at all. Costs the vendor did not report are counted as zero rather than guessed at.
+    """
+    return round(sum(float(c.get("cost_usd") or 0.0) for c in client.calls), 8)
+
+
+def failure_mode_question() -> dict:
+    """The one ``choice`` question placement A asks."""
+    return choice(
+        "This is one recorded decision from a fruit-fly connectome driving a room light. "
+        "Given the state, decide which single label best explains how the colour came out. "
+        "Choose 'healthy' only if the chosen colour tracks the ideal within a small tolerance; "
+        "prefer a specific failure mode whenever the state shows one.",
+        FAILURE_MODES,
+    )
+
+
+async def classify_decision(
+    client: JevClient,
+    row: Mapping[str, Any],
+    *,
+    risk: Risk = PAINT,
+    question_id: str = "failure_mode",
+) -> dict:
+    """Ask Jev which failure mode a recorded decision looks like.
+
+    Returns a plain dict rather than a :class:`JevResponse` because the caller is an HTTP
+    endpoint that has to serialise it, and because the *routing* is part of the answer: a verdict
+    is only usable if you also know how much to trust it. A ``noul`` or a low confidence comes
+    back as ``needs_human`` with the reason attached, which is a real outcome and not an error —
+    this project's own measurement produced 0.34 for a state containing a contradiction.
+    """
+    response = await client.ask(decision_state(row), {question_id: failure_mode_question()})
+    answer = response.answers.get(question_id)
+    if answer is None:
+        raise JevError(f"Jev answered without a {question_id!r} answer")
+    routing = route(answer, risk)
+    probabilities = getattr(answer, "probabilities", None) or {}
+    return {
+        "label": getattr(answer, "choice", None),
+        "confidence": answer.confidence,
+        "action": routing.action,
+        "routing_reason": routing.reason,
+        "probabilities": {str(k): float(v) for k, v in probabilities.items()},
+        "model": response.model,
+        "cost_usd": response.cost_usd,
+        "cost_reported": response.cost_reported,
+        "credits_remaining_usd": response.credits_remaining_usd,
+        "latency_ms": round(response.latency_ms, 1),
+        "floor_ms": response.network_floor_ms,
+        "input_tokens": response.input_tokens,
+        "output_tokens": response.output_tokens,
+    }
+
+
 # ------------------------------------------------------------------------------------- config
 
 
@@ -399,6 +523,14 @@ class JevConfig:
     network_floor_ms: float | None = None
     #: Refuse an answer whose reported ``model`` is not the pinned id. See ``JevModelMismatch``.
     strict_model: bool = True
+    #: The on/off switch, independent of whether a key is present. Default **False**.
+    #:
+    #: Defaulting to off is a deliberate cost decision rather than diffidence. Merely having the
+    #: dashboard open used to spend one probe question every ``PROBE_TTL_S`` (about $0.03/day) to
+    #: feed a badge, and a dashboard is a thing people leave running for weeks. Nothing should
+    #: spend money as a side effect of being *watched*; the switch makes the spend something a
+    #: person asked for. ``JEV_ENABLED=1`` turns it on.
+    enabled_flag: bool = False
 
     def __post_init__(self) -> None:
         """Normalize the key once, so `enabled`, `redacted` and the header all agree.
@@ -434,6 +566,8 @@ class JevConfig:
             network_floor_ms=None if not floor else _number(floor, 0.0),
             strict_model=(e.get("JEV_STRICT_MODEL") or "1").strip().lower()
             not in {"0", "false", "no", "off"},
+            enabled_flag=(e.get("JEV_ENABLED") or "0").strip().lower()
+            in {"1", "true", "yes", "on"},
             risks={name: _risk_from_env(e, risk) for name, risk in DEFAULT_RISKS.items()},
         )
 
@@ -446,6 +580,17 @@ class JevConfig:
 
     @property
     def enabled(self) -> bool:
+        """Whether Jev may be called at all: a key *and* the switch.
+
+        Both are required, and they are kept separate on purpose. "Off" is a choice, "no key" is
+        an omission, and they send a person to different places — which is the whole reason
+        :class:`JevStatus` distinguishes them rather than reporting one "unavailable".
+        """
+        return self.enabled_flag and bool(self.api_key)
+
+    @property
+    def key_present(self) -> bool:
+        """Whether a credential exists, regardless of the switch."""
         return bool(self.api_key)
 
     @property
@@ -471,7 +616,8 @@ class JevConfig:
             "timeout_s": self.timeout_s,
             "network_floor_ms": self.network_floor_ms,
             "strict_model": self.strict_model,
-            "key_present": self.enabled,
+            "enabled": self.enabled,
+            "key_present": self.key_present,
             "key_hint": None if not self.api_key else f"...{self.api_key[-4:]}",
         }
 
@@ -481,7 +627,7 @@ class JevStatus:
     """Why Jev is or is not usable, in a form the UI can say out loud."""
 
     available: bool
-    reason: Literal["ok", "no_key", "unauthorized", "unreachable", "disabled"]
+    reason: Literal["ok", "no_key", "unauthorized", "unreachable", "disabled", "unprobed"]
     detail: str = ""
     models: Sequence[str] = ()
     floor_ms: float | None = None
@@ -598,7 +744,7 @@ class JevClient:
                 pass
         return min(8.0, 0.5 * (2**attempt)) * (0.5 + random.random())
 
-    async def available(self, *, refresh: bool = False) -> JevStatus:
+    async def available(self, *, refresh: bool = False, probe: bool = True) -> JevStatus:
         """Report whether Jev can be used right now, and if not, why.
 
         This asks one minimal question rather than probing a cheap endpoint, because **this host
@@ -606,11 +752,29 @@ class JevClient:
         check costs a fraction of a cent rather than nothing, which is why the result is cached for
         :data:`PROBE_TTL_S` and why ``refresh`` is explicit rather than implied.
 
-        The three failure reasons are kept apart on purpose — see :class:`JevAuthError`.
+        ``probe=False`` is what the *status* path passes. A dashboard that is merely being looked
+        at must not spend money, so this returns the last known answer and otherwise says
+        ``unprobed`` — a state the UI shows as "not checked yet", not as a failure.
+
+        The failure reasons are kept apart on purpose — see :class:`JevAuthError`:
+        ``disabled`` means a person switched it off, ``no_key`` means nothing was configured,
+        ``unprobed`` means nobody has asked yet, and ``unauthorized`` means the far end refused a
+        credential that does exist. Four different actions follow from those four words.
         """
-        if not self.config.enabled:
+        if not self.config.api_key:
+            # Checked *before* the switch, deliberately. With no key at all, "nothing is
+            # configured" is the fact that sends someone to the right place; "switched off" would
+            # be true but useless, since there was never anything to switch on.
             return JevStatus(
                 False, "no_key", f"no {' or '.join(API_KEY_VARS)} in the environment",
+                floor_ms=self.config.network_floor_ms,
+            )
+        if not self.config.enabled_flag:
+            return JevStatus(
+                False,
+                "disabled",
+                "Jev is switched off (JEV_ENABLED=0). A key is configured and unused; "
+                "nothing is sent and nothing is spent.",
                 floor_ms=self.config.network_floor_ms,
             )
         now = self._clock()
@@ -621,6 +785,17 @@ class JevClient:
             and (now - self._status_at) < PROBE_TTL_S
         ):
             return self._status
+        if not probe:
+            if self._status is not None:
+                # Stale, but it is the last thing actually observed. Reporting it beats
+                # reporting "unknown" when we do in fact know something.
+                return self._status
+            return JevStatus(
+                False,
+                "unprobed",
+                "not checked yet — the dashboard has not asked, and asking costs a request.",
+                floor_ms=self.config.network_floor_ms,
+            )
 
         status = await self._probe()
         self._status, self._status_at = status, now
@@ -642,8 +817,48 @@ class JevClient:
                 floor_ms=self.config.network_floor_ms,
             )
         if response.status_code == 200:
+            self._record_probe(response)
             return JevStatus(True, "ok", "", floor_ms=self.config.network_floor_ms)
         return self._status_for_error(response)
+
+    def _record_probe(self, response: httpx.Response) -> None:
+        """Log the probe's real cost.
+
+        The probe asks a real question, so it really does cost money, and leaving it out of
+        :attr:`calls` made ``spent_usd`` under-report the session by exactly the amount the
+        dashboard spends on itself — the one number a person would use to decide whether to leave
+        it running. The entry carries ``probe: True`` so an availability check can still be told
+        apart from a judgment.
+        """
+        entry: dict[str, Any] = {
+            "model": self.config.model,
+            "questions": 1,
+            "probe": True,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "latency_ms": None,
+            "floor_ms": self.config.network_floor_ms,
+            "cost_usd": 0.0,
+            "cost_reported": False,
+            "credits_remaining_usd": None,
+        }
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            usage = body.get("usage")
+            if isinstance(usage, dict):
+                entry["input_tokens"] = int(usage.get("input_tokens") or 0)
+                entry["output_tokens"] = int(usage.get("output_tokens") or 0)
+                if usage.get("cost_usd") is not None:
+                    entry["cost_usd"] = float(usage["cost_usd"])
+                    entry["cost_reported"] = True
+                if usage.get("credits_remaining_usd") is not None:
+                    entry["credits_remaining_usd"] = float(usage["credits_remaining_usd"])
+            if body.get("model"):
+                entry["model"] = str(body["model"])
+        self.calls.append(entry)
 
     def _status_for_error(self, response: httpx.Response) -> JevStatus:
         """Map a refusal to a reason the operator can act on.
@@ -708,8 +923,15 @@ class JevClient:
         """
         if not questions:
             raise JevError("at least one question is required")
-        if not self.config.enabled:
+        if not self.config.api_key:
             raise JevAuthError("no_key", f"no {' or '.join(API_KEY_VARS)} in the environment")
+        if not self.config.enabled_flag:
+            # Deliberately not reported as "no_key": a key may be sitting right there in `.env`.
+            # Saying "no key in the environment" when one exists sends a person to edit the wrong
+            # thing, which is the exact failure this whole distinction exists to prevent.
+            raise JevAuthError(
+                "disabled", "Jev is switched off (JEV_ENABLED=0); no request was sent"
+            )
 
         payload = {
             "state": state,

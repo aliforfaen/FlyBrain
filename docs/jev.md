@@ -377,10 +377,13 @@ Two measured caveats:
 Three placements, in the order they should be built. Each one names the panel it lives in, the
 question kind, and the vocabulary — because the vocabulary is the actual work.
 
-### A. The decision inspector — *build this first*
+### A. The decision inspector — **built**
 
-**Panel:** the existing **Colour chosen** scatter. Make each point clickable; the verdict appears
-beside it.
+**Panel:** the existing **Colour chosen** scatter. Each point is clickable; the verdict appears
+beneath the chart, in the three-layer order described at the end of this section.
+
+**It needs `JEV_ENABLED=1`.** With the layer off — which is the default — clicking a point shows
+*why* it is off and a button to turn it on, rather than an error.
 
 **This is already in the repo as an unbuilt idea** — [`live-view.md`](live-view.md) lists *"A
 'why' trace for one decision... Turns the dashboard from a readout into a debugger."* Jev is the
@@ -514,9 +517,10 @@ systemd unit or container env block works unchanged. See [`.env.example`](../.en
 
 | Variable | Meaning |
 |---|---|
-| `TYPESAFE_API_KEY` | The credential, from the [TypeSafe console](https://console.typesafe.ai/keys). Absent ⇒ the whole feature is off |
+| `TYPESAFE_API_KEY` | The older spelling of the credential, still read so an existing `.env` is not silently ignored |
+| `JEV_API_KEY` | The credential, from the provider console. Absent ⇒ `no_key`, and nothing is ever sent |
+| `JEV_ENABLED` | **Default `0` — jevless.** A key alone is a credential, not a decision to spend. See below |
 | `JEV_MODEL` | **`jev-1.13.0`** — the versioned id, deliberately, *not* the `jev-latest` alias. See below |
-| `JEV_API_KEY` | The credential, from the provider console. **Absent ⇒ the whole feature is off.** The older `TYPESAFE_API_KEY` spelling is still read, so an existing `.env` is not silently ignored |
 | `JEV_BASE_URL` | `https://jevtypesafeai.com/api/v1/decide`; the bare host also works |
 | `JEV_TIMEOUT_S` | Request timeout; default `30` |
 | `JEV_NETWORK_FLOOR_MS` | The measured floor, recorded beside every latency figure. Unset ⇒ reported as "not measured", never as `0` |
@@ -524,6 +528,49 @@ systemd unit or container env block works unchanged. See [`.env.example`](../.en
 | `JEV_PAINT_ACT` / `_CONFIRM` | Thresholds for a judgment that only paints a verdict on screen |
 | `JEV_LABEL_ACT` / `_CONFIRM` | The ones that matter: a wrong label silently corrupts the training set. Default act `0.95` — above the under-determined case (0.34) so it can never write, and below the top of the determined range (0.99) so a maximally determined answer can |
 | `JEV_HA_ACT` / `_CONFIRM` | Thresholds for a judgment that gates a Home Assistant action. Default act `0.98` |
+
+### Jevless mode, and why it is the default
+
+**A key is a credential, not a decision to spend.** The reachability probe is a real question on a
+host with no free endpoint to poll, and `/api/status` used to trigger it every five minutes — about
+**$0.03/day** to feed a badge, on a dashboard people leave open for weeks. Since nothing consumed
+the answer until placement A existed, that was a recurring cost with no benefit.
+
+So two things changed:
+
+- **`/api/status` never probes.** It reports the last known answer, or `unprobed`. The one call that
+  costs money is the one a person asked for — opening the panel or pressing the switch.
+- **`JEV_ENABLED` defaults to `0`.** With it off, `available()` returns without touching the network
+  at all.
+
+The switch in *What it may touch* flips it for one process without editing a file, the same way the
+dry-run switch works. `.env` remains the durable setting.
+
+**Six reasons, not four**, because each one sends a person somewhere different:
+
+| Reason | Means | What to do |
+|---|---|---|
+| `disabled` | You turned it off. A key may be sitting right there | Flip the switch, or set `JEV_ENABLED=1` |
+| `no_key` | Nothing was ever configured | Set `JEV_API_KEY` |
+| `unprobed` | Enabled, but nobody has asked yet | Press Refresh — it costs one probe |
+| `unauthorized` | A key was sent and refused | Mint a new key |
+| `unreachable` | No network path, or a non-200 | Check connectivity |
+| `ok` | Answering | — |
+
+`disabled` is checked **after** `no_key` on purpose: with no key at all, "nothing is configured" is
+the fact that sends someone to the right place, and "switched off" would be true but useless.
+
+### The probe is a billable request, and the log says so
+
+It was not, for a while: `_probe()` posted directly and never appended to the call log, so
+`spent_usd` under-reported the session by exactly what the dashboard spends on itself — the one
+number a person would use to decide whether to leave it running. Probe entries are now recorded with
+`probe: true` and their real `cost_usd`.
+
+**Measured:** in two clean observations the reported `cost_usd` matched the drop in
+`credits_remaining_usd` *exactly* ($0.000356 and $0.000118). The balance is sometimes returned to
+four decimal places, though, so a delta computed from it can be off by ~1e-4 — the meter is not
+precise enough to audit individual sub-cent calls, while the per-call figure is trustworthy.
 
 An unusable threshold — non-numeric, out of range, or inverted so that `confirm_at` exceeds
 `act_at` — falls back to its default and logs. A configuration typo must never *loosen* a
@@ -652,20 +699,21 @@ leaving it open for a month.
 
 ## TODO
 
-**J0, J1 and J1a are built** ([`flybrain/jev.py`](../flybrain/jev.py), tested in
-`tests/test_jev.py` and `tests/test_jev_live.py`). Nothing has a UI yet, and the placements below
-still do not exist. The one thing that is *blocked* rather than unbuilt is called out below.
+**J0, J1, J1a and J2 are built** ([`flybrain/jev.py`](../flybrain/jev.py), tested in
+`tests/test_jev.py` and `tests/test_jev_live.py`). **Placement A now has a UI** — click any point in
+*Colour chosen*. Placements B and C still do not exist; they are J3 and J4 in
+[`roadmap.md`](roadmap.md).
 
 **J0 — credential surface — done**
 - [x] Document `JEV_API_KEY` / `JEV_*` in `.env.example` and `.env`
 - [x] A `JevConfig` reader following the `os.environ.get(...)` pattern, with tests
 - [x] Default `JEV_MODEL` to the **versioned id `jev-1.13.0`**, never the alias, and refuse to
       proceed if a response's `model` field differs from the pinned id
-- [x] An `available()` check that reports *why* it is off, with **three distinct** failure
-      reasons rather than two: `no_key` (403), `unauthorized` (401 — a key was sent and rejected),
-      and `unreachable`. The third state was not in the original plan; the live endpoint produced
-      it immediately, and it is the difference between "you forgot to configure this" and "your
-      key is being refused", which send an operator to different places.
+- [x] An `available()` check that reports *why* it is off, with **distinct** failure
+      reasons rather than two: `no_key`, `unauthorized` (a key was sent and rejected),
+      `unreachable`, and later `disabled` and `unprobed`. Each of those was forced by a real
+      confusion — see the table above.
+- [x] **`JEV_ENABLED`, defaulting off**, and a runtime switch, so being *watched* is not a cost
 
 **J1 — the client, with no UI — done**
 - [x] `httpx` rather than the official SDK — the reasoning is
@@ -673,13 +721,42 @@ still do not exist. The one thing that is *blocked* rather than unbuilt is calle
       quietly dropped
 - [x] `flybrain/jev.py`: one call to `POST /v1/systemone`; typed `choice` / `score` / `noul`
       helpers; `legend` and per-kind `probabilities` parsing
-- [x] **Measured the network floor on this machine** — and found that the *first* sample is
-      ~3× the warm median, so the measurement is repeated and the method is recorded. Median
-      **49.2 ms** over 5 warm samples to the configured host
+- [x] **Measured the network floor on this machine** — and found that the *first request ever
+      made to a host* is inflated (~3×), which is a first-contact effect and **not** a
+      per-process one. Re-measured against the working host: median **49.0 ms** over 9 warm
+      samples, first sample 55.5 ms (~1.1×)
 - [x] Reconcile `score` against `probabilities` to ±0.02
 - [x] A test that runs the whole client against fixtures with no network — and one live test that
       asserts the client's *diagnosis* is truthful, so it is useful even while the credential is
       rejected
+
+**J2 — the decision inspector (placement A) — done**
+- [x] `FAILURE_MODES`: the seven-label closed vocabulary, each entry a failure mode this project
+      already documents elsewhere, with a test that every label explains itself
+- [x] `decision_state()` — the state is **trimmed** to the fields a failure mode can actually use,
+      and unmeasured fields are omitted rather than sent as `null`
+- [x] `classify_decision()`, routed through the **PAINT** tier: a verdict that only paints a label
+      on a screen is a different risk from one that writes a training label
+- [x] History rows now carry what the inspector needs — `seq`, `ideal_kelvin`, `active_neurons`,
+      `total_spikes`, `window_ms`, `reading_age_s`, `top_regions` and the settings that shaped the
+      decision. Captured at decision time because the brain's per-window counts are overwritten by
+      the next advance, and the sensitivity range is live-tunable
+- [x] `POST /api/jev`, cached by `seq`, answering **200 with `available: false`** when the layer is
+      off, because "off" and "broken" must not render as the same red message
+- [x] Clickable points in *Colour chosen*, a verdict card in the documented three-layer order, and
+      a **Turn Jev on** affordance instead of a failure when the layer is switched off
+- [x] Fixtures for both the probe and a real classification
+      ([`tests/fixtures/jev/`](../tests/fixtures/jev/README.md))
+
+**The verdict shape is not obvious, and the first version was wrong.** `classify_decision()` read
+`routing.detail`; the field is `routing.reason`. Nothing caught it, so a real call was paid for,
+answered, and then turned into a 500 that was *not* cached — the failure path working correctly on
+top of a bug. A test over the assembled dict is what was missing, and is now there.
+
+**The first real verdict was `throttled` at 0.24 confidence**, which routed to `needs_human` and the
+card said *"not enough to call it"*. That is the design working: the state did not determine an
+answer, and the dashboard said so rather than picking the most likely label and presenting it as
+one.
 
 **J1a — the three disciplines, as code rather than convention — done**
 - [x] **Trim:** `build_state()` emits named fields, only changed values, rounded numbers, and the

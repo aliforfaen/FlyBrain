@@ -49,6 +49,44 @@ LABELS_FILE = "labels.jsonl"
 META_FILE = "meta.json"
 
 
+def session_regime(meta: dict[str, Any]) -> dict[str, Any]:
+    """Which regime a recording was made under, and whether that had to be *assumed*.
+
+    ``AGENTS.md`` #2 is "train and run in the same regime", and pacing is part of the regime:
+    with a trigger enabled a recording samples *events*, while a fixed heartbeat samples *time*.
+    Pooling the two silently costs accuracy.
+
+    Sessions written before pacing was recorded have no ``pacing`` block. The temptation is to
+    fill in the default and move on; that would be inventing provenance, so this reports
+    ``assumed=True`` instead and leaves the caller to decide. ``session-20260924-135739`` is the
+    one such recording in this repository, and ``recording_meta`` in ``server.py`` documents why
+    it is left that way rather than rewritten.
+    """
+    pacing = meta.get("pacing")
+    if isinstance(pacing, dict) and pacing:
+        return {"flat_out": False, "assumed": False, "pacing": dict(pacing)}
+    # No pacing recorded. The loop ran flat out except where an interval was configured by hand,
+    # and there is no way to recover which — so call it the conservative one.
+    return {"flat_out": True, "assumed": True, "pacing": None}
+
+
+def regimes_compatible(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Whether two regimes may be pooled.
+
+    Two recordings are compatible when they agree on whether the brain ran flat out. An *assumed*
+    flat-out regime still conflicts with a paced one: the assumption is exactly the thing under
+    suspicion, so it is not allowed to pass as agreement.
+    """
+    return bool(a.get("flat_out")) == bool(b.get("flat_out"))
+
+
+def _regime_word(regime: dict[str, Any]) -> str:
+    """A short phrase for a regime, for log lines and error messages."""
+    if regime.get("assumed"):
+        return "flat out (assumed — no pacing recorded)"
+    return "flat out" if regime.get("flat_out") else "paced"
+
+
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -224,6 +262,39 @@ class Recording:
         self.meta: dict[str, Any] = json.loads(meta_path.read_text(encoding="utf-8"))
         self.feature_dim = int(self.meta["feature_dim"])
         self.window_ms = float(self.meta.get("window_ms", 0.0))
+        if self.regime["assumed"]:
+            logger.warning(
+                "%s has no pacing metadata; treating it as flat out and refusing to pool it "
+                "with a paced recording (see recorder.session_regime)",
+                self.root.name,
+            )
+
+    @property
+    def regime(self) -> dict[str, Any]:
+        """The regime this recording was made under, and whether it had to be assumed."""
+        return session_regime(self.meta)
+
+    def assert_compatible(self, other: Recording, *, allow_regime_mix: bool = False) -> None:
+        """Refuse to pool this recording with one made under a different regime.
+
+        Nothing enforced this before. The pacing config was recorded (so it was *checkable*) and
+        documented, but a caller could still concatenate a flat-out session with a paced one and
+        get a readout that is quietly worse — the same class of silent failure as the rest-basin
+        bug. Making it raise is what turns a remembered rule into a checked one.
+
+        ``allow_regime_mix`` exists because deliberately mixing may one day be the experiment;
+        it must be said out loud rather than arrived at by accident.
+        """
+        if allow_regime_mix:
+            return
+        mine, theirs = self.regime, other.regime
+        if regimes_compatible(mine, theirs):
+            return
+        raise ValueError(
+            f"refusing to pool {self.root.name} ({_regime_word(mine)}) with "
+            f"{other.root.name} ({_regime_word(theirs)}): AGENTS.md #2 — the readout is fitted on "
+            f"the regime the loop runs in. Pass allow_regime_mix=True if mixing is intentional."
+        )
 
     def _feature_rows(self) -> int:
         """Whole rows present in ``features.f32``, ignoring any trailing partial row."""
@@ -371,7 +442,8 @@ def _main(argv: list[str] | None = None) -> int:
                 rec = Recording(path)
                 print(
                     f"{path.name:24} {rec.features.shape[0]:6d} windows  "
-                    f"{len(rec.labels):4d} labels  dim={rec.feature_dim}"
+                    f"{len(rec.labels):4d} labels  dim={rec.feature_dim}  "
+                    f"{_regime_word(rec.regime)}"
                 )
         return 0
 
@@ -395,6 +467,7 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"  windows   {rec.features.shape[0]}")
         print(f"  dim       {rec.feature_dim}")
         print(f"  window_ms {rec.window_ms}")
+        print(f"  regime    {_regime_word(rec.regime)}")
         print(f"  labels    {len(rec.labels)}")
         for lb in rec.labels:
             print(f"    {time.strftime('%H:%M:%S', time.localtime(lb.t))}  {lb.label}")

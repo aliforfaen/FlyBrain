@@ -216,8 +216,9 @@ class TestTimeline:
 class TestStatus:
     def _status(self, host) -> dict:
         # The Jev probe is stubbed: the real one makes an HTTP request, and a unit test that
-        # needed the network would be a unit test that fails on a train.
-        async def fake_jev_status(*, refresh: bool = False) -> dict:
+        # needed the network would be a unit test that fails on a train. `probe` is accepted and
+        # ignored so the stub keeps matching the real signature as it grows.
+        async def fake_jev_status(*, refresh: bool = False, probe: bool = True) -> dict:
             return {"available": False, "reason": "no_key", "detail": "", "models": [],
                     "floor_ms": 47.0, "config": {"model": "jev-1.13.0"}, "calls": 0}
 

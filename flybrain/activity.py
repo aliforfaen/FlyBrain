@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 
+from flybrain.families import ALL_FAMILIES, family_ids
 from flybrain.types import coerce_patch
 
 #: Rejection bounds for :class:`ActivitySettings`, checked by
@@ -150,6 +151,102 @@ class MemoryBrain:
         #: Spike counts and window length from the most recent window, for the usage panel.
         self._last_counts: np.ndarray | None = None
         self._last_window_ms = 0.0
+        #: Per-neuron integer labels for the two groupings the dashboard colours by, built lazily
+        #: by :meth:`_ensure_indices`. The alternative — a boolean mask per class per request —
+        #: was O(classes x neurons) on every poll.
+        self._indices_for: object = "unbuilt"
+        self._class_index: np.ndarray | None = None
+        self._class_names: list[str] = []
+        self._class_sizes = np.zeros(0, dtype=np.int64)
+        self._family_ids: np.ndarray | None = None
+        self._family_index: np.ndarray | None = None
+
+    # ------------------------------------------------------------------ indices
+
+    def _build_index(self, table, column: str) -> tuple[np.ndarray | None, list[str]]:
+        """Turn an annotation column into a dense ``int8`` label array.
+
+        Returned as int8 rather than object strings so that per-class totals are a single
+        ``np.bincount`` instead of one full-array comparison per class. The names list is the
+        ``id -> name`` mapping that bincount's output indexes into.
+        """
+        if table is None or column not in table.columns:
+            return None, []
+        values = table[column].fillna("unlabelled").astype(str).to_numpy()
+        names, codes = np.unique(values, return_inverse=True)
+        if len(names) > 127:
+            raise ValueError(
+                f"{column} has {len(names)} distinct values, which overflows the int8 index"
+            )
+        return codes.astype(np.int8), [str(n) for n in names]
+
+    def _ensure_indices(self) -> None:
+        """Build the label indices from the annotation table, once per table.
+
+        Lazy rather than eager in ``__init__`` on purpose: the table can legitimately be attached
+        *after* the driver is constructed — ``ConnectomeSim.load()`` sets it, and tests attach a
+        synthetic one — so an eager build would freeze whichever table happened to exist first and
+        then report no regions at all. Comparing identity makes a replacement table take effect
+        without needing a rebuild API.
+        """
+        table = getattr(self.sim, "annotation_table", None)
+        if table is self._indices_for:
+            return
+        self._indices_for = table
+        self._class_index, self._class_names = self._build_index(table, "cell_class")
+        self._class_sizes = (
+            np.bincount(self._class_index, minlength=len(self._class_names))
+            if self._class_index is not None
+            else np.zeros(0, dtype=np.int64)
+        )
+        # The per-neuron family mapping is built here rather than in families.py so that both
+        # groupings share one join onto connectome order. `_family_index` is the same array under
+        # the name the region code reads; keeping one object avoids computing the join twice.
+        self._family_ids = (
+            family_ids(table["super_class"].to_numpy())
+            if table is not None and "super_class" in table.columns
+            else None
+        )
+        self._family_index = self._family_ids
+
+    @property
+    def n_classes(self) -> int:
+        """How many distinct ``cell_class`` values this build knows about."""
+        self._ensure_indices()
+        return len(self._class_names)
+
+    @property
+    def seq(self) -> int:
+        """The sequence number of the most recent :meth:`advance`.
+
+        Public because it is the identity that ties a decision on the chart to a recorded brain
+        state: the Jev inspector is asked about a ``seq``, and every history row carries the one
+        it was decided on.
+        """
+        return int(self._seq)
+
+    def class_names(self) -> list[str]:
+        """``cell_class`` names, in the id order :meth:`counts_by_class` returns totals in."""
+        self._ensure_indices()
+        return list(self._class_names)
+
+    def class_index(self) -> np.ndarray | None:
+        """Per-neuron ``cell_class`` id, or ``None`` when no annotation table is loaded."""
+        self._ensure_indices()
+        return self._class_index
+
+    def family_index(self) -> np.ndarray | None:
+        """Per-neuron ``super_class`` id as published, or ``None`` without annotations."""
+        self._ensure_indices()
+        return self._family_index
+
+    def counts_by_class(self, counts: np.ndarray) -> np.ndarray:
+        """Spike totals per ``cell_class`` id, by bincount rather than per-class masking."""
+        self._ensure_indices()
+        index = self._class_index
+        if index is None:
+            return np.zeros(0, dtype=np.int64)
+        return np.bincount(index, weights=counts.astype(np.float64), minlength=len(self._class_names))
 
     # ------------------------------------------------------------------ drive
 
@@ -240,30 +337,65 @@ class MemoryBrain:
 
     # ---------------------------------------------------------------- readout
 
+    def family_usage(self, top: int = 0) -> list[dict]:
+        """Per-family activity for the most recent window, for the cell-family legend.
+
+        Same contract as :meth:`region_usage` but grouped by the broad ``super_class`` families
+        the dashboard colours by, so the legend and the cloud cannot disagree about which group a
+        neuron is in.
+        """
+        self._ensure_indices()
+        if self._family_ids is None or self._last_counts is None:
+            return []
+        window_s = max(self._last_window_ms, 1e-6) / 1000.0
+        totals = np.bincount(
+            self._family_ids,
+            weights=self._last_counts.astype(np.float64),
+            minlength=len(ALL_FAMILIES) + 1,
+        )
+        sizes = np.bincount(self._family_ids, minlength=len(ALL_FAMILIES) + 1)
+        out: list[dict] = []
+        for fam in ALL_FAMILIES:
+            # int() of a whole float64 is exact here and yields a Python int, which is what
+            # the JSON encoder needs: a numpy scalar would raise at serialisation time.
+            spikes = int(totals[fam.id])
+            neurons = int(sizes[fam.id])
+            out.append(
+                {
+                    "id": fam.id,
+                    "key": fam.key,
+                    "spikes": spikes,
+                    "neurons": neurons,
+                    "rate_hz": round(spikes / max(neurons, 1) / window_s, 3),
+                }
+            )
+        out.sort(key=lambda d: d["spikes"], reverse=True)
+        return out[:top] if top else out
+
     def region_usage(self, top: int = 12) -> list[dict]:
         """Per-cell-class activity for the most recent window, for the 'usage' panel.
 
         Reads the cached counts from the last :meth:`advance` rather than the simulator's
         spike tensor, which has already been reset by the time a request arrives.
         """
-        table = getattr(self.sim, "annotation_table", None)
-        if table is None or self._last_counts is None:
+        self._ensure_indices()
+        if self._class_index is None or self._last_counts is None:
             return []
-        arr = self._last_counts
         window_s = max(self._last_window_ms, 1e-6) / 1000.0
-        cls = table["cell_class"].fillna("unclassified").to_numpy()
+        totals = self.counts_by_class(self._last_counts)
         out: list[dict] = []
-        for name in np.unique(cls):
-            mask = cls == name
-            total = int(arr[mask].sum())
-            if total:
-                out.append(
-                    {
-                        "name": str(name),
-                        "neurons": int(mask.sum()),
-                        "spikes": total,
-                        "rate_hz": round(total / max(int(mask.sum()), 1) / window_s, 2),
-                    }
-                )
+        for i, name in enumerate(self._class_names):
+            total = int(totals[i])
+            if not total:
+                continue
+            neurons = int(self._class_sizes[i])
+            out.append(
+                {
+                    "name": name,
+                    "neurons": neurons,
+                    "spikes": total,
+                    "rate_hz": round(total / max(neurons, 1) / window_s, 2),
+                }
+            )
         out.sort(key=lambda d: d["spikes"], reverse=True)
         return out[:top]

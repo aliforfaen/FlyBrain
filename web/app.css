@@ -213,13 +213,62 @@ body {
 
 .panel > h2 {
   margin: 0;
+  padding: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+/* The whole heading is the toggle. A real <button> rather than a click handler on the h2 so it
+   is focusable and operable from the keyboard without any extra work. */
+.panel-head {
+  width: 100%;
+  display: flex; align-items: center; gap: 8px;
   padding: 8px 10px 7px;
+  background: none; border: 0; color: var(--text-2);
+  font: inherit;
   font-size: 9.5px; font-weight: 600;
   letter-spacing: 0.20em; text-transform: uppercase;
-  color: var(--text-2);
-  border-bottom: 1px solid var(--line);
-  display: flex; align-items: center; gap: 8px;
+  text-align: left; cursor: pointer;
 }
+.panel-head:hover { color: var(--text); }
+.panel-head:focus-visible { outline: 1px solid var(--accent); outline-offset: -2px; }
+
+/* The chevron points down when open and right when collapsed: the usual convention, and it is
+   the only affordance that says the heading does something. */
+.chev {
+  flex: 0 0 auto; width: 6px; height: 6px;
+  border-right: 1px solid currentColor; border-bottom: 1px solid currentColor;
+  transform: rotate(45deg) translate(-1px, -1px);
+  transition: transform 0.14s ease;
+  opacity: 0.75;
+}
+.panel[data-collapsed="1"] .chev { transform: rotate(-45deg); }
+
+.ptitle { flex: 0 0 auto; }
+
+/* The one-line summary that replaces a collapsed panel's contents. Hidden while open, because
+   the panel itself is saying far more than one line. */
+.panel-head .sum {
+  margin-left: auto;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 8.5px; font-weight: 400; letter-spacing: 0.08em;
+  text-transform: none; color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.panel[data-collapsed="0"] .panel-head .sum { display: none; }
+/* A .tag is more useful than a summary on the panels that have one, so the tag wins the space
+   and the summary sits after it. */
+.panel-head .tag {
+  font-size: 8px; letter-spacing: 0.12em; padding: 1px 5px;
+  border: 1px solid var(--line-2); border-radius: 2px; color: var(--dim);
+  flex: 0 0 auto;
+}
+.panel-head .h2-right {
+  margin-left: auto; font-size: 8.5px; letter-spacing: 0.12em;
+  color: var(--dim); text-transform: none; font-weight: 400;
+}
+
+.panel[data-collapsed="1"] .body { display: none; }
+
 .panel > h2 .h2-right {
   margin-left: auto; font-size: 8.5px; letter-spacing: 0.12em;
   color: var(--dim); text-transform: none; font-weight: 400;
@@ -880,7 +929,20 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .trail-keys .tk.label { background: var(--good); }
 .trail-keys .tk.action { background: var(--amber); }
 
-.trail-list { margin-top: 8px; max-height: 124px; overflow-y: auto; }
+/* Deliberately *not* a scroll container. A nested scroller inside the already-scrolling column
+   was scroll-ception: the wheel did different things depending on which box the pointer was
+   over. The compact strip above is the glance; "show all" grows this in place instead. */
+.trail-list { margin-top: 8px; }
+
+.trail-more {
+  display: block; width: 100%; margin-top: 6px;
+  padding: 4px 6px;
+  background: rgba(124, 164, 204, 0.06);
+  border: 1px solid var(--line-2); border-radius: 2px;
+  color: var(--dim); font: inherit; font-size: 8.5px;
+  letter-spacing: 0.12em; text-transform: uppercase; cursor: pointer;
+}
+.trail-more:hover { color: var(--text); border-color: var(--accent); }
 .trail-list .trail-row {
   display: flex; align-items: baseline; gap: 7px;
   padding: 2.5px 6px; border-radius: 2px;
@@ -957,4 +1019,174 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 @media (prefers-reduced-motion: reduce) {
   .pet-glyph .core, .pet-glyph .ring, .pet-glyph .flare,
   .pace-dial .pace-fill { animation: none !important; }
+}
+
+/* ============================================================================
+   Topbar controls — pause, auto-orbit, reset. These were buried at the bottom
+   of the right column inside "The brain itself", which meant the one control a
+   person reaches for while watching was the one they had to scroll to find.
+   ========================================================================= */
+
+.topctl { display: flex; align-items: center; gap: 6px; }
+
+.topctl button {
+  font: inherit; font-size: 9px; font-weight: 600;
+  letter-spacing: 0.13em; text-transform: uppercase;
+  padding: 5px 9px; border-radius: 2px; cursor: pointer;
+  background: rgba(9, 16, 26, 0.72);
+  border: 1px solid var(--line-2); color: var(--text-2);
+  backdrop-filter: blur(8px);
+  white-space: nowrap;
+}
+.topctl button:hover { color: var(--text); border-color: var(--accent); }
+.topctl button.on {
+  color: var(--accent); border-color: var(--accent);
+  background: rgba(76, 141, 214, 0.16);
+}
+.topctl button.warn {
+  color: var(--amber); border-color: rgba(244, 168, 63, 0.5);
+  background: rgba(244, 168, 63, 0.12);
+}
+#btn-pause { min-width: 74px; }
+
+/* ============================================================================
+   Cell families — swatch, plain-English name, live activity. The name and the
+   count are always present, so colour never carries a meaning on its own.
+   ========================================================================= */
+
+.fam-rows { display: flex; flex-direction: column; gap: 2px; }
+
+.fam-row {
+  display: grid; grid-template-columns: 9px 1fr auto; gap: 7px; align-items: center;
+  width: 100%; padding: 4px 5px;
+  background: none; border: 1px solid transparent; border-radius: 2px;
+  color: var(--text-2); font: inherit; font-size: 9.5px;
+  text-align: left; cursor: pointer;
+}
+.fam-row:hover { border-color: var(--line-2); background: rgba(124, 164, 204, 0.05); }
+.fam-row[aria-pressed="true"] {
+  border-color: var(--accent); background: rgba(76, 141, 214, 0.13); color: var(--text);
+}
+.fam-row .sw { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+.fam-row .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fam-row .ct {
+  font-size: 8.5px; color: var(--dim); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.fam-row .ct b { color: var(--accent); font-weight: 600; }
+.fam-row[data-hot="1"] .ct b { color: var(--amber); }
+
+.fam-detail {
+  margin-top: 7px; padding: 7px 8px;
+  background: var(--panel-2); border-left: 2px solid var(--accent); border-radius: 2px;
+  font-size: 9px; line-height: 1.5; color: var(--text-2);
+}
+.fam-detail .hd { color: var(--text); font-weight: 600; margin-bottom: 3px; }
+.fam-detail .bl { color: var(--dim); }
+
+.sense-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+
+/* Deliberately its own class rather than reusing `.fam-row`: that one is a three-column grid for
+   swatch/name/count, and a chip with a single child lands in the 9px swatch column and wraps one
+   letter per line. */
+.sense-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 7px; border-radius: 2px;
+  background: none; border: 1px solid var(--line-2);
+  color: var(--text-2); font: inherit; font-size: 9px;
+  white-space: nowrap; cursor: pointer;
+}
+.sense-chip:hover { color: var(--text); border-color: var(--accent); }
+.sense-chip[aria-pressed="true"] {
+  color: var(--accent); border-color: var(--accent); background: rgba(76, 141, 214, 0.14);
+}
+.sense-chip[data-wired="0"] { color: var(--dim); border-style: dashed; }
+
+/* ============================================================================
+   Guided exploration — ELI5 walkthroughs that set the view up for you.
+   ========================================================================= */
+
+.guide { border: 1px solid var(--line); border-radius: 2px; margin-bottom: 5px; overflow: hidden; }
+.guide[data-active="1"] { border-color: var(--accent); }
+.guide > button {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  padding: 6px 8px; background: none; border: 0;
+  color: var(--text-2); font: inherit; font-size: 9.5px; text-align: left; cursor: pointer;
+}
+.guide > button:hover { color: var(--text); background: rgba(124, 164, 204, 0.05); }
+.guide[data-active="1"] > button { color: var(--accent); }
+.guide .num {
+  flex: 0 0 auto; width: 14px; height: 14px; border-radius: 50%;
+  border: 1px solid var(--line-2); color: var(--dim);
+  font-size: 8px; line-height: 12px; text-align: center;
+}
+.guide[data-active="1"] .num { border-color: var(--accent); color: var(--accent); }
+.guide .txt { padding: 0 9px 8px 9px; font-size: 9px; line-height: 1.55; color: var(--dim); }
+.guide .txt b { color: var(--text-2); font-weight: 600; }
+
+/* ============================================================================
+   The decision inspector — the verdict card under the chart.
+   ========================================================================= */
+
+#chart { cursor: crosshair; }
+
+.verdict {
+  margin-top: 8px; padding: 8px;
+  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 2px;
+  font-size: 9px; line-height: 1.5; color: var(--text-2);
+}
+.verdict .vk { font-size: 8px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--dim); }
+.verdict .vl { font-size: 13px; color: var(--text); margin: 2px 0 4px; }
+.verdict[data-tone="good"] { border-color: rgba(79, 224, 138, 0.4); }
+.verdict[data-tone="good"] .vl { color: var(--good); }
+.verdict[data-tone="warn"] { border-color: rgba(244, 168, 63, 0.4); }
+.verdict[data-tone="warn"] .vl { color: var(--amber); }
+.verdict[data-tone="mute"] .vl { color: var(--dim); }
+.verdict .vrow { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; }
+.verdict .vrow .k { color: var(--dim); }
+.verdict .vrow .v { color: var(--text-2); font-variant-numeric: tabular-nums; }
+.verdict .prob { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+.verdict .prob-row { display: grid; grid-template-columns: 1fr 46px; gap: 6px; align-items: center; }
+.verdict .prob-row .bar { height: 4px; background: rgba(124, 164, 204, 0.14); border-radius: 2px; }
+.verdict .prob-row .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+.verdict .prob-row .n { font-size: 8px; color: var(--dim); text-align: right; font-variant-numeric: tabular-nums; }
+.verdict .layerline { margin-top: 6px; padding-top: 5px; border-top: 1px dashed rgba(124,164,204,0.16); }
+.verdict .layerline b { color: var(--text-2); }
+
+.verdict button.enable {
+  margin-top: 6px; padding: 4px 8px;
+  font: inherit; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  background: rgba(76, 141, 214, 0.14); border: 1px solid var(--accent);
+  color: var(--accent); border-radius: 2px; cursor: pointer;
+}
+
+/* A toggle that states its own meaning, used for Jev and for the view switches. */
+.toggle-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 7px; background: var(--panel-2); border-radius: 2px; margin-bottom: 6px;
+}
+.toggle-row .lbl { font-size: 9.5px; color: var(--text-2); }
+.toggle-row .sub { font-size: 8.5px; color: var(--dim); }
+.toggle-row button {
+  margin-left: auto; flex: 0 0 auto;
+  font: inherit; font-size: 8.5px; font-weight: 600;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  padding: 4px 8px; border-radius: 2px; cursor: pointer;
+  background: none; border: 1px solid var(--line-2); color: var(--dim);
+}
+.toggle-row button[aria-pressed="true"] {
+  color: var(--good); border-color: rgba(79, 224, 138, 0.45);
+  background: rgba(79, 224, 138, 0.1);
+}
+
+.view-modes { display: flex; gap: 4px; margin-bottom: 7px; }
+.view-modes button {
+  flex: 1; padding: 5px 4px;
+  font: inherit; font-size: 8.5px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  background: none; border: 1px solid var(--line-2); border-radius: 2px;
+  color: var(--dim); cursor: pointer;
+}
+.view-modes button[aria-pressed="true"] {
+  color: var(--accent); border-color: var(--accent); background: rgba(76, 141, 214, 0.14);
 }

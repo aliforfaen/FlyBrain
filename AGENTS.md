@@ -23,7 +23,7 @@ population → learned ridge readout → colour temperature (K) → HA light.tur
 ```bash
 uv sync                                        # Python 3.11 → .venv (torch + CUDA wheels)
 .venv/bin/python tools/fetch_data.py           # connectome + annotations, ~140 MB, one time
-.venv/bin/python -m pytest tests/ -q           # 430 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q           # 503 tests, no connectome needed
 
 .venv/bin/python -m flybrain.experiment        # train the readout, ~50 s
 .venv/bin/python -m flybrain.server            # dashboard + live loop
@@ -58,6 +58,10 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
    an already-running brain. A window that starts from rest is a different state (a linear
    probe separates them perfectly), and mixing the two silently costs accuracy. See
    [`docs/live-view.md`](docs/live-view.md#training-must-match-the-regime-the-loop-runs-in).
+   **Now enforced rather than remembered:** `Recording.regime` reads the pacing block from a
+   session's `meta.json`, and `assert_compatible()` refuses to pool a flat-out session with a
+   paced one. A session with *no* pacing block reads as flat-out **and is marked assumed**, so it
+   cannot pass as agreement either — `session-20260924-135739` is exactly that case.
 
 3. **A ~100× fudge factor is a bug report, not a calibration.** That lesson cost days.
    Verify arithmetic against a closed form on a two-neuron network before touching data:
@@ -81,12 +85,13 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
 | `flybrain/loop.py` | Runs it live: sensor → brain → colour → HA action |
 | `flybrain/pacing.py` | When the brain is worth stepping: the heartbeat, the burst, the change trigger |
 | `flybrain/pet.py` | The dashboard's state word, derived from measurements only, with its contributors |
+| `flybrain/families.py` | Plain-English names for the ten broad cell families, the sensory pathways, and which end of the brain is the front |
 | `flybrain/wiring.py` | Which HA entity drives which fly sensory pathway |
 | `flybrain/recorder.py` | Records every window so new readouts can be trained later |
 | `flybrain/server.py` | FastAPI dashboard + the loop's clock |
 | `flybrain/ha.py` | Home Assistant adapters (mock and REST) |
 | `flybrain/env.py` | Loads `.env`, so no house-specific value is ever hardcoded or hand-sourced |
-| `flybrain/jev.py` | The optional Jev judgment layer: typed questions, confidence routing, credential surface. Off unless `JEV_API_KEY` is set |
+| `flybrain/jev.py` | The optional Jev judgment layer: typed questions, confidence routing, credential surface, and the seven-label decision inspector. **Off unless `JEV_ENABLED=1`** — a key alone is not enough, because a dashboard being watched must not spend |
 | `tools/fetch_data.py` | Downloads and byte-verifies the connectome and annotation tables |
 | `web/` | three.js dashboard, no bundler, three.js vendored |
 | `validation/` | Brian2 comparison and a closed-form integrator test |
@@ -111,7 +116,9 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
 - [`docs/vision.md`](docs/vision.md) — the camera→visual-column design, **not built**
 - [`docs/jev.md`](docs/jev.md) — the Jev judgment layer: three UI placements, their closed
   vocabularies, the four places it must **not** be used, and the credential surface. The client,
-  config and confidence routing are **built** (`flybrain/jev.py`); **no placement has a UI yet**,
+  config, confidence routing and **placement A (the decision inspector, J2)** are **built**
+  (`flybrain/jev.py`; click any point in *Colour chosen*). It is **jevless by default** —
+  `JEV_ENABLED=1` turns it on. Placements B and C are still unbuilt,
   and the most valuable content is still the negative recommendations
 - [`docs/licensing.md`](docs/licensing.md) — **read before shipping anything**
 - [`docs/research/`](docs/research/README.md) — asset inventory and the record of what went

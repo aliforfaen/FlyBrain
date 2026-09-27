@@ -249,3 +249,100 @@ class TestRecordingProvenance:
         pacing = recording_meta(LoopConfig())["pacing"]
         assert pacing["trigger_delta"] == 0.0
         assert pacing["heartbeat_s"] == 15.0
+
+
+class TestRegimeGuard:
+    """AGENTS.md #2, enforced instead of remembered.
+
+    The pacing config was recorded and documented, but nothing *checked* it, so a caller could
+    still pool a flat-out session with a paced one and get a quietly worse readout — the same
+    shape of silent failure as the rest-basin bug. These tests pin the check.
+    """
+
+    def test_an_old_session_is_flat_out_and_assumed(self, tmp_path) -> None:
+        """No pacing block means flat out, and it must say that it guessed."""
+        root = _fill(tmp_path / "old", 1)
+        # _fill writes meta without a pacing block, exactly like the pre-pacing session.
+        regime = open_recording(root).regime
+        assert regime["flat_out"] is True
+        assert regime["assumed"] is True
+        assert regime["pacing"] is None
+
+    def test_a_recorded_pacing_block_is_not_assumed(self, tmp_path) -> None:
+        from flybrain.loop import LoopConfig
+        from flybrain.server import recording_meta
+
+        root = tmp_path / "paced"
+        with Recorder(root, 2, 300.0, meta=recording_meta(LoopConfig())):
+            pass
+        regime = open_recording(root).regime
+        assert regime["flat_out"] is False
+        assert regime["assumed"] is False
+        assert regime["pacing"]["heartbeat_s"] == 15.0
+
+    def test_pooling_an_assumed_flat_out_session_with_a_paced_one_raises(self, tmp_path) -> None:
+        from flybrain.loop import LoopConfig
+        from flybrain.server import recording_meta
+
+        flat = open_recording(_fill(tmp_path / "flat", 1))
+        paced_root = tmp_path / "paced"
+        with Recorder(paced_root, 2, 300.0, meta=recording_meta(LoopConfig())):
+            pass
+        paced = open_recording(paced_root)
+
+        # An *assumed* regime does not get to pass as agreement — the assumption is the suspect.
+        with pytest.raises(ValueError, match="refusing to pool"):
+            flat.assert_compatible(paced)
+
+    def test_two_assumed_flat_out_sessions_pool(self, tmp_path) -> None:
+        """Two pre-pacing sessions are genuinely the same regime as each other."""
+        a = open_recording(_fill(tmp_path / "a", 1))
+        b = open_recording(_fill(tmp_path / "b", 1))
+        a.assert_compatible(b)
+
+    def test_mixing_can_be_opted_into_explicitly(self, tmp_path) -> None:
+        from flybrain.loop import LoopConfig
+        from flybrain.server import recording_meta
+
+        flat = open_recording(_fill(tmp_path / "flat2", 1))
+        paced_root = tmp_path / "paced2"
+        with Recorder(paced_root, 2, 300.0, meta=recording_meta(LoopConfig())):
+            pass
+        flat.assert_compatible(open_recording(paced_root), allow_regime_mix=True)
+
+    def test_the_error_names_both_sessions_and_the_rule(self, tmp_path) -> None:
+        from flybrain.loop import LoopConfig
+        from flybrain.server import recording_meta
+
+        flat = open_recording(_fill(tmp_path / "namedflat", 1))
+        paced_root = tmp_path / "namedpaced"
+        with Recorder(paced_root, 2, 300.0, meta=recording_meta(LoopConfig())):
+            pass
+        with pytest.raises(ValueError) as excinfo:
+            flat.assert_compatible(open_recording(paced_root))
+        message = str(excinfo.value)
+        assert "namedflat" in message and "namedpaced" in message
+        assert "AGENTS.md #2" in message
+
+    def test_session_regime_treats_an_empty_pacing_block_as_missing(self) -> None:
+        """"{}" is not provenance either — treating it as recorded would be a fabricated answer."""
+        from flybrain.recorder import session_regime
+
+        regime = session_regime({"pacing": {}})
+        assert regime["flat_out"] is True
+        assert regime["assumed"] is True
+
+    def test_the_shipped_session_reads_as_assumed_flat_out(self) -> None:
+        """The real `session-20260924-135739` is the case this whole guard exists for."""
+        import json
+        from pathlib import Path
+
+        from flybrain.recorder import DEFAULT_ROOT, META_FILE, session_regime
+
+        path = Path(DEFAULT_ROOT) / "session-20260924-135739" / META_FILE
+        if not path.exists():
+            pytest.skip("the pre-pacing session is not present in this checkout")
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        assert "pacing" not in meta, "this test is about a session that predates pacing metadata"
+        regime = session_regime(meta)
+        assert regime["flat_out"] is True and regime["assumed"] is True

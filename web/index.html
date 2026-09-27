@@ -42,6 +42,15 @@
     </div>
   </div>
 
+  <!-- The three controls a person reaches for *while watching*, kept here rather than at the
+       bottom of the right column where they used to be. Pause really stops the brain, so it is
+       the most consequential button on the page and should not need scrolling to find. -->
+  <div class="topctl">
+    <button id="btn-pause" type="button" title="Stop stepping the brain. Space bar does the same.">Pause</button>
+    <button id="btn-orbit" type="button" aria-pressed="false" title="Slowly rotate the view">Auto-orbit</button>
+    <button id="btn-reset" type="button" title="Put the camera back where it started">Reset view</button>
+  </div>
+
   <!-- The pet's state lives up here as well as in its panel, because it is the one number that
        answers "what is it doing" and it should not require scrolling. -->
   <button class="pet-chip" id="pet-chip" data-state="waking" title="What the brain and the house are doing right now">
@@ -168,7 +177,8 @@
         </div>
         <div class="note">Every mark is something that actually happened, newest at the right.
           Labels here are training examples, not weight changes — they are stored and used the
-          next time a readout is fitted.</div>
+          next time a readout is fitted. <b>"Show all" means everything the server sent</b>, which
+          is a bounded window (the last 40 bursts and 60 decisions), not all of history.</div>
       </div>
     </section>
 
@@ -192,6 +202,8 @@
           <span class="item"><i class="sw colour"></i> brain chose</span>
           <span class="item"><i class="sw temp"></i> perfect mapping</span>
         </div>
+        <div class="note">Click any point to ask Jev why that decision came out the way it did.</div>
+        <div id="verdict-host"></div>
       </div>
     </section>
 
@@ -227,6 +239,37 @@
       </div>
     </section>
 
+    <!-- Broad groups of cells, in plain English. Ten families rather than fifty cell classes:
+         colouring every fine-grained label would turn the brain into confetti, and 23% of
+         neurons have no cell class at all. -->
+    <section class="panel" id="panel-families">
+      <h2>Cell families <span class="tag" id="families-tag">—</span></h2>
+      <div class="body tight">
+        <div class="note">Each colour is a broad <b>kind</b> of cell; how bright it is shows how
+          hard it is firing. Click one to spotlight it and fade everything else.</div>
+        <div class="fam-rows" id="fam-rows">
+          <div class="empty">awaiting /api/groups …</div>
+        </div>
+        <div id="fam-detail"></div>
+        <div class="note">A neuron can be in one family <i>and</i> one sense pathway — they are
+          different questions, so both can be lit at once.</div>
+      </div>
+    </section>
+
+    <!-- Guided exploration: ELI5 walkthroughs that set the view up for you. Collapsed by
+         default, because it is the thing you open when you do not know what to look at. -->
+    <section class="panel" id="panel-guides">
+      <h2>Guided exploration <span class="tag" id="guides-tag">7 guides</span></h2>
+      <div class="body tight">
+        <div class="note">Not sure what you are looking at? Pick a question. Each one moves the
+          camera, lights up the cells involved, and says what you are seeing in ordinary words.</div>
+        <div id="guide-list"></div>
+        <div id="guide-body"></div>
+        <div class="note">Every group named here comes from the published cell annotations, not
+          from a guess about what a region ought to do. Where something is uncertain, it says so.</div>
+      </div>
+    </section>
+
     <section class="panel" id="panel-layers">
       <h2>Why that colour <span class="tag">three layers</span></h2>
       <div class="body tight">
@@ -254,6 +297,21 @@
       <h2>What it may touch <span class="tag" id="trust-mode">—</span></h2>
       <div class="body tight">
         <div class="badges" id="trust-badges"></div>
+        <!-- The Jev switch, with a plain description of what each position means. It defaults to
+             off: nothing should spend money merely because a page is open. -->
+        <div class="toggle-row">
+          <span>
+            <span class="lbl">Jev judgment layer</span>
+            <span class="sub" id="jev-switch-sub">off — nothing is sent</span>
+          </span>
+          <button type="button" id="btn-jev" aria-pressed="false">Off</button>
+        </div>
+        <div class="note" id="jev-switch-note">Jev is an optional outside service that classifies
+          a decision. <b>Jevless mode</b> is the default: the brain, the colour and this dashboard
+          run exactly as they do with Jev on — Jev is never in the render path — but no request
+          leaves this machine and nothing is spent, so the decision inspector cannot explain a
+          decision. Turning it on sends one decision's state (temperature, chosen and ideal
+          colour, spike counts, busiest regions) to TypeSafe and costs roughly $0.0002 each.</div>
         <div class="rows" id="trust-outputs"><div class="empty">no outputs configured</div></div>
         <div class="note" id="trust-trained">—</div>
         <div class="note" id="trust-jev">—</div>
@@ -362,14 +420,29 @@
     <section class="panel" id="panel-view">
       <h2>The brain itself <span class="tag" id="view-tag">live</span></h2>
       <div class="body tight">
-        <div class="note">Each dot is one neuron. Brightness is how hard it is firing right
-          now. Drag to orbit · scroll to zoom · right-drag to pan.</div>
-        <div class="btn-row">
-          <button id="btn-pause">Pause</button>
-          <button id="btn-reset">Reset view</button>
+        <div class="view-modes" id="view-modes">
+          <button type="button" data-view="activity" aria-pressed="true">Activity</button>
+          <button type="button" data-view="families" aria-pressed="false">Families</button>
+          <button type="button" data-view="spotlight" aria-pressed="false">Spotlight</button>
         </div>
-        <div class="note">Pausing really stops the brain — the GPU drops from ~165 W to idle.
-          Space bar toggles it.</div>
+        <div class="note" id="view-note">Each dot is one neuron. Brightness is how hard it is
+          firing right now. Drag to orbit · scroll to zoom · right-drag to pan.</div>
+        <div class="toggle-row">
+          <span>
+            <span class="lbl">Afterimage</span>
+            <span class="sub">let a spike linger ~0.8 s</span>
+          </span>
+          <button type="button" id="btn-afterimage" aria-pressed="true">On</button>
+        </div>
+        <div class="toggle-row">
+          <span>
+            <span class="lbl">Orientation</span>
+            <span class="sub">front / back / left / right</span>
+          </span>
+          <button type="button" id="btn-markers" aria-pressed="true">On</button>
+        </div>
+        <div class="note"><b>Pause, auto-orbit and reset are in the bar along the top.</b> Pausing
+          really stops the brain — the GPU drops from ~165 W to idle, and Space does the same.</div>
       </div>
     </section>
 

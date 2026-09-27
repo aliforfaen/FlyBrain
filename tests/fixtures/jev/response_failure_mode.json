@@ -1,0 +1,25 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "failure_mode": {
+      "type": "choice",
+      "choice": "unknown",
+      "confidence": 0.5,
+      "probabilities": {
+        "too_few_spikes": 0.01,
+        "sensor_stale": 0.03,
+        "healthy": 0.04,
+        "saturated_sensory": 0.01,
+        "regime_mismatch": 0.06,
+        "throttled": 0.29,
+        "unknown": 0.5599999999999999
+      }
+    }
+  },
+  "usage": {
+    "input_tokens": 670,
+    "output_tokens": 85,
+    "cost_usd": 0.000282,
+    "credits_remaining_usd": 4.9783
+  }
+}

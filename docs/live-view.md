@@ -76,15 +76,24 @@ Clients send text JSON: `{"type":"pause","value":true}`, `{"type":"settings","se
 |---|---|
 | `GET /api/config` | connectome metadata, role sizes, settings, wire description |
 | `GET /api/positions` | raw `Float32Array`, `n*3` — soma positions in normalised units |
-| `GET /api/regions` | per-cell-class usage: neurons, spikes, rate |
+| `GET /api/groups` | cell families and sensory pathways with plain-English names, plus where the orientation markers go |
+| `GET /api/groups/ids` | raw `Uint8Array`, `n*2` — family id then sense id per neuron, in connectome order |
+| `GET /api/regions` | per-cell-class usage (`regions`) **and** per-family usage (`families`) |
+| `GET /api/trace` | where one family or sense sends its signals: top target classes, exact synapse counts, group-to-group geometry |
 | `GET`/`POST /api/settings` | read / patch the live settings |
 | `POST /api/drive` | set or clear a persistent drive on a named role |
 | `GET /api/frame` | last frame summary |
 | `GET /api/loop` | the control loop's whole state, including pacing and the last action |
 | `GET /api/status` | the pet, journal, three layers, pacing state, trust block and Jev status |
 | `GET /api/timeline` | the memory trail: state changes, bursts, decisions, labels, actions |
-| `GET /api/jev/status` | whether the Jev judgment layer is usable, and if not, *why* |
+| `GET /api/jev/status` | whether the Jev judgment layer is usable, and if not, *why*. **This is the call that spends** |
+| `POST /api/jev` | classify one recorded decision into a failure mode (placement A) |
+| `POST /api/jev/enabled` | turn the judgment layer on or off for this process |
 | `POST /api/pause` | pause or resume without opening a browser (phone shortcut, cron, HA) |
+
+**`/api/status` deliberately does not probe Jev.** It reports the last known answer, or `unprobed`.
+A dashboard that is merely being *looked at* must not spend money, so the one call that costs
+anything is the one you ask for.
 
 ## Settings that are live-tunable
 
@@ -293,12 +302,142 @@ The HUD now reads:
 
 | Panel | What it is for |
 |---|---|
+| **What it's doing** | The pet: the state word, its contributors, and a sentence naming what moved |
 | **Room → light colour** | The headline. Sensor reading in °C, the colour in Kelvin, a swatch painted in the actual light colour, the ideal for comparison, and the exact Home Assistant call |
-| **Colour chosen** | An **X-Y plot**: room temperature on x, chosen colour on y, one point per decision, with the perfect mapping as a dashed line. Overlapping two time series would have hidden the very thing worth seeing — the mapping itself |
+| **Colour chosen** | An **X-Y plot**: room temperature on x, chosen colour on y, one point per decision, with the perfect mapping as a dashed line. Overlapping two time series would have hidden the very thing worth seeing — the mapping itself. **Click any point** to ask Jev why that decision came out as it did |
+| **Pacing** | The heartbeat, the burst, the trigger, and the duty cycle actually achieved |
+| **Memory trail** | Marks for state changes, bursts, decisions, labels and actions. Three newest rows, expandable, **with no scrollbar of its own** |
+| **Senses wired to the brain** | Every sensor feeding the brain and which part of the fly it drives |
+| **Cell families** | Ten broad groups of cells in plain English, with live activity — see below |
+| **Guided exploration** | Seven ELI5 walkthroughs that set the view up for you |
 | **Light connection** | The settings that adapt the loop to a real home — see below |
 | **Brain activity** | Plain language first ("the brain is busy"), then active neurons, spikes per window, simulated time, frames |
+| **Why that colour** | The three layers, kept apart on purpose |
+| **What it may touch** | The trust badges, the output lists, and the **Jev switch** |
+| **Today so far** | Time in each pet state since this process started; in memory only |
 | **Which regions are busy** | Top 12 cell classes by spikes, for looking under the hood |
-| **The brain itself** | The 3D point cloud, plus pause and reset |
+| **The brain itself** | The view modes, the orientation markers and the afterimage toggle |
+
+### Everything is collapsible, and every collapsed panel says something
+
+There are fifteen panels and one screen, so each heading is a toggle with a **live one-line
+summary** in it: `waiting · 42 s`, `21.4 °C → 3300 K`, `Central brain — where it comes together
+busiest`. The eight diagnostic panels start collapsed; the dramatic ones start open. Which ones you
+left open is remembered in `localStorage`, so a refresh does not undo your layout.
+
+Two implementation notes that matter more than they look:
+
+- **The bodies are never removed from the DOM**, only hidden with CSS. Every paint function
+  addresses its nodes by id, so unmounting a collapsed panel would silently stop it updating and it
+  would show stale numbers when reopened — a bug that looks like a data problem and is not.
+- The headings became real `<button>` elements rather than click handlers on the `<h2>`, so they
+  are keyboard-operable and announce their state through `aria-expanded` without extra work.
+
+### The memory trail no longer scrolls inside a scroll
+
+It used to be a 124 px-tall scroll container inside an already-scrolling column: the wheel did
+different things depending on which box the pointer was over. The compact mark strip is the glance;
+the list shows the three newest rows and a **Show all N** button grows it in place.
+
+"Show all" means *everything the server sent*, which is a **bounded window** — the last 40 bursts
+and 60 decisions, plus states, labels and actions. The panel says that rather than implying it is
+all of history.
+
+### Pause, auto-orbit and reset live in the top bar
+
+They used to be at the bottom of the right column, which meant the one control you reach for while
+watching was the one you had to scroll to find. Pause really stops the brain, so it is the most
+consequential button on the page. `Space` still toggles it.
+
+**Auto-orbit** is a slow drift that makes the 3D shape readable without touching the mouse; it is
+forced off under `prefers-reduced-motion`.
+
+## The three views: activity, families, spotlight
+
+The cloud answers one question at a time, and the switch is in *The brain itself*.
+
+**Activity** is the default and the dramatic one: resting cells are dim steel blue, spiking cells
+climb a blue → cyan → amber → white ramp. Nothing else is encoded.
+
+**Families** answers *what kind of cell is this*. Ten broad `super_class` groups get a fixed hue,
+and brightness still means "firing" — so the two facts are carried by two different channels and
+both stay readable at once. This is deliberately **broad rather than fine-grained**: colouring all
+fifty `cell_class` values would produce confetti, and 23% of neurons have no `cell_class` at all
+while only 14 lack a `super_class`.
+
+The names come from [`flybrain/families.py`](../flybrain/families.py), not from a model, and the
+publisher's own vocabulary is precise and unreadable — `ME>LO`, `ALPN`, `CX`. So the module carries
+the plain-English gloss, and a test requires it to cover every value the annotation table can
+report. An unrecognised value renders as *unlabelled* rather than being guessed at.
+
+![The family view: violet central brain, blue optic lobe, amber and green projection cells](images/cell-families.png)
+
+**Spotlight** fades everything outside a selection. Pick a family from the legend, or a **sense**
+from the chips below it, and that pathway is lifted out of the brain.
+
+Lifting matters as much as fading. The trained temperature pathway is **29 neurons out of
+138,639** — dimming alone leaves it invisible, so selected cells are enlarged and brightened as
+well. Filtering alone was measured to be indistinguishable from the activity view, and the fix was
+to change the shader rather than to describe the feature more confidently.
+
+![Spotlighting the thermosensory pathway: 29 cells lifted out of a dimmed brain](images/spotlight-pathway.png)
+
+### Orientation markers are derived, not guessed
+
+The markers say `front · eyes`, `back · body`, `left` and `right`, and they are a **fact about this
+dataset verified against three independent landmarks**:
+
+| Landmark | mean z | Why it settles the question |
+|---|---|---|
+| photoreceptors `R1-6` (the retina) | −0.175 | the retina is the front of the eye |
+| `TRN` antennal thermoreceptors | −0.830 | the antennae sit in front of the brain |
+| `ascending` neurons (from the body) | +0.38 | the neck is at the back |
+
+So **front is negative z**, and `left` is negative x — confirmed against the annotation table's own
+`side` column, where neurons marked `left` average x = −0.123 and `right` averages +0.124, covering
+all 138,639 cells. A test recomputes both from the raw data, so the constant cannot rot silently.
+No claim is made about up and down: the cloud is only ~0.24 deep in y and the renderer uses that
+axis for depth, so a label there would confuse more than it explains.
+
+The markers are **inset** from the cloud's extremes by a fraction of each axis's span, and the
+labels are kept short, because **the cloud is wider than the gap between the two HUD columns** — a
+label at the literal extreme is projected underneath a panel and cannot be read.
+
+### Afterimage is decoration on a measurement, and the panel says so
+
+A neuron that spikes stays visible for about 0.8 s. This is **ours, not the brain's**: the truth is
+the frame the server sent, and the fade is a rendering choice, which is why there is a toggle for
+reading exact values.
+
+It is also honest about its own limits. With a 60 s heartbeat the brain produces frames seconds
+apart, so the fade is visible *within* a burst and will not make an idle brain look busy. It is
+implemented as a **sparse** decay list — only cells that actually spiked are decayed, rather than
+138,639 entries every animation frame, which would be 8M writes a second to fade a few thousand
+cells.
+
+## Guided exploration
+
+Seven walkthroughs, collapsed by default, each of which sets the view up and explains what you are
+looking at in ordinary words: *what am I even looking at*, *which end is the front*, *follow the
+warmth*, *where does light come in*, *what smells*, *how does it decide to move*, and *what colour
+is it choosing, and why*.
+
+Clicking a running guide again clears it, so a guide is never a mode you are stuck in. The prose
+may only restate the real role descriptions in [`flybrain/mapping.py`](../flybrain/mapping.py) —
+there is no invented biology in it.
+
+### The connection trace
+
+Following a sense draws a handful of lines to where it sends its signals, weighted by how many
+synapses run that way. For the thermosensory pathway that is 2,495 synapses, most of them to
+`ALLN` and `ALPN`.
+
+**The counts are exact; the geometry is a summary.** The lines join group centres of mass, not
+individual synapses, and the payload says so in a `note` field. 15,091,983 connections cannot be
+drawn, and all of them together is a hairball that answers nothing.
+
+The whole overlay **degrades to absent**: if `/api/trace` is unavailable, the guide it belongs to
+still reads perfectly.
 
 ### Sensitivity: the setting that makes it work in a real house
 
@@ -621,22 +760,30 @@ Recorded so they do not have to be re-derived. Roughly in order of value per uni
   depends on. It is the most direct answer to "is the brain doing something sensible?".
 - **A "why" trace for one decision.** Record the per-neuron rates behind the current colour and
   let the user click a decision in the history to replay it. Turns the dashboard from a
-  readout into a debugger. **Designed:** this is placement A in [`jev.md`](jev.md), where the
-  trace is a *classification* into one of seven failure modes this project already documents
-  (saturation, regime mismatch, deadband throttling, …) rather than a generated sentence.
-- **An attention director.** 138,639 points is more than anyone can scan, and the current
-  emphasis rule is the static `gain`/`saturation`/`gamma` threshold in
-  [`MemoryBrain.quantize()`](../flybrain/activity.py). A slow loop that picks which cell class to
-  emphasise would make the cloud readable. **Designed:** placement C in [`jev.md`](jev.md);
-  ranked below the "why" trace because it relies on the same vocabularies being good first.
+  readout into a debugger. ~~Designed~~ **Built** — this is placement A in [`jev.md`](jev.md),
+  where the trace is a *classification* into one of seven failure modes this project already
+  documents (saturation, regime mismatch, deadband throttling, …) rather than a generated
+  sentence. Click any point in *Colour chosen*. It needs `JEV_ENABLED=1`, and the first real
+  verdict this project got was `throttled` at 0.24 confidence, which the router correctly refused
+  to act on.
+- **An attention director.** 138,639 points is more than anyone can scan, and the emphasis rule in
+  the activity view is still the static `gain`/`saturation`/`gamma` threshold in
+  [`MemoryBrain.quantize()`](../flybrain/activity.py). **Half built:** the *manual* version is the
+  spotlight, which is what placement C would drive automatically. A slow loop that picks which
+  family to emphasise would make the cloud readable on its own; it now has somewhere to plug in,
+  since spotlighting is a single uniform.
+- **Show the readout's weights.** Still not built, and still the most direct answer to "is the
+  brain doing something sensible?" — the loop is a linear map over 512 neurons, and drawing those
+  512 coefficients as a bar strip beside the brain would show *which* neurons the colour actually
+  depends on.
 - **Real-time engine.** Everything above is cheap; this is not. 0.13× realtime means a decision
   every ~2.3 s, which is fine for a thermostat and hopeless for anything that reacts. The
   active-set integrator is the documented route (see `engine.md`).
 - ~~**A pet card, the three-layer explanation, a memory trail and trust controls.**~~ **Built** —
-  see *The pet panels* above. What is still missing from them is the *interactive* half: marking a
-  trail entry *"yes, that fits"* or *"no, just passing through"* is not built, and neither is the
-  click-through from a decision to a Jev verdict (that is placement A,
-  [`jev.md`](jev.md#where-jev-goes)).
+  see *The pet panels* above. ~~The click-through from a decision to a Jev verdict~~ **Built** —
+  placement A. What is still missing is the other half of the trail's interactivity: marking an
+  entry *"yes, that fits"* or *"no, just passing through"*, which writes a training label and so
+  belongs with the recorder work rather than as UI alone.
 - **A time-of-day prior.** A fly brain has circadian clock neurons, and as of the `clock` role fix
   they resolve correctly (48 cells — see [`roadmap.md`](roadmap.md#resolved-the-circadian-clock-role-was-unreachable)).
   Driving them from `sun.sun` elevation would be a cheap contextual input. It is not free, though:

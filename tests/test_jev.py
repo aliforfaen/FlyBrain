@@ -61,6 +61,21 @@ def fixture_text(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 
 
+def live_config(**kwargs) -> JevConfig:
+    """A configuration that is actually switched on.
+
+    Since ``JEV_ENABLED`` defaults to off, a key alone no longer means Jev will be called, so
+    every test that is *about* a working layer has to say so. Tests about the switch itself build
+    ``JevConfig(...)`` directly.
+    """
+    kwargs.setdefault("api_key", "jv_live_test")
+    kwargs.setdefault("enabled_flag", True)
+    # The real deployment has this measured and set, and a latency figure without it describes
+    # geography rather than the model — so the default test config carries it too.
+    kwargs.setdefault("network_floor_ms", 49.0)
+    return JevConfig(**kwargs)
+
+
 def client_for(response_text: str, *, status: int = 200, config: JevConfig | None = None, calls=None):
     """A client whose transport always answers with one canned response."""
     def handler(request: httpx.Request) -> httpx.Response:
@@ -69,7 +84,7 @@ def client_for(response_text: str, *, status: int = 200, config: JevConfig | Non
         return httpx.Response(status, text=response_text, headers={"content-type": "application/json"})
 
     return JevClient(
-        config or JevConfig(api_key="jv_live_test"),
+        config or live_config(),
         transport=httpx.MockTransport(handler),
     )
 
@@ -84,7 +99,7 @@ def client_seq(responses, *, calls=None, config=None):
         status, text, headers = queue.pop(0) if len(queue) > 1 else queue[0]
         return httpx.Response(status, text=text, headers=headers or {"content-type": "application/json"})
 
-    return JevClient(config or JevConfig(api_key="jv_live_test"), transport=httpx.MockTransport(handler))
+    return JevClient(config or live_config(), transport=httpx.MockTransport(handler))
 
 
 def run(coro):
@@ -437,7 +452,7 @@ class TestAsking:
     def test_the_call_log_records_tokens_latency_and_the_floor(self) -> None:
         """A latency number without the floor beside it describes geography, not the model."""
         client = JevClient(
-            JevConfig(api_key="jv_live_test", network_floor_ms=154.0),
+            live_config(network_floor_ms=154.0),
             transport=httpx.MockTransport(
                 lambda r: httpx.Response(200, text=fixture_text("response_noul.json"))
             ),
@@ -478,7 +493,7 @@ class TestAsking:
     def test_a_model_mismatch_can_be_downgraded_to_a_warning(self) -> None:
         body = fixture("response_noul.json")
         body["model"] = "jev-1.14.0"
-        client = client_for(json.dumps(body), config=JevConfig(api_key="k", strict_model=False))
+        client = client_for(json.dumps(body), config=live_config(api_key="k", strict_model=False))
         assert run(client.ask({}, {"q": noul("?")})).model == "jev-1.14.0"
 
     def test_an_unknown_answer_kind_does_not_fail_the_others(self) -> None:
@@ -621,7 +636,7 @@ class TestAvailability:
         def boom(request):
             raise httpx.ConnectError("no route to host")
 
-        client = JevClient(JevConfig(api_key="jv_live_test"), transport=httpx.MockTransport(boom))
+        client = JevClient(live_config(), transport=httpx.MockTransport(boom))
         status = run(client.available())
         assert status.reason == "unreachable"
         assert "ConnectError" in status.detail
@@ -641,7 +656,7 @@ class TestAvailability:
 
     def test_the_probe_is_cached(self) -> None:
         calls: list[httpx.Request] = []
-        client = client_for(fixture_text("models_200.json"), calls=calls)
+        client = client_for(fixture_text("probe_200.json"), calls=calls)
         run(client.available())
         run(client.available())
         assert len(calls) == 1
@@ -656,7 +671,7 @@ class TestAvailability:
     def test_the_status_carries_the_floor_when_it_is_known(self) -> None:
         client = client_for(
             fixture_text("models_200.json"),
-            config=JevConfig(api_key="k", network_floor_ms=154.0),
+            config=live_config(api_key="k", network_floor_ms=154.0),
         )
         assert run(client.available()).to_dict()["floor_ms"] == 154.0
 
@@ -770,10 +785,10 @@ class _StubClient:
 
     def __init__(self, status) -> None:
         self._status = status
-        self.config = JevConfig(api_key="jv_live_donotleakme")
+        self.config = live_config(api_key="jv_live_donotleakme")
         self.calls: list = []
 
-    async def available(self, *, refresh: bool = False):
+    async def available(self, *, refresh: bool = False, probe: bool = True):
         return self._status
 
     async def aclose(self) -> None:
@@ -826,3 +841,272 @@ class TestStatusEndpoint:
 
         payload = self._payload(JevStatus(False, "unreachable", "ConnectError"), monkeypatch)
         assert json.loads(json.dumps(payload))["reason"] == "unreachable"
+
+
+class TestJevlessMode:
+    """The switch, and the promise that a watched dashboard cannot spend money.
+
+    This matters more than it looks. The probe is a real request, and a dashboard is something
+    people leave open for weeks — so "spends ~$0.03/day because it is on screen" is a silent cost
+    with no benefit until a placement exists. These tests pin both halves: that off means off, and
+    that the *status* path never pays for a badge.
+    """
+
+    def test_enabled_is_off_by_default_even_with_a_key(self) -> None:
+        """A key is a credential, not a decision to spend."""
+        config = JevConfig(api_key="jv_live_test")
+        assert config.key_present is True
+        assert config.enabled is False
+
+    def test_the_switch_and_the_key_are_reported_separately(self) -> None:
+        """`key_present` must not be dragged down by the switch, or the UI would hide the key."""
+        redacted = JevConfig(api_key="jv_live_secret").redacted()
+        assert redacted["key_present"] is True
+        assert redacted["enabled"] is False
+        assert redacted["key_hint"] == "...cret"
+
+    def test_the_environment_switch_turns_it_on(self) -> None:
+        assert JevConfig.from_env({"JEV_API_KEY": "k"}).enabled is False
+        assert JevConfig.from_env({"JEV_API_KEY": "k", "JEV_ENABLED": "1"}).enabled is True
+
+    def test_the_environment_switch_accepts_the_usual_spellings(self) -> None:
+        for truthy in ("1", "true", "yes", "on", "TRUE", " On "):
+            cfg = JevConfig.from_env({"JEV_API_KEY": "k", "JEV_ENABLED": truthy})
+            assert cfg.enabled is True, truthy
+        for falsy in ("0", "false", "no", "off", ""):
+            cfg = JevConfig.from_env({"JEV_API_KEY": "k", "JEV_ENABLED": falsy})
+            assert cfg.enabled is False, falsy
+
+    def test_switched_off_with_a_key_says_disabled_not_no_key(self) -> None:
+        """The distinction that sends a person to the right fix."""
+        calls: list[httpx.Request] = []
+        client = JevClient(
+            JevConfig(api_key="jv_live_test"),
+            transport=httpx.MockTransport(lambda r: calls.append(r) or httpx.Response(200, text="{}")),
+        )
+        status = run(client.available())
+        assert status.reason == "disabled"
+        assert status.available is False
+        assert calls == [], "a switched-off layer must not touch the network at all"
+
+    def test_no_key_still_wins_over_the_switch(self) -> None:
+        """With nothing configured, "you never set this up" beats "you turned it off"."""
+        client = JevClient(
+            JevConfig(api_key=None),
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, text="{}")),
+        )
+        assert run(client.available()).reason == "no_key"
+
+    def test_asking_while_switched_off_raises_disabled_not_no_key(self) -> None:
+        """A key that is present but unused must not be reported as a missing key."""
+        calls: list[httpx.Request] = []
+        client = JevClient(
+            JevConfig(api_key="jv_live_test"),
+            transport=httpx.MockTransport(lambda r: calls.append(r) or httpx.Response(200, text="{}")),
+        )
+        with pytest.raises(JevAuthError) as excinfo:
+            run(client.ask({}, {"q": noul("?")}))
+        assert excinfo.value.reason == "disabled"
+        assert calls == []
+
+    def test_the_status_path_does_not_probe(self) -> None:
+        """`probe=False` is what /api/status passes, and it must not spend."""
+        calls: list[httpx.Request] = []
+        client = client_for(fixture_text("models_200.json"), calls=calls)
+        status = run(client.available(probe=False))
+        assert status.reason == "unprobed"
+        assert calls == []
+
+    def test_the_status_path_returns_the_last_known_answer_after_a_probe(self) -> None:
+        """Stale-but-real beats "unknown" when something genuinely was observed."""
+        calls: list[httpx.Request] = []
+        client = client_for(fixture_text("models_200.json"), calls=calls)
+        run(client.available())
+        assert run(client.available(probe=False)).reason == "ok"
+        assert len(calls) == 1, "reading the cached answer must not re-ask"
+
+    def test_the_reason_vocabulary_is_closed(self) -> None:
+        """Six reasons, each a different action for the person reading it."""
+        import typing
+
+        from flybrain.jev import JevStatus
+
+        # `get_type_hints`, not `__dataclass_fields__[...].type`: the module uses
+        # `from __future__ import annotations`, so the field type is the *string*
+        # "Literal[...]" and `get_args` on it returns nothing — which silently makes the
+        # companion test below pass on an empty set.
+        allowed = set(typing.get_args(typing.get_type_hints(JevStatus)["reason"]))
+        assert allowed == {
+            "ok", "no_key", "disabled", "unprobed", "unauthorized", "unreachable",
+        }
+
+    def test_every_reason_has_a_plain_english_label_in_the_client(self) -> None:
+        """A reason with no label renders as a raw token in the UI."""
+        import typing
+        from pathlib import Path
+
+        from flybrain.jev import JevStatus
+
+        reasons = typing.get_args(typing.get_type_hints(JevStatus)["reason"])
+        assert reasons, "the annotation did not resolve; this test would pass vacuously"
+        app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        missing = [r for r in reasons if f"{r}:" not in app]
+        assert not missing, f"Jev reasons with no client label: {missing}"
+
+
+class TestDecisionInspector:
+    """Placement A: the closed vocabulary, the trimmed state, and the verdict shape.
+
+    This class exists because the first version of :func:`classify_decision` read
+    ``routing.detail``, which does not exist — the field is ``reason``. Nothing caught it, so a
+    real call was paid for, answered, and then turned into a 500 that was not cached. A test over
+    the assembled dict is exactly what was missing.
+    """
+
+    def _row(self) -> dict:
+        return {
+            "t": 1790530920.67,
+            "temperature_c": 26.484,
+            "kelvin": 4790,
+            "ideal_kelvin": 5336,
+            "band": "neutral",
+            "seq": 222,
+            "active_neurons": 8506,
+            "total_spikes": 157939,
+            "window_ms": 300.0,
+            "reading_age_s": 0.4,
+            "top_regions": [{"name": "ALLN", "spikes": 120}],
+            "settings": {"interval_s": 8.0, "deadband_k": 25.0},
+        }
+
+    def test_the_vocabulary_is_the_seven_documented_modes(self) -> None:
+        from flybrain.jev import FAILURE_MODES
+
+        assert set(FAILURE_MODES) == {
+            "healthy", "saturated_sensory", "regime_mismatch", "too_few_spikes",
+            "sensor_stale", "throttled", "unknown",
+        }
+
+    def test_every_mode_explains_itself(self) -> None:
+        """A label nobody can verify is a label nobody should trust."""
+        from flybrain.jev import FAILURE_MODES
+
+        for label, meaning in FAILURE_MODES.items():
+            assert meaning and len(meaning) > 20, label
+
+    def test_the_question_offers_every_mode_as_a_criterion(self) -> None:
+        from flybrain.jev import FAILURE_MODES, failure_mode_question
+
+        q = failure_mode_question()
+        assert q["type"] == "choice"
+        assert set(q["criteria"]) == set(FAILURE_MODES)
+
+    def test_the_state_is_trimmed_to_what_a_mode_can_use(self) -> None:
+        from flybrain.jev import DECISION_STATE_FIELDS, decision_state
+
+        state = decision_state({**self._row(), "an_irrelevant_field": 1})
+        assert "an_irrelevant_field" not in state
+        assert set(state) <= set(DECISION_STATE_FIELDS)
+        assert state["temperature_c"] == 26.484
+
+    def test_unmeasured_fields_are_omitted_rather_than_sent_as_null(self) -> None:
+        """A null invites the model to read "not measured" as "zero"."""
+        from flybrain.jev import decision_state
+
+        row = self._row()
+        row["reading_age_s"] = None
+        assert "reading_age_s" not in decision_state(row)
+
+    def test_a_real_captured_response_becomes_a_verdict(self) -> None:
+        """The shape the HTTP endpoint returns, against a verbatim capture."""
+        from flybrain.jev import FAILURE_MODES, classify_decision
+
+        client = client_for(fixture_text("response_failure_mode.json"))
+        verdict = run(classify_decision(client, self._row()))
+
+        assert verdict["label"] in set(FAILURE_MODES)
+        assert 0.0 <= verdict["confidence"] <= 1.0
+        assert verdict["action"] in {"act", "confirm", "needs_human"}
+        # The bug that motivated this class: these keys must exist, and `routing_reason` is the
+        # one that was wrong.
+        assert "routing_reason" in verdict
+        assert verdict["routing_reason"]
+        assert set(verdict["probabilities"]) == set(FAILURE_MODES)
+        assert verdict["cost_usd"] > 0
+        assert verdict["floor_ms"] == 49.0
+
+    def test_a_low_confidence_verdict_only_proposes(self) -> None:
+        """The capture scored 0.50, which must land on `confirm` rather than being acted on."""
+        from flybrain.jev import classify_decision
+
+        client = client_for(fixture_text("response_failure_mode.json"))
+        verdict = run(classify_decision(client, self._row()))
+        assert verdict["confidence"] == pytest.approx(0.5)
+        assert verdict["action"] == "confirm"
+
+    def test_a_noul_answer_comes_back_as_needs_human_not_as_an_error(self) -> None:
+        """A `noul` carries no confidence, so there is nothing to gate on — a real outcome."""
+        from flybrain.jev import classify_decision
+
+        client = client_for(fixture_text("response_noul.json"), config=None)
+        with pytest.raises(JevError):
+            # `response_noul.json` answers under a different id, so the missing answer is an
+            # error rather than a silent `unknown` verdict.
+            run(classify_decision(client, self._row(), question_id="failure_mode"))
+
+    def test_the_request_carries_the_trimmed_state_and_one_question(self) -> None:
+        calls: list[httpx.Request] = []
+        from flybrain.jev import DECISION_STATE_FIELDS, classify_decision
+
+        client = client_for(fixture_text("response_failure_mode.json"), calls=calls)
+        run(classify_decision(client, self._row()))
+        body = json.loads(calls[0].content)
+        assert len(body["questions"]) == 1
+        assert "failure_mode" in body["questions"]
+        assert set(body["state"]) <= set(DECISION_STATE_FIELDS)
+
+
+class TestProbeAccounting:
+    """The probe is a real request that really costs money.
+
+    Leaving it out of the call log made `spent_usd` under-report the session by exactly what the
+    dashboard spends on itself — the number a person uses to decide whether to leave it running.
+    """
+
+    def test_a_probe_is_recorded_with_its_cost(self) -> None:
+        calls: list[httpx.Request] = []
+        client = client_for(fixture_text("probe_200.json"), calls=calls)
+        status = run(client.available())
+        assert status.reason == "ok"
+        assert len(client.calls) == 1
+        entry = client.calls[0]
+        assert entry["probe"] is True
+        assert entry["questions"] == 1
+        assert entry["cost_usd"] > 0, "a probe costs money and the log has to say so"
+        assert entry["cost_reported"] is True
+
+    def test_the_probe_cost_counts_towards_the_session_total(self) -> None:
+        from flybrain.jev import session_spend
+
+        client = client_for(fixture_text("probe_200.json"))
+        run(client.available())
+        run(client.available(refresh=True))
+        assert len(client.calls) == 2
+        assert session_spend(client) > 0
+
+    def test_a_failed_probe_records_nothing(self) -> None:
+        """Nothing was charged for a connection that never opened."""
+        def boom(request):
+            raise httpx.ConnectError("no route to host")
+
+        client = JevClient(live_config(), transport=httpx.MockTransport(boom))
+        assert run(client.available()).reason == "unreachable"
+        assert client.calls == []
+
+    def test_a_cached_answer_does_not_add_a_second_charge(self) -> None:
+        calls: list[httpx.Request] = []
+        client = client_for(fixture_text("models_200.json"), calls=calls)
+        run(client.available())
+        run(client.available())
+        assert len(calls) == 1
+        assert len(client.calls) == 1

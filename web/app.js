@@ -108,6 +108,53 @@ async function getJSON(url) {
 }
 
 
+/* ------------------------------------------------------------- preferences */
+
+/* One tiny store for everything the *viewer* chooses: which panels are open, the view mode,
+ * auto-orbit, and the two view toggles. Reads are guarded because a corrupt or unavailable
+ * localStorage must never stop the dashboard booting — a privacy setting that blocks storage
+ * would otherwise present as a blank page. */
+
+const STORE_KEY = 'flybrain.prefs.v1';
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (err) {
+    console.warn('could not read saved preferences; using defaults', err);
+    return {};
+  }
+}
+
+/* Panels that start collapsed: the diagnostics, the settings block, and the walkthrough. The
+   point is to leave the dramatic things visible and put the reference material one click away. */
+const DEFAULT_CLOSED = [
+  'panel-pacing', 'panel-senses', 'panel-guides', 'panel-layers',
+  'panel-trust', 'panel-journal', 'panel-connect', 'panel-usage',
+];
+
+const prefs = loadPrefs();
+const collapsedPanels = new Set(
+  Array.isArray(prefs.collapsed) ? prefs.collapsed : DEFAULT_CLOSED,
+);
+
+function savePrefs() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify({
+      collapsed: [...collapsedPanels],
+      viewMode: state.viewMode,
+      autoRotate: state.autoRotate,
+      afterimage: state.afterimage,
+      markers: state.markers,
+    }));
+  } catch (err) {
+    // Storage blocked or full. The dashboard is not worse for it, so this is not an error.
+    console.warn('could not save preferences', err);
+  }
+}
+
 /* ------------------------------------------------------------- app state */
 
 const state = {
@@ -117,14 +164,94 @@ const state = {
   headerBytes: FALLBACK_HEADER_BYTES,
   dtMs: 0.1,
   paused: false,
-  autoRotate: false,
+  autoRotate: prefs.autoRotate === true,
   lastFrameAt: 0,
   spikeRate: 0,
   silentSince: 0,
   silenceWarned: false,
   frameDtMs: 0,
   loop: null,          // last /api/loop or websocket "loop" payload
+  //: Which question the cloud is answering. "activity" is the dramatic live view and stays the
+  //: default; the other two are deliberate ways to explore rather than things to stumble into.
+  viewMode: ['activity', 'families', 'spotlight'].includes(prefs.viewMode) ? prefs.viewMode : 'activity',
+  //: A spike lingers for a moment after it fires. Off under a reduced-motion preference.
+  afterimage: prefs.afterimage !== false && !prefersReducedMotion(),
+  //: Front/back/left/right markers, derived from the annotations rather than guessed.
+  markers: prefs.markers !== false,
+  //: The spotlight selection: a family id and/or a sense id, -1 meaning "not selected".
+  spotFamily: -1,
+  spotSense: -1,
+  groups: null,        // /api/groups metadata
+  familyIds: null,     // Uint8Array, one per neuron
+  senseIds: null,      // Uint8Array, one per neuron
+  familyActivity: null, // id -> spikes, from /api/regions
+  activeGuide: null,
+  trail: null,          // last /api/timeline payload, so expanding needs no refetch
+  trailExpanded: false,
+  //: The last chart payload and the axes used to draw it, so a click can be turned back into the
+  //: decision that produced the point under the cursor.
+  chartRows: [],
+  chartMap: null,
+  selectedSeq: null,
+  //: The last status blocks, so the Jev switch can repaint the badge without a refetch.
+  lastTrust: null,
+  lastJev: null,
 };
+
+function prefersReducedMotion() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+
+/* ------------------------------------------------------------ collapsible panels */
+
+/* Panels are made collapsible here rather than in the markup. There are fifteen of them, and the
+ * body must stay in the DOM while collapsed — every paint function addresses its nodes by id, so
+ * removing a body would silently stop it updating and the panel would show stale numbers when
+ * reopened. Doing it in one place also means a new panel cannot forget to be collapsible. */
+
+function setSummary(key, text) {
+  setText('#sum-' + key, text);
+}
+
+function applyPanel(panel, open) {
+  panel.dataset.collapsed = open ? '0' : '1';
+  const btn = panel.querySelector('.panel-head');
+  if (btn) btn.setAttribute('aria-expanded', String(open));
+}
+
+function togglePanel(id) {
+  const panel = document.getElementById(id);
+  if (!panel) return;
+  const open = panel.dataset.collapsed === '1';
+  applyPanel(panel, open);
+  if (open) collapsedPanels.delete(id); else collapsedPanels.add(id);
+  savePrefs();
+}
+
+function buildPanels() {
+  for (const panel of document.querySelectorAll('section.panel')) {
+    const h2 = panel.querySelector(':scope > h2');
+    const body = panel.querySelector(':scope > .body');
+    if (!h2 || !body || panel.querySelector('.panel-head')) continue;
+    const key = panel.id.replace(/^panel-/, '');
+    if (!body.id) body.id = 'body-' + key;
+
+    const btn = el('button', 'panel-head');
+    btn.type = 'button';
+    btn.setAttribute('aria-controls', body.id);
+    // Move the existing heading content into the button rather than rebuilding it, so the tags
+    // the paint functions write to (`#pace-mode`, `#brain-tag`, …) keep their ids and handlers.
+    while (h2.firstChild) btn.appendChild(h2.firstChild);
+    const sum = el('span', 'sum');
+    sum.id = 'sum-' + key;
+    btn.appendChild(sum);
+    h2.appendChild(btn);
+
+    applyPanel(panel, !collapsedPanels.has(panel.id));
+    btn.addEventListener('click', () => togglePanel(panel.id));
+  }
+}
+
 
 /* Temperature and colour history is owned by the server (it is the thing that actually
  * made the decisions), so the chart cannot disagree with the numbers beside it. */
@@ -171,6 +298,9 @@ function paintBrainActivity(activeNeurons, rateHz) {
       : `About ${fmtCount(activeNeurons)} of the fly's ${fmtInt(state.nNeurons)} neurons `
         + `are firing right now — the brain is ${st.word}.`;
   }
+  setSummary('brain', state.paused
+    ? 'paused'
+    : `${fmtCount(activeNeurons)} active · ${st.word}`);
 }
 
 /* A plain description of what the light looks like. Derived from the Kelvin value, not
@@ -217,6 +347,9 @@ function paintLoop(loop) {
   const tempEl = $('#loop-temp');
   const kelvinEl = $('#loop-kelvin');
   const hasReading = Number.isFinite(loop.temperature_c) && Number.isFinite(loop.kelvin);
+  setSummary('loop', hasReading
+    ? `${Number(loop.temperature_c).toFixed(1)} °C → ${Math.round(loop.kelvin)} K`
+    : (loop.available === false ? 'unavailable' : 'waiting'));
 
   if (tempEl) {
     tempEl.innerHTML = hasReading
@@ -309,6 +442,11 @@ function drawChart() {
   const loop = state.loop;
   const hist = (loop && Array.isArray(loop.history)) ? loop.history : [];
   const c = cctx;
+  state.chartRows = hist;
+  const lastK = hist.length ? hist[hist.length - 1].kelvin : null;
+  setSummary('history', hist.length
+    ? `${hist.length} decision(s)${lastK != null ? ` · last ${Math.round(lastK)} K` : ''}`
+    : 'collecting…');
   c.setTransform(chartDpr, 0, 0, chartDpr, 0, 0);
   c.clearRect(0, 0, chartW, chartH);
 
@@ -335,6 +473,9 @@ function drawChart() {
   const [yLo, yHi] = pad(kLo, kHi, 0.08);
   const X = (t) => padL + ((t - xLo) / (xHi - xLo)) * w;
   const Y = (k) => padT + h - ((k - yLo) / (yHi - yLo)) * h;
+  // Kept so a click can be turned back into a decision. Recomputing the axes in the click
+  // handler is how a hit test silently drifts out of step with the thing it is testing.
+  state.chartMap = { X, Y };
 
   // grid
   c.strokeStyle = 'rgba(120,150,180,0.12)';
@@ -377,6 +518,24 @@ function drawChart() {
   c.strokeStyle = 'rgba(255,255,255,0.85)';
   c.stroke();
 
+  // The decision the inspector is currently showing, ringed so the verdict below the chart is
+  // visibly attached to one point rather than floating free.
+  if (state.selectedSeq != null) {
+    const picked = hist.find((d) => Number(d.seq) === Number(state.selectedSeq));
+    if (picked) {
+      const px = X(Number(picked.temperature_c));
+      const py = Y(Number(picked.kelvin));
+      c.beginPath();
+      c.arc(px, py, 7, 0, Math.PI * 2);
+      c.strokeStyle = 'rgba(244,168,63,0.95)';
+      c.lineWidth = 1.6;
+      c.stroke();
+      c.beginPath();
+      c.moveTo(px + 7, py); c.lineTo(px + 13, py);
+      c.stroke();
+    }
+  }
+
   // axis labels
   c.font = `10px ${MONO}`;
   c.fillStyle = 'rgba(190,210,230,0.95)';
@@ -408,6 +567,35 @@ let points = null;
 let material = null;
 let intensityAttr = null;
 let intensityArray = null;
+/* Afterimage buffers. `frameBase` is what the server said, `glowValues` is the decaying copy,
+ * and `recentIdx` lists only the neurons currently fading. */
+let frameBase = null;
+let glowValues = null;
+let recentIdx = null;
+let inRecent = null;
+let recentCount = 0;
+//: Seconds for a spike to fade to about a tenth. Short on purpose: this is a trace of something
+//: that just happened, not a second, invented activity signal.
+const GLOW_TAU_S = 0.35;
+//: Markers placed from the annotation table, so the cloud reads as a head with a front and a back.
+let markerGroup = null;
+//: The connection trace drawn for the active guide, if any.
+let traceGroup = null;
+
+/* Which numeric code the shader expects for the current view mode. */
+function viewModeCode() {
+  return { activity: 0, families: 1, spotlight: 2 }[state.viewMode] ?? 0;
+}
+
+/* A uint8 id buffer as a float attribute. The shader compares ids, so a float is what it wants;
+ * sharing one helper keeps the two id attributes the same shape. */
+function familyAttr(bytes) {
+  const arr = new Float32Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) arr[i] = bytes[i];
+  const attr = new THREE.BufferAttribute(arr, 1);
+  attr.setUsage(THREE.StaticDrawUsage);
+  return attr;
+}
 let fpsEma = 0;
 let lastTick = 0;
 let lastFpsPaint = 0;
@@ -471,24 +659,40 @@ function buildCloud(positions) {
   intensityAttr.setUsage(THREE.DynamicDrawUsage);
   geom.setAttribute('aIntensity', intensityAttr);
 
-  // Normalised connectome index — used by the "index order" colour mode.
-  const idx = new Float32Array(n);
-  const inv = n > 1 ? 1 / (n - 1) : 0;
-  for (let i = 0; i < n; i++) idx[i] = i * inv;
-  geom.setAttribute('aIndexT', new THREE.BufferAttribute(idx, 1).setUsage(THREE.StaticDrawUsage));
+  // Server truth, kept separate from the attribute the shader reads: the attribute carries the
+  // afterimage blend, so overwriting it with the raw frame would erase the fade every time a
+  // frame arrived. `glow` is the decaying half and `recentIdx` is the sparse list of neurons it
+  // currently applies to — sparse because decaying 138,639 entries every animation frame would
+  // be 8M writes a second to fade a few thousand cells.
+  frameBase = new Uint8Array(n);
+  glowValues = new Float32Array(n);
+  recentIdx = new Int32Array(n);
+  inRecent = new Uint8Array(n);
+  recentCount = 0;
+
+  // Family and sense ids, one byte each, straight from /api/groups/ids. Absent when the server
+  // has no annotation table, in which case the family views fall back to the activity ramp.
+  if (state.familyIds) geom.setAttribute('aFamily', familyAttr(state.familyIds));
+  if (state.senseIds) geom.setAttribute('aSense', familyAttr(state.senseIds));
 
   geom.computeBoundingBox();
 
+  const source = shaderSource(state.groups);
   material = new THREE.ShaderMaterial({
     uniforms: {
-      uPointSize: { value: 1.9 },
+      // A touch smaller than the 1.9 this used to be: at 1.9 the resting cloud read as a solid
+      // mass and individual firing cells had nowhere to stand out.
+      uPointSize: { value: 1.45 },
       uPixelRatio: { value: renderer.getPixelRatio() },
       uExposure: { value: 1.35 },
       uFloor: { value: 0.05 },
-      uColorMode: { value: 0 },
+      uViewMode: { value: viewModeCode() },
+      uSpotFamily: { value: state.spotFamily },
+      uSpotSense: { value: state.spotSense },
+      uSpotDim: { value: 0.22 },
     },
-    vertexShader: VERT,
-    fragmentShader: FRAG,
+    vertexShader: source.vert,
+    fragmentShader: source.frag,
     transparent: true,
     depthTest: true,
     depthWrite: true,
@@ -499,8 +703,6 @@ function buildCloud(positions) {
   points.frustumCulled = false;
   scene.add(points);
 
-  if (material) material.uniforms.uColorMode.value = 0;
-
   // A very faint bounding box gives the cloud a sense of scale.
   const box = geom.boundingBox.clone().expandByScalar(0.015);
   const helper = new THREE.Box3Helper(box, new THREE.Color(0x14304a));
@@ -510,49 +712,102 @@ function buildCloud(positions) {
   scene.add(helper);
 }
 
-const VERT = `
+/* The family palette comes from /api/groups, so there is exactly one place that decides what
+ * colour "optic" is — the Python vocabulary the tests check against the annotation table. The
+ * shader is generated from it rather than duplicating eleven hex codes here. */
+function hexToVec3(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+  if (!m) return 'vec3(0.35, 0.39, 0.45)';
+  const v = parseInt(m[1], 16);
+  const r = ((v >> 16) & 255) / 255, g = ((v >> 8) & 255) / 255, b = (v & 255) / 255;
+  return `vec3(${r.toFixed(3)}, ${g.toFixed(3)}, ${b.toFixed(3)})`;
+}
+
+function familyHueGLSL(groups) {
+  const families = (groups && Array.isArray(groups.families)) ? groups.families : [];
+  if (!families.length) {
+    // No annotation table: every dot is the same grey, and the view modes that need a family
+    // simply look like the activity view rather than breaking.
+    return 'vec3 familyHue(float id) { return vec3(0.35, 0.39, 0.45); }';
+  }
+  // The branches are upper bounds on an ascending id, so **every** id needs its own bound,
+  // including 0. Without an explicit `id < 0.5` first, unlabelled cells satisfy `id < 1.5` and
+  // silently take the first real family's colour.
+  const ordered = [...families].sort((a, b) => a.id - b.id);
+  const lines = ordered.map((f) => `    if (id < ${(f.id + 0.5).toFixed(1)}) return ${hexToVec3(f.colour)};`);
+  return [
+    '  // Family id -> hue. An if/else chain rather than a uniform array: GLSL ES 1.00 restricts',
+    '  // dynamic indexing of uniform arrays, and this has to compile everywhere three does.',
+    '  vec3 familyHue(float id) {',
+    ...lines,
+    '    return vec3(0.35, 0.39, 0.45);',
+    '  }',
+  ].join('\n');
+}
+
+function shaderSource(groups) {
+  const vert = `
   uniform float uPointSize;
   uniform float uPixelRatio;
-  uniform int uColorMode;
+  uniform int uViewMode;
+  uniform int uSpotFamily;
+  uniform int uSpotSense;
+  uniform float uSpotDim;
 
   attribute float aIntensity;
-  attribute float aIndexT;
+  attribute float aFamily;
+  attribute float aSense;
 
   varying float vValue;
-  varying float vIntensity;
+  varying vec3 vFamilyHue;
+  varying float vDim;
+  varying float vSel;
   varying float vFog;
+
+${familyHueGLSL(groups)}
 
   void main() {
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     float inten = clamp(aIntensity / 255.0, 0.0, 1.0);
-    vIntensity = inten;
+    vValue = inten;
     vFog = clamp((-mv.z - 1.15) / 1.75, 0.0, 1.0);
+    vFamilyHue = familyHue(aFamily);
 
-    float v = inten;
-    if (uColorMode == 1) {
-      v = clamp(position.z * 0.5 + 0.5, 0.0, 1.0);          // anterior <-> posterior
-    } else if (uColorMode == 2) {
-      v = aIndexT;                                          // connectome index order
-    } else if (uColorMode == 3) {
-      v = clamp(length(position.xz) * 2.2, 0.0, 1.0);       // distance from centre
+    // Spotlight fades everything that is not selected, rather than hiding it: the shape of the
+    // brain is part of what makes a highlighted pathway legible.
+    float dim = 1.0;
+    float sel = 0.0;
+    if (uViewMode == 2 && (uSpotFamily >= 0 || uSpotSense >= 0)) {
+      bool hit = false;
+      if (uSpotFamily >= 0 && abs(aFamily - float(uSpotFamily)) < 0.5) hit = true;
+      if (uSpotSense >= 0 && abs(aSense - float(uSpotSense)) < 0.5) hit = true;
+      dim = hit ? 1.0 : uSpotDim;
+      sel = hit ? 1.0 : 0.0;
     }
-    vValue = v;
+    vDim = dim;
+    vSel = sel;
 
     // Firing neurons swell slightly, which reads as emphasis at 1-3 px.
-    float boost = (uColorMode == 0) ? (1.0 + 1.15 * inten) : 1.0;
-    float size = uPointSize * uPixelRatio * boost * (2.4 / max(0.30, -mv.z));
-    gl_PointSize = clamp(size, 1.0, ${MAX_POINT_CHUNK}.0);
+    float boost = 1.0 + 1.15 * inten;
+    // The selected pathway is *lifted* as well as the rest being pushed down. Dimming alone is
+    // not enough to find 29 neurons inside 138,639: the whole point of the spotlight is that the
+    // small thing becomes the visible thing.
+    float emphasis = mix(1.0, 2.8, sel);
+    float size = uPointSize * uPixelRatio * boost * (2.4 / max(0.30, -mv.z)) * emphasis;
+    gl_PointSize = clamp(size * mix(1.0, 0.82, 1.0 - dim), 1.0, ${MAX_POINT_CHUNK}.0);
     gl_Position = projectionMatrix * mv;
   }
 `;
 
-const FRAG = `
+  const frag = `
   uniform float uExposure;
   uniform float uFloor;
-  uniform int uColorMode;
+  uniform int uViewMode;
 
   varying float vValue;
-  varying float vIntensity;
+  varying vec3 vFamilyHue;
+  varying float vDim;
+  varying float vSel;
   varying float vFog;
 
   // Ordered ramp: near-black blue -> deep blue -> cyan -> amber -> white.
@@ -575,23 +830,40 @@ const FRAG = `
     if (d > 0.5) discard;                       // round the square point into a disc
     float edge = smoothstep(0.5, 0.34, d);
 
-    float t = (uColorMode == 0) ? vIntensity : vValue;
-    t = clamp(t * uExposure, 0.0, 1.0);
+    float t = clamp(vValue * uExposure, 0.0, 1.0);
 
     vec3 col;
-    if (uColorMode == 0) {
-      // Resting connectome reads as dim steel blue; spiking neurons climb the ramp.
+    if (uViewMode == 0) {
+      // Activity: resting connectome reads as dim steel blue; spiking neurons climb the ramp.
       vec3 rest = vec3(0.100, 0.175, 0.310);
       float k = smoothstep(uFloor, 0.70, t);
       col = mix(rest, ramp(0.30 + 0.70 * t), k);
     } else {
-      col = ramp(uFloor + (1.0 - uFloor) * t);
+      // Families and spotlight: the hue is *what kind* of cell, the brightness is *whether it is
+      // firing*. Two facts, two channels, so both stay readable at once.
+      //
+      // The resting floor is deliberately high (0.55). At a low floor the hues were technically
+      // distinct but practically invisible: the optic lobe alone is 56% of the brain, so a cloud
+      // of dark blue cells just reads as blue.
+      vec3 base = vFamilyHue * (0.55 + 0.85 * t);
+      // Only a *small* wash towards white, and only at the very top. Bleaching a firing cell
+      // destroyed the family information exactly where there was activity to be interested in:
+      // the central brain is the busiest family in a typical window, and at a 0.85 wash its
+      // violet never appeared at all. Brightness now carries "firing" without erasing "kind".
+      col = mix(base, vec3(1.0, 1.0, 0.97), smoothstep(0.80, 1.0, t) * 0.35);
     }
     // Depth cue: the near surface of the cloud stays bright, the far side sinks.
     col *= mix(1.10, 0.55, vFog);
+    col *= vDim;
+    // Selection adds light rather than changing hue, so the family colour and the firing
+    // brightness both survive being picked out.
+    col = mix(col, min(col * 1.9 + 0.18, vec3(1.0)), vSel);
     gl_FragColor = vec4(col, edge);
   }
 `;
+
+  return { vert, frag };
+}
 
 /* ------------------------------------------------------------- frame loop */
 
@@ -603,6 +875,7 @@ function animate(now) {
 
   if (!document.hidden) {
     if (controls) controls.update();
+    decayGlow(dt);
     if (renderer && scene && camera) renderer.render(scene, camera);
 
     if (now - lastChartPaint > 55) {
@@ -621,7 +894,7 @@ function animate(now) {
 function paintStaleness(now) {
   const tag = $('#brain-tag');
   if (!tag) return;
-  if (state.paused) { tag.textContent = 'paused'; return; }
+  if (state.paused) { tag.textContent = 'paused'; setSummary('view', 'paused'); return; }
   if (!state.lastFrameAt) { tag.textContent = 'idle'; return; }
   const age = now - state.lastFrameAt;
   // Pacing means the brain deliberately steps in bursts and then waits. Frames *should* be
@@ -635,9 +908,770 @@ function paintStaleness(now) {
     const mode = state.loop && state.loop.pacing && state.loop.pacing.mode;
     if (mode === 'burst') { tag.textContent = 'bursting'; return; }
     tag.textContent = interval > 0 ? 'waiting' : 'live';
+    setSummary('view', `${state.viewMode} · ${fpsEma ? fpsEma.toFixed(0) : '—'} fps`);
     return;
   }
   tag.textContent = `stalled ${(age / 1000).toFixed(1)}s`;
+  setSummary('view', `stalled ${(age / 1000).toFixed(1)}s`);
+}
+
+/* ------------------------------------------------------------- afterimage */
+
+/* A neuron that spikes stays visible for a moment after the frame that showed it. This is
+ * *decoration on a real measurement*: the truth is `frameBase`, the fade is ours, and the note in
+ * the view panel says so. It is also only ever visible within a burst — with a 60 s heartbeat the
+ * brain produces frames seconds apart, so a fade of a third of a second cannot make an idle brain
+ * look busy, and it is not meant to. The toggle exists so exact values can be read. */
+
+function registerGlow(incoming, n) {
+  if (!state.afterimage || !glowValues) return;
+  for (let i = 0; i < n; i++) {
+    const v = incoming[i];
+    if (!v) continue;
+    const g = v / 255;
+    if (g > glowValues[i]) glowValues[i] = g;
+    if (!inRecent[i]) {
+      inRecent[i] = 1;
+      recentIdx[recentCount++] = i;
+    }
+  }
+  // Write the blend once, so a spiking cell is bright immediately rather than next tick.
+  for (let k = 0; k < recentCount; k++) {
+    const i = recentIdx[k];
+    intensityArray[i] = Math.max(frameBase[i], Math.round(glowValues[i] * 255));
+  }
+}
+
+function decayGlow(dtMs) {
+  if (!state.afterimage || !glowValues || !recentCount) return;
+  const decay = Math.exp(-Math.max(dtMs, 0) / 1000 / GLOW_TAU_S);
+  let k = 0;
+  while (k < recentCount) {
+    const i = recentIdx[k];
+    glowValues[i] *= decay;
+    if (glowValues[i] < 0.02) {
+      // Swap-remove: order does not matter, and compaction keeps the loop proportional to the
+      // number of cells actually fading rather than to the size of the brain.
+      inRecent[i] = 0;
+      glowValues[i] = 0;
+      intensityArray[i] = frameBase[i];
+      recentIdx[k] = recentIdx[--recentCount];
+      continue;
+    }
+    intensityArray[i] = Math.max(frameBase[i], Math.round(glowValues[i] * 255));
+    k += 1;
+  }
+  intensityAttr.needsUpdate = true;
+}
+
+function clearGlow() {
+  if (!glowValues) return;
+  for (let k = 0; k < recentCount; k++) {
+    const i = recentIdx[k];
+    inRecent[i] = 0;
+    glowValues[i] = 0;
+    intensityArray[i] = frameBase[i];
+  }
+  recentCount = 0;
+  intensityAttr.needsUpdate = true;
+}
+
+/* =========================================================== cell families */
+
+/* The legend, the spotlight and the two exploration views. The names, colours and group
+ * memberships all come from /api/groups, which is built from the published cell annotations —
+ * nothing here invents a grouping or a hue, and the legend always shows the name and the count
+ * so colour is never the only thing carrying a meaning. */
+
+async function loadGroups() {
+  try {
+    const [meta, idBuf] = await Promise.all([
+      getJSON('/api/groups'),
+      fetch('/api/groups/ids', { cache: 'no-store' }).then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+        return r.arrayBuffer();
+      }),
+    ]);
+    const want = state.nNeurons * 2;
+    if (idBuf.byteLength < want) {
+      showNotice(`Group ids payload is ${fmtInt(idBuf.byteLength)} B, expected ${fmtInt(want)} B.`, 12000);
+    }
+    const raw = new Uint8Array(idBuf, 0, Math.min(idBuf.byteLength, want));
+    const fam = new Uint8Array(state.nNeurons);
+    const sen = new Uint8Array(state.nNeurons);
+    for (let i = 0; i < fam.length; i++) {
+      fam[i] = raw[i * 2] || 0;
+      sen[i] = raw[i * 2 + 1] || 0;
+    }
+    state.groups = meta;
+    state.familyIds = fam;
+    state.senseIds = sen;
+    return true;
+  } catch (err) {
+    // Not fatal. The cloud still renders and the activity view still works; only the family
+    // colouring and the spotlight have nothing to go on, and the legend says so.
+    showNotice(`Cell families unavailable (${err.message}). The brain still renders.`, 12000);
+    return false;
+  }
+}
+
+function buildFamiliesUI() {
+  const host = $('#fam-rows');
+  if (!host) return;
+  const families = (state.groups && state.groups.families) || [];
+  host.textContent = '';
+  if (!families.length) {
+    host.appendChild(el('div', 'empty', 'no cell annotations available'));
+    setSummary('families', 'unavailable');
+    return;
+  }
+  const tag = $('#families-tag');
+  if (tag) tag.textContent = `${families.length} families`;
+  setSummary('families', `${families.length} families`);
+
+  // Biggest first: the legend is a table of contents for the brain, and the optic lobe is a
+  // quarter of it. Ids stay stable; only the display order changes.
+  for (const f of [...families].sort((a, b) => b.neurons - a.neurons)) {
+    const row = el('button', 'fam-row');
+    row.type = 'button';
+    row.dataset.family = String(f.id);
+    row.dataset.neurons = String(f.neurons);
+    row.setAttribute('aria-pressed', String(state.spotFamily === f.id));
+    const sw = el('span', 'sw');
+    sw.style.background = f.colour;
+    row.appendChild(sw);
+    row.appendChild(el('span', 'nm', f.label));
+    row.appendChild(el('span', 'ct', fmtInt(f.neurons)));
+    row.title = `${f.label} — ${f.blurb}`;
+    row.addEventListener('click', () => selectFamily(f.id));
+    host.appendChild(row);
+  }
+
+  buildSenseChips();
+}
+
+function buildSenseChips() {
+  const senses = (state.groups && state.groups.senses) || [];
+  if (!senses.length) return;
+  const anchor = $('#fam-detail');
+  if (!anchor || $('#sense-chips')) return;
+  const wrap = el('div', 'sense-chips');
+  wrap.id = 'sense-chips';
+  for (const s of senses) {
+    const b = el('button', 'sense-chip');
+    b.type = 'button';
+    b.dataset.sense = String(s.id);
+    b.dataset.wired = s.wired ? '1' : '0';
+    b.setAttribute('aria-pressed', 'false');
+    // A pathway with no sensor is still a real set of cells, so it is offered and labelled
+    // rather than hidden — the panel would otherwise disagree with the brain on screen.
+    b.appendChild(el('span', '', s.wired ? s.label : `${s.label} (no sensor)`));
+    b.title = `${s.label} — ${s.blurb}`;
+    b.addEventListener('click', () => selectSense(s.id));
+    wrap.appendChild(b);
+  }
+  anchor.parentNode.insertBefore(wrap, anchor);
+}
+
+function paintFamilyActivity(families) {
+  state.familyActivity = families || null;
+  const byId = new Map((families || []).map((f) => [f.id, f]));
+  let busiest = null;
+  for (const row of document.querySelectorAll('.fam-row[data-family]')) {
+    const id = Number(row.dataset.family);
+    const f = byId.get(id);
+    const ct = row.querySelector('.ct');
+    if (!ct) continue;
+    const neurons = Number(row.dataset.neurons) || 0;
+    if (f && f.spikes > 0) {
+      // Name and count always present; the spike number is the only thing that changes colour.
+      ct.textContent = '';
+      ct.appendChild(document.createTextNode(`${fmtInt(neurons)} `));
+      ct.appendChild(el('b', '', fmtCount(f.spikes)));
+      row.dataset.hot = '1';
+      if (!busiest || f.spikes > busiest.spikes) busiest = f;
+    } else {
+      ct.textContent = fmtInt(neurons);
+      row.dataset.hot = '0';
+    }
+  }
+  if (busiest) {
+    const meta = ((state.groups && state.groups.families) || []).find((f) => f.id === busiest.id);
+    setSummary('families', `${meta ? meta.label : busiest.key} busiest`);
+  }
+}
+
+function applySpotlight() {
+  if (!material) return;
+  material.uniforms.uSpotFamily.value = state.spotFamily;
+  material.uniforms.uSpotSense.value = state.spotSense;
+  material.uniforms.uViewMode.value = viewModeCode();
+  const active = state.spotFamily >= 0 || state.spotSense >= 0;
+  for (const b of document.querySelectorAll('#sense-chips .sense-chip')) {
+    b.setAttribute('aria-pressed', String(Number(b.dataset.sense) === state.spotSense));
+  }
+  if (state.viewMode === 'spotlight' && !active) {
+    setText('#view-note', 'Spotlight is on but nothing is selected — pick a family or a sense, ' +
+      'and the rest of the brain fades back.');
+  }
+}
+
+function selectFamily(id) {
+  state.spotFamily = state.spotFamily === id ? -1 : id;
+  state.spotSense = -1;
+  showFamilyDetail(state.spotFamily >= 0 ? state.spotFamily : null);
+  if (state.spotFamily >= 0) setViewMode('spotlight');
+  syncFamilyRows();
+}
+
+function selectSense(id) {
+  state.spotSense = state.spotSense === id ? -1 : id;
+  state.spotFamily = -1;
+  const sense = ((state.groups && state.groups.senses) || []).find((s) => s.id === state.spotSense);
+  showFamilyDetail(null, sense || null);
+  if (state.spotSense >= 0) {
+    setViewMode('spotlight');
+    showTrace(sense ? sense.key : null);
+  } else {
+    clearTrace();
+  }
+  syncFamilyRows();
+}
+
+function syncFamilyRows() {
+  for (const row of document.querySelectorAll('.fam-row[data-family]')) {
+    row.setAttribute('aria-pressed', String(Number(row.dataset.family) === state.spotFamily));
+  }
+  applySpotlight();
+}
+
+/* The detail card answers "what is this, and how much of it is there" for whatever is selected —
+ * the plain-English blurb, the exact cell count, and the current activity. */
+function showFamilyDetail(familyId, sense) {
+  const host = $('#fam-detail');
+  if (!host) return;
+  host.textContent = '';
+  if (familyId == null && !sense) return;
+
+  const card = el('div', 'fam-detail');
+  if (sense) {
+    card.appendChild(el('div', 'hd', sense.label));
+    card.appendChild(el('div', 'bl', sense.blurb));
+    // No spike figure here on purpose. The family activity payload is grouped by *family*, and a
+    // sense is a different grouping — looking its number up there would always miss and quietly
+    // print nothing, which is worse than not offering it. Activity for a sense is visible on the
+    // cloud itself, which is the point of the spotlight.
+    card.appendChild(el('div', '', `Neurons: ${fmtInt(sense.neurons)}`
+      + (sense.trained ? ' · the pathway the light is read from' : '')
+      + (sense.wired ? ' · wired to a live sensor' : ' · no sensor wired to it')));
+  } else {
+    const f = ((state.groups && state.groups.families) || []).find((x) => x.id === familyId);
+    if (!f) return;
+    card.appendChild(el('div', 'hd', f.label));
+    card.appendChild(el('div', 'bl', f.blurb));
+    card.appendChild(el('div', '', `Neurons: ${fmtInt(f.neurons)} of ${fmtInt(state.nNeurons)} `
+      + `(${((f.neurons / Math.max(state.nNeurons, 1)) * 100).toFixed(1)}%)`));
+    const act = (state.familyActivity || []).find((x) => x.id === familyId);
+    if (act) card.appendChild(el('div', '', `Spiking this window: ${fmtCount(act.spikes)}`));
+  }
+  host.appendChild(card);
+}
+
+function setViewMode(mode) {
+  if (!['activity', 'families', 'spotlight'].includes(mode)) return;
+  state.viewMode = mode;
+  for (const b of document.querySelectorAll('#view-modes button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.view === mode));
+  }
+  if (material) material.uniforms.uViewMode.value = viewModeCode();
+  const note = $('#view-note');
+  if (note) {
+    note.textContent = {
+      activity: "Each dot is one neuron. Brightness is how hard it is firing right now. Drag to orbit · scroll to zoom · right-drag to pan.",
+      families: 'Colour is the kind of cell, brightness is whether it is firing. Click a family in the legend to pick it out.',
+      spotlight: 'Everything outside the selection fades back, so one pathway is readable against the whole brain.',
+    }[mode];
+  }
+  setSummary('view', `${mode} · ${fpsEma ? fpsEma.toFixed(0) : '\u2014'} fps`);
+  savePrefs();
+}
+
+/* ======================================================== orientation markers */
+
+/* Labels placed from the annotation table, not guessed. The front is the retina-and-antennae
+ * end (negative z), which three separate landmarks agree on — see the Python that computes
+ * `orientation` in /api/groups. Nothing is claimed about up and down. */
+
+function labelSprite(text, colour) {
+  const canvas2 = document.createElement('canvas');
+  const ctx = canvas2.getContext('2d');
+  const font = '600 22px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.font = font;
+  const w = Math.ceil(ctx.measureText(text).width) + 16;
+  canvas2.width = w;
+  canvas2.height = 34;
+  const c = canvas2.getContext('2d');
+  c.font = font;
+  c.fillStyle = 'rgba(4, 6, 11, 0.62)';
+  c.fillRect(0, 0, w, 34);
+  c.fillStyle = colour;
+  c.textBaseline = 'middle';
+  c.fillText(text, 8, 18);
+
+  const tex = new THREE.CanvasTexture(canvas2);
+  tex.minFilter = THREE.LinearFilter;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, opacity: 0.7,
+    // Always readable rather than swallowed by the cloud: these are a frame of reference, and a
+    // reference you cannot see is worse than none.
+    depthTest: false, depthWrite: false,
+  }));
+  sprite.scale.set(w / 1100, 0.038, 1);
+  return sprite;
+}
+
+function buildOrientation() {
+  if (markerGroup) return;
+  const o = state.groups && state.groups.orientation;
+  if (!o || !o.front) return;
+  markerGroup = new THREE.Group();
+  markerGroup.visible = state.markers;
+
+  const anchor = (k) => new THREE.Vector3(...(o[k] ? o[k].anchor : [0, 0, 0]));
+  for (const [key, colour] of [['front', '#8fd0ff'], ['back', '#7f93a8'], ['left', '#5f7d99'], ['right', '#5f7d99']]) {
+    if (!o[key]) continue;
+    const at = anchor(key);
+    const sprite = labelSprite(o[key].label, colour);
+    sprite.position.copy(at);
+    markerGroup.add(sprite);
+  }
+  if (o.front && o.back) {
+    // One thin shaft through the long axis, so "front" and "back" are visibly opposite ends of
+    // the same line rather than two floating words.
+    const a = anchor('front'), b = anchor('back');
+    const geom = new THREE.BufferGeometry().setFromPoints([a, b]);
+    const line = new THREE.Line(geom, new THREE.LineBasicMaterial({
+      color: 0x2f4a68, transparent: true, opacity: 0.55, depthWrite: false,
+    }));
+    markerGroup.add(line);
+  }
+  scene.add(markerGroup);
+}
+
+function setMarkers(on) {
+  state.markers = !!on;
+  if (markerGroup) markerGroup.visible = state.markers;
+  const btn = $('#btn-markers');
+  if (btn) {
+    btn.setAttribute('aria-pressed', String(state.markers));
+    btn.textContent = state.markers ? 'On' : 'Off';
+  }
+  savePrefs();
+}
+
+/* ============================================================== connection trace */
+
+/* A handful of group-to-group lines for the selected pathway. The counts are exact; the geometry
+ * is a summary, and the panel says so. Everything here degrades to "no trace drawn". */
+
+function clearTrace() {
+  if (!traceGroup || !scene) return;
+  scene.remove(traceGroup);
+  traceGroup.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) o.material.dispose();
+  });
+  traceGroup = null;
+}
+
+async function showTrace(group) {
+  clearTrace();
+  if (!group || !scene) return;
+  let payload;
+  try {
+    payload = await getJSON(`/api/trace?group=${encodeURIComponent(group)}`);
+  } catch (err) {
+    // An overlay must never break the page: the guide reads fine without it.
+    console.warn('no connection trace', err);
+    return;
+  }
+  const targets = Array.isArray(payload.targets) ? payload.targets : [];
+  if (!targets.length) return;
+  const max = Math.max(...targets.map((t) => t.synapses), 1);
+  traceGroup = new THREE.Group();
+  for (const t of targets) {
+    const opacity = 0.35 + 0.6 * (t.synapses / max);
+    const geom = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(...t.from), new THREE.Vector3(...t.to),
+    ]);
+    traceGroup.add(new THREE.Line(geom, new THREE.LineBasicMaterial({
+      color: 0xffc46b, transparent: true, opacity, depthWrite: false,
+    })));
+    const label = labelSprite(`${t.name} · ${fmtCount(t.synapses)}`, '#f4c98a');
+    label.position.set(...t.to);
+    traceGroup.add(label);
+  }
+  scene.add(traceGroup);
+}
+
+/* ============================================================ guided exploration */
+
+/* ELI5 walkthroughs. Each one sets a documented view state and says what you are looking at.
+ * The words restate the real role descriptions in mapping.py — no invented biology. */
+
+const GUIDES = [
+  {
+    id: 'start',
+    title: 'What am I even looking at?',
+    body: 'Each dot is <b>one neuron</b>, and there are 138,639 of them — a whole fruit fly brain, '
+      + 'taken from a real one and photographed slice by slice. The brain is <b>frozen</b>: it never '
+      + 'learns. Only a small readout on top of it is trained, and that readout is what picks the '
+      + 'colour of the light. Brightness means "this cell is firing right now".',
+    setup: { view: 'activity' },
+  },
+  {
+    id: 'orientation',
+    title: 'Which end is the front?',
+    body: 'The <b>front</b> is the eyes-and-antennae end, and it is marked. That is not a guess: the '
+      + 'retina, the antennal sensors and the nerves coming up from the body all agree on which way '
+      + 'round this brain is. Turn the orientation markers on if you have hidden them.',
+    setup: { view: 'activity', markers: true, camera: 'front' },
+  },
+  {
+    id: 'warmth',
+    title: 'Follow the warmth',
+    body: 'Your room temperature drives <b>29 neurons</b> — a tiny, specific pathway. Watch them: '
+      + 'these are the only cells the light colour is actually read from. Everything else you can '
+      + 'see is the rest of the brain doing whatever it does.',
+    setup: { view: 'spotlight', sense: 'thermosensory', trace: true },
+  },
+  {
+    id: 'light',
+    title: 'Where does light come in?',
+    body: 'The fly\u2019s <b>eyes</b> are the largest single group of cells here. Look for the big '
+      + 'blue mass at the front-sides — that is the optic lobe, more than half the brain, and it does '
+      + 'the first pass of seeing before anything is sent inwards.',
+    setup: { view: 'families', family: 'optic', camera: 'front' },
+  },
+  {
+    id: 'smell',
+    title: 'What smells?',
+    body: 'Flies live by smell. The <b>olfactory</b> cells sit in the antennae and the lobe right '
+      + 'behind them, and they are wired straight into the learning centres — which is why a fly can '
+      + 'learn an odour in one trial.',
+    setup: { view: 'spotlight', sense: 'olfactory', trace: true },
+  },
+  {
+    id: 'move',
+    title: 'How does it decide to move?',
+    body: '<b>Descending</b> neurons carry orders from the brain down to the body. If you only ever '
+      + 'light up one pathway, make it this one: it is the fly\u2019s output, the equivalent of the '
+      + 'colour this project sends to your lamp.',
+    setup: { view: 'spotlight', family: 'descending', trace: true },
+  },
+  {
+    id: 'why',
+    title: 'What colour is it choosing, and why?',
+    body: 'Open <b>Colour chosen</b>. Each dot is one real decision: room temperature across, the '
+      + 'colour the brain picked up. The dashed line is what a perfect mapping would be. Click any '
+      + 'dot and Jev will try to say why that decision came out the way it did.',
+    setup: { view: 'activity', open: ['panel-history', 'panel-families'] },
+  },
+];
+
+function buildGuides() {
+  const host = $('#guide-list');
+  if (!host) return;
+  host.textContent = '';
+  setSummary('guides', `${GUIDES.length} guides`);
+  const tag = $('#guides-tag');
+  if (tag) tag.textContent = `${GUIDES.length} guides`;
+
+  GUIDES.forEach((g, i) => {
+    const wrap = el('div', 'guide');
+    wrap.dataset.guide = g.id;
+    const btn = el('button', '');
+    btn.type = 'button';
+    btn.appendChild(el('span', 'num', String(i + 1)));
+    btn.appendChild(el('span', '', g.title));
+    btn.addEventListener('click', () => runGuide(g.id));
+    wrap.appendChild(btn);
+    host.appendChild(wrap);
+  });
+}
+
+function runGuide(id) {
+  const g = GUIDES.find((x) => x.id === id);
+  if (!g) return;
+  // Toggle: clicking the running guide again clears it, so a guide is never a mode you are stuck in.
+  const active = state.activeGuide === id ? null : id;
+  state.activeGuide = active;
+
+  for (const wrap of document.querySelectorAll('.guide')) {
+    wrap.dataset.active = String(wrap.dataset.guide === active);
+  }
+  const bodyHost = $('#guide-body');
+  if (bodyHost) {
+    bodyHost.textContent = '';
+    if (active) {
+      const card = el('div', 'fam-detail');
+      card.appendChild(el('div', 'hd', g.title));
+      const p = el('div', 'bl');
+      p.innerHTML = g.body;
+      card.appendChild(p);
+      bodyHost.appendChild(card);
+    }
+  }
+  setSummary('guides', active ? g.title : `${GUIDES.length} guides`);
+
+  if (!active) {
+    clearTrace();
+    return;
+  }
+  const s = g.setup || {};
+  if (s.open) for (const pid of s.open) {
+    if (collapsedPanels.has(pid)) togglePanel(pid);
+  }
+  if (s.markers) setMarkers(true);
+  // `state.groups` is null when the annotation table is missing, in which case a guide that names
+  // a group has nothing to point at and says so rather than failing silently.
+  const pick = (list, key) => (list || []).find((x) => x.key === key);
+  if (s.family) {
+    const f = pick(state.groups && state.groups.families, s.family);
+    if (f) { state.spotFamily = -1; selectFamily(f.id); }
+    else showNotice(`No annotated group called ${s.family} in this build.`, 9000);
+  }
+  if (s.sense) {
+    const x = pick(state.groups && state.groups.senses, s.sense);
+    if (x) { state.spotSense = -1; selectSense(x.id); }
+    else showNotice(`No sensory pathway called ${s.sense} in this build.`, 9000);
+  }
+  if (s.view) setViewMode(s.view);
+  if (s.camera === 'front') lookFromFront();
+  if (s.trace && !s.sense) showTrace(s.family);
+}
+
+/* Point the camera at the eyes-and-antennae end. Uses the marker the server derived, so the
+ * camera and the label cannot disagree about which end is the front. */
+function lookFromFront() {
+  if (!camera || !controls) return;
+  const o = state.groups && state.groups.orientation;
+  const front = o && o.front ? o.front.anchor : null;
+  const target = front ? new THREE.Vector3(-front[0] * 0.1, -front[1] * 0.1, 0.05)
+    : new THREE.Vector3(...DEFAULT_CAM.target);
+  controls.target.copy(target);
+  camera.position.set(target.x, 0.42, target.z - 1.28);
+  controls.update();
+}
+
+/* ============================================================= Jev, and the inspector */
+
+/* Two separate things share this section: the on/off switch, which is about *cost and privacy*,
+ * and the decision inspector, which is the one placement built so far. Both go through the same
+ * vocabulary the server uses, so the badge and the card can never tell different stories. */
+
+const JEV_REASONS = {
+  ok: 'answering',
+  no_key: 'no key set',
+  unauthorized: 'key rejected',
+  unreachable: 'unreachable',
+  disabled: 'off (jevless)',
+  unprobed: 'not checked yet',
+};
+
+const ROUTE_WORDS = {
+  act: 'verdict',
+  confirm: 'possible — low confidence',
+  needs_human: 'not enough to call it',
+};
+
+function paintJevSwitch(jev) {
+  const btn = $('#btn-jev');
+  if (!btn) return;
+  const on = !!(jev && jev.config && jev.config.enabled);
+  btn.setAttribute('aria-pressed', String(on));
+  btn.textContent = on ? 'On' : 'Off';
+  const sub = $('#jev-switch-sub');
+  if (sub) {
+    sub.textContent = on
+      ? 'on — one decision at a time, ~$0.0002 each'
+      : 'off — nothing is sent, nothing is spent';
+  }
+}
+
+function buildJevToggle() {
+  const btn = $('#btn-jev');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    const want = btn.getAttribute('aria-pressed') !== 'true';
+    btn.disabled = true;
+    const was = btn.textContent;
+    btn.textContent = '…';
+    try {
+      const res = await fetch('/api/jev/enabled', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ value: want }),
+      });
+      const payload = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((payload && payload.detail) || `HTTP ${res.status}`);
+      paintJevSwitch(payload);
+      if (state.lastTrust) paintTrust(state.lastTrust, payload);
+    } catch (err) {
+      btn.textContent = was;
+      showNotice(`Could not change the Jev setting: ${err.message}`, 9000);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+function nearestChartPoint(clientX, clientY) {
+  const map = state.chartMap;
+  const rows = state.chartRows || [];
+  if (!map || !chartCanvas || !rows.length) return null;
+  const rect = chartCanvas.getBoundingClientRect();
+  // getBoundingClientRect is in CSS pixels, and so are the chart's own coordinates, so no DPR
+  // scaling belongs here even though the backing store is scaled.
+  const mx = clientX - rect.left;
+  const my = clientY - rect.top;
+  let best = null;
+  let bestD2 = 14 * 14;      // a generous grab radius: these dots are 4 px and hard to hit exactly
+  for (const d of rows) {
+    if (d.temperature_c == null || d.kelvin == null) continue;
+    const dx = map.X(Number(d.temperature_c)) - mx;
+    const dy = map.Y(Number(d.kelvin)) - my;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < bestD2) { bestD2 = d2; best = d; }
+  }
+  return best;
+}
+
+function bindChartClicks() {
+  if (!chartCanvas) return;
+  chartCanvas.addEventListener('click', (ev) => {
+    const point = nearestChartPoint(ev.clientX, ev.clientY);
+    if (!point || point.seq == null) {
+      showNotice('Click closer to a dot — each one is a single decision.', 5000);
+      return;
+    }
+    inspectDecision(Number(point.seq));
+  });
+}
+
+async function inspectDecision(seq) {
+  state.selectedSeq = seq;
+  const host = $('#verdict-host');
+  if (!host) return;
+  host.textContent = '';
+  const card = el('div', 'verdict');
+  card.dataset.tone = 'mute';
+  card.appendChild(el('div', 'vk', 'Decision inspector'));
+  card.appendChild(el('div', 'vl', 'asking Jev…'));
+  host.appendChild(card);
+
+  try {
+    const res = await fetch('/api/jev', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seq }),
+    });
+    const payload = await res.json().catch(() => null);
+    if (!res.ok) {
+      throw new Error((payload && payload.detail) || `HTTP ${res.status} ${res.statusText}`);
+    }
+    drawVerdict(host, payload, seq);
+  } catch (err) {
+    host.textContent = '';
+    const bad = el('div', 'verdict');
+    bad.dataset.tone = 'warn';
+    bad.appendChild(el('div', 'vk', 'Decision inspector'));
+    bad.appendChild(el('div', 'vl', 'could not be asked'));
+    bad.appendChild(el('div', '', `That call did not come back: ${err.message}. Nothing was cached, so trying again is safe.`));
+    host.appendChild(bad);
+  }
+}
+
+function drawVerdict(host, payload, seq) {
+  host.textContent = '';
+  const card = el('div', 'verdict');
+  const row = (state.chartRows || []).find((d) => Number(d.seq) === Number(seq)) || {};
+
+  if (payload && payload.available === false) {
+    // "Off" and "broken" must not look the same — the same distinction the badge makes.
+    card.dataset.tone = 'mute';
+    card.appendChild(el('div', 'vk', 'Decision inspector'));
+    card.appendChild(el('div', 'vl', JEV_REASONS[payload.reason] || payload.reason || 'unavailable'));
+    card.appendChild(el('div', '', payload.detail || ''));
+    if (payload.reason === 'disabled') {
+      const btn = el('button', 'enable', 'Turn Jev on');
+      btn.type = 'button';
+      btn.addEventListener('click', () => $('#btn-jev')?.click());
+      card.appendChild(btn);
+    }
+    if (state.lastTrust) paintTrust(state.lastTrust, null);
+    host.appendChild(card);
+    return;
+  }
+
+  const label = payload.label || 'unknown';
+  const tone = payload.action === 'act' ? 'good'
+    : (payload.action === 'confirm' ? 'warn' : 'mute');
+  card.dataset.tone = tone;
+  card.appendChild(el('div', 'vk', `Decision #${seq} · ${ROUTE_WORDS[payload.action] || payload.action}`));
+  card.appendChild(el('div', 'vl', String(label).replace(/_/g, ' ')));
+
+  const conf = payload.confidence;
+  const kv = (k, v) => {
+    const line = el('div', 'vrow');
+    line.appendChild(el('span', 'k', k));
+    line.appendChild(el('span', 'v', v));
+    card.appendChild(line);
+  };
+  if (conf != null) kv('confidence', Number(conf).toFixed(3));
+  if (payload.floor_ms != null && payload.latency_ms != null) {
+    kv('latency', `${Math.round(payload.latency_ms)} ms (network floor ${Math.round(payload.floor_ms)} ms)`);
+  }
+  if (payload.cost_usd != null) {
+    kv('cost', `$${Number(payload.cost_usd).toFixed(6)}${payload.cost_reported ? '' : ' (computed)'}`);
+  }
+  if (payload.cached) kv('cached', 'yes — this click was free');
+
+  const probs = payload.probabilities || {};
+  const entries = Object.entries(probs).sort((a, b) => b[1] - a[1]);
+  if (entries.length) {
+    const wrap = el('div', 'prob');
+    for (const [name, p] of entries) {
+      const line = el('div', 'prob-row');
+      const bar = el('div', 'bar');
+      const fill = el('i');
+      fill.style.width = `${Math.max(1, Math.min(100, p * 100)).toFixed(0)}%`;
+      bar.appendChild(fill);
+      line.appendChild(bar);
+      line.appendChild(el('div', 'n', `${name.replace(/_/g, ' ')} ${(p * 100).toFixed(0)}%`));
+      wrap.appendChild(line);
+    }
+    card.appendChild(wrap);
+  }
+
+  // The three layers, in the order docs/jev.md insists on: the house, then the brain, then what
+  // *we* mapped it to. The ordering is what keeps it clear that the colour is ours.
+  const layers = el('div', 'layerline');
+  layers.innerHTML =
+    `<div><b>The house said</b> ${row.temperature_c != null ? Number(row.temperature_c).toFixed(1) + ' °C' : '—'}</div>` +
+    `<div><b>The brain did</b> ${row.active_neurons != null ? fmtCount(row.active_neurons) + ' neurons firing' : '—'}` +
+    `${row.total_spikes != null ? ', ' + fmtCount(row.total_spikes) + ' spikes' : ''}</div>` +
+    `<div><b>We mapped it to</b> ${row.kelvin != null ? Math.round(row.kelvin) + ' K' : '—'}` +
+    `${row.ideal_kelvin != null ? ' (ideal ' + Math.round(row.ideal_kelvin) + ' K)' : ''}</div>`;
+  card.appendChild(layers);
+
+  if (payload.action === 'needs_human') {
+    card.appendChild(el('div', '', 'That is a real answer, not a failure: the state did not '
+      + 'determine a verdict. Our own measurements produce this when a case contains a '
+      + 'contradiction.'));
+  }
+  host.appendChild(card);
+  if (state.lastTrust) paintTrust(state.lastTrust, null);
 }
 
 /* ================================================================ regions */
@@ -649,7 +1683,10 @@ function startRegionPolling() {
   const tick = async () => {
     try {
       const data = await getJSON('/api/regions');
-      renderRegions(Array.isArray(data.regions) ? data.regions : []);
+      renderRegions(
+        Array.isArray(data.regions) ? data.regions : [],
+        Array.isArray(data.families) ? data.families : [],
+      );
       lastRegionOk = performance.now();
     } catch (err) {
       const p = $('#usage-poll');
@@ -661,7 +1698,10 @@ function startRegionPolling() {
   regionTimer = setInterval(tick, 2000);
 }
 
-function renderRegions(regions) {
+function renderRegions(regions, families) {
+  // The legend's live numbers ride on this poll so they can never be a different moment from the
+  // top-12 list, and so one request feeds both panels.
+  paintFamilyActivity(families);
   const host = $('#usage-rows');
   if (!host) return;
   state.regionCount = regions.length;
@@ -674,6 +1714,8 @@ function renderRegions(regions) {
     return;
   }
 
+  setSummary('usage', `${regions[0].name} busiest`);
+
   const head = el('div', 'row head');
   head.appendChild(el('span', 'name', 'cell class'));
   head.appendChild(el('span', 'n', 'neurons'));
@@ -681,6 +1723,7 @@ function renderRegions(regions) {
   host.appendChild(head);
 
   const maxSpikes = regions.reduce((m, r) => Math.max(m, Number(r.spikes) || 0), 0) || 1;
+  paintFamilyActivity(dataFamilies);
 
   for (const r of regions) {
     const row = el('div', 'row');
@@ -778,6 +1821,7 @@ function paintStatus(s) {
 function paintPet(pet) {
   if (!pet) return;
   const key = PET_TONES[pet.state] || 'waking';
+  setSummary('pet', pet.state ? `${pet.state}${pet.since_s ? ` · ${fmtDuration(pet.since_s)}` : ''}` : 'starting');
 
   const glyph = $('#pet-glyph');
   if (glyph) glyph.dataset.state = key;
@@ -833,6 +1877,7 @@ function paintPacing(pacing, journal) {
 
   const label = { flat_out: 'flat out', waiting: 'waiting', burst: 'bursting' }[mode] || mode;
   setText('#pace-mode', label);
+  setSummary('pacing', `${label}${pacing.observed_duty != null ? ` · ${(pacing.observed_duty * 100).toFixed(0)}% duty` : ''}`);
   const tag = $('#pace-mode');
   if (tag) {
     tag.classList.toggle('warn', mode === 'burst' || mode === 'flat_out');
@@ -901,6 +1946,7 @@ function paintPaceCountdown() {
 function paintLayers(layers) {
   if (!layers) return;
   const { house, brain, mapped } = layers;
+  setSummary('layers', house && house.value != null ? String(house.value) : '—');
 
   if (house) {
     setText('#layer-house-v', house.value == null ? 'no reading'
@@ -952,6 +1998,12 @@ function paintLayers(layers) {
 /* --- trust --------------------------------------------------------------- */
 
 function paintTrust(trust, jev) {
+  setSummary('trust', trust ? `${trust.dry_run ? 'dry run' : 'live'}${trust.paused ? ' · paused' : ''}` : '—');
+  if (trust) state.lastTrust = trust;
+  if (jev) {
+    state.lastJev = jev;
+    paintJevSwitch(jev);
+  }
   if (!trust) return;
   const host = $('#trust-badges');
   const live = trust.mode && trust.mode !== 'mock';
@@ -1019,13 +2071,9 @@ function paintTrust(trust, jev) {
   }
 
   if ($('#trust-jev') && jev) {
-    const reasons = {
-      ok: 'answering',
-      no_key: 'no key set',
-      unauthorized: 'key rejected',
-      unreachable: 'unreachable',
-      disabled: 'off',
-    };
+    // One vocabulary, defined once, shared with the decision-inspector card. Two copies drifted
+    // the moment `disabled` was added to the server's reason set.
+    const reasons = JEV_REASONS;
     const good = !!jev.available;
     const floor = jev.floor_ms == null ? 'floor not measured'
       : `network floor ${Math.round(jev.floor_ms)} ms`;
@@ -1059,6 +2107,7 @@ function paintJournal(journal) {
   if (!journal) return;
   setText('#journal-line', journal.line || '—');
   setText('#journal-session', journal.session || (journal.recording ? 'recording' : 'not recording'));
+  setSummary('journal', journal.line || 'nothing yet');
 
   const host = $('#journal-states');
   if (!host) return;
@@ -1101,7 +2150,9 @@ function paintTrail(data) {
   // fifteen seconds does not get stretched across the whole strip and look busy.
   const oldest = Math.min(...entries.map((e) => e.t));
   const span = Math.max(300, now - oldest);
-  setText('#trail-span', `last ${fmtDuration(span)} · ${entries.length} mark(s)`);
+  const spanText = `last ${fmtDuration(span)} · ${entries.length} mark(s)`;
+  setText('#trail-span', spanText);
+  setSummary('trail', `last ${fmtDuration(span)} · ${entries.length} mark(s)`);
 
   for (const entry of entries) {
     const mark = el('span', 'mark');
@@ -1115,8 +2166,15 @@ function paintTrail(data) {
 
   const list = $('#trail-list');
   if (!list) return;
+  state.trail = data;
   list.textContent = '';
-  for (const entry of entries.slice(0, 8)) {
+
+  // Three newest by default. The strip above is the glance; this is the readable version, and
+  // expanding it grows the panel in place rather than opening a second scroller inside the
+  // already-scrolling column — which is what made the wheel do different things in different
+  // parts of the same panel.
+  const shown = state.trailExpanded ? entries : entries.slice(0, 3);
+  for (const entry of shown) {
     // Deliberately not `.row`: that class is a three-column grid for the region panels, and two
     // children inside it land in the wrong tracks and overlap.
     const row = el('div', 'trail-row');
@@ -1129,6 +2187,16 @@ function paintTrail(data) {
     row.title = entry.detail || entry.text;
     list.appendChild(row);
   }
+
+  if (entries.length <= 3 && !state.trailExpanded) return;
+  const more = el('button', 'trail-more',
+    state.trailExpanded ? 'Show fewer' : `Show all ${entries.length}`);
+  more.type = 'button';
+  more.addEventListener('click', () => {
+    state.trailExpanded = !state.trailExpanded;
+    if (state.trail) paintTrail(state.trail);
+  });
+  list.appendChild(more);
 }
 
 /* ============================================================== senses */
@@ -1156,6 +2224,7 @@ function paintSenses(loop) {
   if (!host || !loop) return;
 
   const channels = Array.isArray(loop.channels) ? loop.channels : [];
+  setSummary('senses', channels.length ? `${channels.length + 1} senses` : 'temperature only');
   const tag = $('#senses-tag');
   if (tag) tag.textContent = channels.length ? `${channels.length + 1} senses` : 'temperature only';
 
@@ -1244,7 +2313,10 @@ function connectWS() {
     reconnectAttempt = 0;
     setConn('live');
     startPing();
-    if (state.paused) sendWS({ type: 'pause', value: true });
+    // Deliberately *not* re-sending this tab's pause state. Pause belongs to the server, which is
+    // what actually holds the GPU: a tab left paused — or restored with the page — used to pause a
+    // freshly started brain the moment it reconnected. The client adopts the server's state from
+    // the `loop` payload instead, and only ever *changes* it from a real click or key press.
   };
   socket.onmessage = onSocketMessage;
   socket.onerror = () => { /* onclose follows */ };
@@ -1344,10 +2416,16 @@ function handleBinary(buf) {
   const totalSpikes = dv.getUint32(16, true);
   const activeNeurons = dv.getUint32(20, true);
 
-  // In-place update: no reallocation, no geometry rebuild.
-  intensityArray.set(new Uint8Array(buf, hb, n));
-  if (n < state.nNeurons) intensityArray.fill(0, n);
-  intensityAttr.needsUpdate = true;
+  // In-place update: no reallocation, no geometry rebuild. The raw frame goes into `frameBase`
+  // rather than straight into the attribute, because the attribute also carries the afterimage
+  // and overwriting it would wipe the fade on every frame.
+  const incoming = new Uint8Array(buf, hb, n);
+  if (intensityArray && frameBase) {
+    frameBase.set(incoming);
+    if (n < state.nNeurons) frameBase.fill(0, n);
+    registerGlow(incoming, n);
+    intensityAttr.needsUpdate = true;
+  }
 
   const now = performance.now();
   // The server's frame rate is compute-bound and can sit well below the configured
@@ -1586,7 +2664,6 @@ function togglePause() {
 }
 
 function buildControls() {
-  const rot = { on: false };
   $('#btn-pause')?.addEventListener('click', togglePause);
   // Space is the shortcut, because pausing is the thing you reach for while watching the
   // brain and you should not have to find the button. Ignored while typing in a field.
@@ -1603,9 +2680,56 @@ function buildControls() {
     controls.target.set(DEFAULT_CAM.target[0], DEFAULT_CAM.target[1], DEFAULT_CAM.target[2]);
     controls.update();
   });
-  // Keep the gentle drift, but never fight the user for control.
-  if (controls) controls.autoRotate = false;
-  return rot;
+
+  // Auto-orbit: a slow drift that makes the 3D shape readable without touching the mouse. Off
+  // under a reduced-motion preference, and never fighting the user — OrbitControls stops it the
+  // moment you drag, which is the behaviour people expect.
+  const orbitBtn = $('#btn-orbit');
+  const paintOrbit = () => {
+    if (orbitBtn) {
+      orbitBtn.setAttribute('aria-pressed', String(state.autoRotate));
+      orbitBtn.classList.toggle('on', state.autoRotate);
+    }
+    if (controls) controls.autoRotate = state.autoRotate;
+  };
+  orbitBtn?.addEventListener('click', () => {
+    state.autoRotate = !state.autoRotate;
+    paintOrbit();
+    savePrefs();
+  });
+  if (prefersReducedMotion()) state.autoRotate = false;
+  paintOrbit();
+
+  for (const b of document.querySelectorAll('#view-modes button')) {
+    b.addEventListener('click', () => {
+      setViewMode(b.dataset.view);
+      applySpotlight();
+    });
+  }
+  for (const b of document.querySelectorAll('#view-modes button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.view === state.viewMode));
+  }
+
+  const afterBtn = $('#btn-afterimage');
+  const paintAfter = () => {
+    if (!afterBtn) return;
+    afterBtn.setAttribute('aria-pressed', String(state.afterimage));
+    afterBtn.textContent = state.afterimage ? 'On' : 'Off';
+  };
+  afterBtn?.addEventListener('click', () => {
+    state.afterimage = !state.afterimage;
+    if (!state.afterimage) clearGlow();
+    paintAfter();
+    savePrefs();
+  });
+  paintAfter();
+
+  const markerBtn = $('#btn-markers');
+  markerBtn?.addEventListener('click', () => setMarkers(!state.markers));
+  setMarkers(state.markers);
+
+  bindChartClicks();
+  setViewMode(state.viewMode);
 }
 
 
@@ -1677,10 +2801,21 @@ async function boot() {
     paintHeader(cfg);
     bootMsg(`allocating ${fmtInt(state.nNeurons)} neuron sprites\u2026`);
 
+    // Panels first: the one-line summaries they expose are written by the painters further down,
+    // and a panel built after the first poll would sit there with an empty heading until the next.
+    buildPanels();
+    buildGuides();
+    buildJevToggle();
+
     initThree();
     buildControls();
     buildConnectUI();
     sizeChart();
+
+    // The family and sense ids must be in hand before the cloud is built, because they become
+    // static vertex attributes — attaching them later would mean rebuilding the geometry.
+    bootMsg('fetching cell families\u2026');
+    await loadGroups();
 
     bootMsg('fetching soma positions\u2026');
     let positions;
@@ -1694,6 +2829,9 @@ async function boot() {
     if (positions) {
       bootMsg('uploading point cloud\u2026');
       buildCloud(positions);
+      buildFamiliesUI();
+      buildOrientation();
+      applySpotlight();
     }
 
     // The control loop's current state, so the panel is populated before the first
