@@ -472,3 +472,18 @@ class TestLoopIntegration:
         loop.pacer.note_poll(10.0, asyncio.run(loop.read_signals(store=False)))
         assert loop.pacer.should_step(10.0) is True
 
+
+    def test_a_negative_interval_cannot_fail_open_into_flat_out(self) -> None:
+        """A stray minus sign must not turn the cheapest setting into the most expensive one.
+
+        The pacer reads a non-positive heartbeat as "never wait", so `interval_s = -5` is not
+        "even faster" - it is flat out at ~165 W. The dashboard is the only thing that sends
+        these values, which is exactly why the guard belongs on the receiving side.
+        """
+        loop = _live_loop(_FakeHA([]), interval_s=60.0)
+        loop.update_settings({"interval_s": -5, "poll_s": -1, "burst_s": -2, "trigger_delta": -0.5})
+        assert loop.loop.interval_s == 0.0
+        assert loop.loop.poll_s == 0.0
+        assert loop.loop.burst_s == 0.0
+        assert loop.loop.trigger_delta == 0.0
+        assert loop.loop.to_dict()["interval_s"] == 0.0, "the dashboard must see the clamped value"

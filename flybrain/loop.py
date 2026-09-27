@@ -782,6 +782,13 @@ class LiveLoop:
             self.loop.smooth_ms = 0.0
         if self.loop.deadband_k < 0:
             self.loop.deadband_k = 0.0
+        # Pacing intervals are floored at zero, and that floor is load-bearing rather than
+        # cosmetic. `interval_s < 0` is not "even faster", it is *flat out*, because the pacer
+        # reads a non-positive heartbeat as "never wait" - so a stray minus sign would fail
+        # **open** on the one setting that decides whether this machine pulls ~25 W or ~165 W.
+        for field_name in ("interval_s", "poll_s", "burst_s", "trigger_delta"):
+            if getattr(self.loop, field_name) < 0:
+                setattr(self.loop, field_name, 0.0)
         # Pacing settings were just replaced wholesale, so the pacer holds a stale copy of them.
         # Rebuilding rather than mutating keeps one definition of each setting: the config.
         self.pacer = self._build_pacer()

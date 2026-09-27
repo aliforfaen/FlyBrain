@@ -23,7 +23,7 @@ population → learned ridge readout → colour temperature (K) → HA light.tur
 ```bash
 uv sync                                        # Python 3.11 → .venv (torch + CUDA wheels)
 .venv/bin/python tools/fetch_data.py           # connectome + annotations, ~140 MB, one time
-.venv/bin/python -m pytest tests/ -q           # 344 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q           # 345 tests, no connectome needed
 
 .venv/bin/python -m flybrain.experiment        # train the readout, ~50 s
 .venv/bin/python -m flybrain.server            # dashboard + live loop
