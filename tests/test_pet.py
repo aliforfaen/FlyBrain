@@ -366,3 +366,34 @@ class TestBurstClock:
         )
         assert "5 min" in line
         assert "0.0 h" not in line
+
+
+class TestMoversAreWorthPrinting:
+    """A movement that *prints* as zero is not worth saying, and saying it looks like a bug."""
+
+    def test_a_movement_below_the_printed_precision_is_not_named(self) -> None:
+        """`-0.004` formats as `-0.00`, which reads as a rounding bug rather than a drift."""
+        _, sentence, contributors = derive(
+            obs(bursting=True, sensor_changes={"sensor.room_temperature": -0.004})
+        )
+        assert "-0.00" not in sentence and "+0.00" not in sentence
+        assert any(c.label == "change" for c in contributors)
+        assert contributors[0].value == "a sensor changed state"
+
+    def test_a_real_movement_beside_a_tiny_one_names_only_the_real_one(self) -> None:
+        _, sentence, _ = derive(
+            obs(bursting=True, sensor_changes={
+                "sensor.lux": 0.50, "sensor.room_temperature": -0.004,
+            })
+        )
+        assert "sensor.lux (+0.50)" in sentence
+        assert "room_temperature" not in sentence
+
+    def test_a_discrete_change_with_no_magnitude_says_so_honestly(self) -> None:
+        """Motion is 0 or 1; if only that fired, there is no delta to report."""
+        _, sentence, _ = derive(obs(bursting=True, sensor_changes={"binary_sensor.motion": 1.0}))
+        assert "binary_sensor.motion (+1.00)" in sentence
+
+    def test_an_empty_change_set_still_produces_a_sentence(self) -> None:
+        _, sentence, _ = derive(obs(bursting=True, sensor_changes={}))
+        assert "a sensor changed state" in sentence

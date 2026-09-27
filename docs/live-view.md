@@ -432,6 +432,30 @@ Measured on the RTX 3070 in this machine, sampling `nvidia-smi` power draw once 
 | A decision every 15 s | bursts | **~40 W** | ~21 W |
 | Paused | idle | **~19 W** | ~0 |
 
+**Re-measured 2026-09-27, with the pacing code** — pause-then-interval, one probe at a time, and
+the browser closed (an earlier attempt was contaminated by a Chromium WebGL view of the point
+cloud, which alone holds the card around 49 W):
+
+| `interval_s` | Model duty | Mean power | Above the floor | Model share | Measured share |
+|---|---|---|---|---|---|
+| `60` | 3.9% | 25.2 W | +1.4 W | 3.9% | 1.0% *(under-resolved)* |
+| `15` | 15.6% | 49.6 W | +25.7 W | 15.6% | 18.8% |
+| `0` | 100% | 160.4 W | +136.6 W | 100% | 100% |
+
+with a **paused floor of 23.8 W** on this desktop (compositor, a streaming host and a browser
+holding the card), against the 19 W measured on an idle machine. So:
+
+- **The documented headroom holds.** Flat out measures 160 W total / 137 W attributable against the
+  documented ~165 / ~146 — within about 6%. The `mean ≈ 19 W + duty × 146 W` model is sound.
+- **The default saves about 3.2×, not 4×.** 160 W → 50 W at a 15 s heartbeat on this machine, where
+  the floor is higher than the one the model was fitted on. The dashboard shows the model, not this
+  machine's floor; if that matters, it is one pair of constants in `flybrain/pacing.py`.
+- **1 Hz sampling cannot resolve a 3.9% duty cycle.** A decision is ~2.3 s of work, so a 55-sample
+  window catches roughly two of them and the mean is mostly floor. That row is *below the
+  resolution of the method*, not evidence against the model — and the `max` column is what shows
+  the work happening at all (126 W in an otherwise 24 W trace). Anyone re-measuring this should
+  sample faster or run longer than a minute.
+
 CPU is a non-issue throughout: **0.1%** of one core, live or paused.
 
 ### Why the default is paced

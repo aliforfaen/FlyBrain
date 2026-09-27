@@ -3,11 +3,28 @@
   "answers": {
     "how_busy": {
       "type": "score",
-      "score": 2.18,
-      "confidence": 0.841,
-      "legend": {"0": "empty", "1": "quiet", "2": "normal", "3": "busy"},
-      "probabilities": {"0": 0.02, "1": 0.08, "2": 0.6, "3": 0.3}
+      "score": 1.35,
+      "confidence": 0.44,
+      "legend": {
+        "0": "empty",
+        "1": "quiet",
+        "2": "normal",
+        "3": "busy",
+        "4": "crowded"
+      },
+      "probabilities": {
+        "0": 0.16,
+        "1": 0.33,
+        "2": 0.5,
+        "3": 0.01,
+        "4": 0
+      }
     }
   },
-  "usage": {"input_tokens": 233, "output_tokens": 12}
+  "usage": {
+    "input_tokens": 341,
+    "output_tokens": 18,
+    "cost_usd": 0.000144,
+    "credits_remaining_usd": 4.997121
+  }
 }

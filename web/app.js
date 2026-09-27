@@ -1014,18 +1014,34 @@ function paintTrust(trust, jev) {
     const reasons = {
       ok: 'answering',
       no_key: 'no key set',
-      unauthorized: 'key rejected (HTTP 401)',
+      unauthorized: 'key rejected',
       unreachable: 'unreachable',
       disabled: 'off',
     };
-    const tone = jev.available ? 'good' : 'mute';
+    const good = !!jev.available;
     const floor = jev.floor_ms == null ? 'floor not measured'
       : `network floor ${Math.round(jev.floor_ms)} ms`;
+    // The credit balance and the per-call cost, because a balance reaching zero is how a feature
+    // stops working without anyone noticing, and the cost is what decides whether asking often is
+    // affordable. Cost is labelled reported-or-computed rather than implied to be one or other.
+    const last = jev.last_call || null;
+    const bill = last
+      ? ` · $${Number(last.cost_usd).toFixed(6)}${last.cost_reported ? '' : ' (computed)'}/call` +
+        (last.credits_remaining_usd == null
+          ? '' : ` · $${Number(last.credits_remaining_usd).toFixed(3)} credit left`)
+      : '';
+    const bits = [`model ${jev.config?.model || '—'}`, floor];
+    if (jev.config?.key_hint) bits.push(`key ${jev.config.key_hint}`);
+    if (jev.calls) bits.push(`${jev.calls} call(s)`);
     $('#trust-jev').innerHTML =
-      `Jev judgment layer: <b>${reasons[jev.reason] || jev.reason}</b> · ` +
-      `model ${jev.config?.model || '—'} · ${floor}` +
-      (jev.config?.key_hint ? ` · key ${jev.config.key_hint}` : '') +
-      `. <span style="color:var(--dim)">${tone === 'good' ? '' : String(jev.detail || '').slice(0, 120)}</span>`;
+      `Jev judgment layer: <b>${reasons[jev.reason] || jev.reason}</b> · ${bits.join(' · ')}${bill}` +
+      `. <span style="color:var(--dim)">${good ? '' : String(jev.detail || '').slice(0, 120)}</span>`;
+    const badgeHost = $('#trust-badges');
+    if (badgeHost && good) {
+      const b = el('span', 'badge', `Jev ${jev.calls ? 'live' : 'ready'}`);
+      b.dataset.tone = 'good';
+      badgeHost.appendChild(b);
+    }
   }
 }
 

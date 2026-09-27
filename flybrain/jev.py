@@ -8,7 +8,8 @@ which is what makes it safe to gate anything on.
 
 Three things about this module are deliberate and worth stating before the code:
 
-**It is off unless configured.** With no ``TYPESAFE_API_KEY`` the client refuses to make a
+**It is off unless configured.** With no ``JEV_API_KEY`` (or ``TYPESAFE_API_KEY``) the
+client refuses to make a
 request and :func:`JevClient.available` says *why*, because "off" and "broken" have to look
 different on screen. There is no fallback that invents an answer.
 
@@ -44,6 +45,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Self
+from urllib.parse import urlparse
 
 import httpx
 
@@ -53,9 +55,21 @@ logger = logging.getLogger(__name__)
 
 #: Root of the first-party API. ``/v1/systemone`` is the only endpoint that answers questions;
 #: ``/v1/models`` also exists and is used here as the cheap availability probe.
-DEFAULT_BASE_URL = "https://api.typesafe.ai"
-SYSTEM_ONE_PATH = "/v1/systemone"
-MODELS_PATH = "/v1/models"
+#: The endpoint the configured key actually works against. Note this is **not** the host in the
+#: vendor's public quickstart: `api.typesafe.ai` served the account this was first written for and
+#: answered every request with HTTP 401, while this one works. Two differences matter and both are
+#: handled below rather than assumed away:
+#:
+#: * the error envelope is ``{"error": "..."}``, not ``{"detail": {...}}``;
+#: * there is **no** cheap ``/v1/models`` probe, so :meth:`JevClient.available` has to spend a
+#:   real (tiny) question instead of a free GET.
+DEFAULT_BASE_URL = "https://jevtypesafeai.com/api/v1/decide"
+DECIDE_PATH = "/api/v1/decide"
+
+#: Accepted spellings of the credential, in priority order. ``JEV_API_KEY`` is this provider's
+#: name; ``TYPESAFE_API_KEY`` is kept so an existing ``.env`` is not silently ignored, and both
+#: come from the same vendor.
+API_KEY_VARS = ("JEV_API_KEY", "TYPESAFE_API_KEY")
 
 #: The **versioned** id, never the ``jev-latest`` alias. The alias moves when a release ships,
 #: which would silently invalidate every confidence threshold calibrated against it — and routing
@@ -408,7 +422,9 @@ class JevConfig:
         if env is None:
             load_dotenv()
         e = os.environ if env is None else env
-        raw_key = e.get("TYPESAFE_API_KEY")
+        # Both spellings, first one wins: an existing `.env` carrying `TYPESAFE_API_KEY` keeps
+        # working, and the provider's own name takes precedence when both are present.
+        raw_key = next((e.get(name) for name in API_KEY_VARS if e.get(name)), None)
         floor = e.get("JEV_NETWORK_FLOOR_MS")
         return cls(
             api_key=(raw_key or "").strip() or None,
@@ -433,25 +449,19 @@ class JevConfig:
         return bool(self.api_key)
 
     @property
-    def root(self) -> str:
-        """The API root, with any endpoint path stripped off.
-
-        ``JEV_BASE_URL`` is documented as the full ``.../v1/systemone`` URL, because that is the
-        value a reader copies out of the docs. The vendor's SDK treats its base URL as a root, so
-        both spellings arrive in the wild; normalizing here means neither is a mistake.
-        """
-        url = self.base_url.rstrip("/")
-        for path in (SYSTEM_ONE_PATH, MODELS_PATH):
-            url = url.removesuffix(path)
-        return url.rstrip("/") or DEFAULT_BASE_URL
-
-    @property
     def endpoint(self) -> str:
-        return f"{self.root}{SYSTEM_ONE_PATH}"
+        """The ``/decide`` URL, tolerating either the full path or the bare host.
 
-    @property
-    def models_url(self) -> str:
-        return f"{self.root}{MODELS_PATH}"
+        A reader copies the full URL out of the docs, while a base-URL habit writes only the host;
+        both are accepted so neither is a mistake. There is no separate root to expose: unlike the
+        other host, this one has no sibling endpoints worth naming.
+        """
+        url = self.base_url.strip().rstrip("/")
+        if not url:
+            return DEFAULT_BASE_URL
+        if url.endswith(DECIDE_PATH):
+            return url
+        return f"{url}{DECIDE_PATH}"
 
     def redacted(self) -> dict:
         """Config, safe to log or return over HTTP. Never the key itself."""
@@ -495,9 +505,14 @@ class JevResponse:
     input_tokens: int
     output_tokens: int
     latency_ms: float
-    #: Computed, because the API reports token counts but no cost.
+    #: The cost of this call. The vendor reports it on this host; when it does not, this is
+    #: ``input_tokens x $0.042/1e6`` and ``cost_reported`` is False.
     cost_usd: float
     network_floor_ms: float | None
+    #: Credit left on the account, when the API reports it. Shown in the dashboard because a
+    #: silent zero is how a feature stops working without anyone noticing.
+    credits_remaining_usd: float | None = None
+    cost_reported: bool = False
 
     def routed(self, risk: Risk) -> dict[str, Routing]:
         return {name: route(answer, risk) for name, answer in self.answers.items()}
@@ -559,7 +574,7 @@ class JevClient:
 
     def _headers(self) -> dict[str, str]:
         if not self.config.api_key:
-            raise JevAuthError("no_key", "TYPESAFE_API_KEY is not set")
+            raise JevAuthError("no_key", f"no {' or '.join(API_KEY_VARS)} in the environment")
         return {"Authorization": f"Bearer {self.config.api_key}"}
 
     def _retry_after_s(self, response: httpx.Response, attempt: int) -> float:
@@ -586,14 +601,18 @@ class JevClient:
     async def available(self, *, refresh: bool = False) -> JevStatus:
         """Report whether Jev can be used right now, and if not, why.
 
-        Probes ``GET /v1/models`` rather than asking a real question: it exercises the same
-        credential for no length of state, so a dashboard refresh cannot cost money. The result
-        is cached for :data:`PROBE_TTL_S`, which is why ``refresh`` exists.
+        This asks one minimal question rather than probing a cheap endpoint, because **this host
+        has no cheap endpoint to probe** — ``/api/v1/models`` answers ``unknown_endpoint``. So the
+        check costs a fraction of a cent rather than nothing, which is why the result is cached for
+        :data:`PROBE_TTL_S` and why ``refresh`` is explicit rather than implied.
 
-        The two credential failures are kept apart on purpose — see :class:`JevAuthError`.
+        The three failure reasons are kept apart on purpose — see :class:`JevAuthError`.
         """
         if not self.config.enabled:
-            return JevStatus(False, "no_key", "TYPESAFE_API_KEY is not set", floor_ms=self.config.network_floor_ms)
+            return JevStatus(
+                False, "no_key", f"no {' or '.join(API_KEY_VARS)} in the environment",
+                floor_ms=self.config.network_floor_ms,
+            )
         now = self._clock()
         if (
             not refresh
@@ -608,36 +627,42 @@ class JevClient:
         return status
 
     async def _probe(self) -> JevStatus:
+        """One trivial question. Cheap, but not free — say so rather than implying it is."""
+        payload = {
+            "state": {"probe": "reachability check"},
+            "questions": {"ok": noul("Is this request being answered?")},
+        }
         try:
-            response = await self.client.get(self.config.models_url, headers=self._headers())
+            response = await self.client.post(
+                self.config.endpoint, headers=self._headers(), json=payload
+            )
         except httpx.HTTPError as exc:
             return JevStatus(
                 False, "unreachable", f"{type(exc).__name__}: {exc}",
                 floor_ms=self.config.network_floor_ms,
             )
         if response.status_code == 200:
-            models = ()
-            try:
-                body = response.json()
-                listing = body.get("models") if isinstance(body, dict) else None
-                if isinstance(listing, list):
-                    models = tuple(
-                        str(item.get("id", item)) if isinstance(item, dict) else str(item)
-                        for item in listing
-                    )
-            except ValueError:
-                pass  # reachable and authorized; the listing is a bonus, not the point
-            return JevStatus(
-                True, "ok", "", models=models, floor_ms=self.config.network_floor_ms
-            )
+            return JevStatus(True, "ok", "", floor_ms=self.config.network_floor_ms)
         return self._status_for_error(response)
 
     def _status_for_error(self, response: httpx.Response) -> JevStatus:
+        """Map a refusal to a reason the operator can act on.
+
+        **The status code alone is not enough on this host.** A *missing* key and an *invalid* key
+        both come back as 401; only the message distinguishes them:
+
+        * ``"Missing API key. Send 'Authorization: Bearer jv_live_...'."``
+        * ``"Invalid or revoked API key."``
+
+        Those send an operator to different places (set a variable vs mint a new key), so the
+        message is read rather than the code being trusted.
+        """
         detail = self._error_detail(response)
-        if response.status_code == 401:
-            return JevStatus(False, "unauthorized", detail, floor_ms=self.config.network_floor_ms)
-        if response.status_code == 403:
+        lowered = detail.lower()
+        if "missing api key" in lowered or "must supply an api key" in lowered:
             return JevStatus(False, "no_key", detail, floor_ms=self.config.network_floor_ms)
+        if response.status_code in (401, 403) or "invalid or revoked" in lowered:
+            return JevStatus(False, "unauthorized", detail, floor_ms=self.config.network_floor_ms)
         return JevStatus(
             False,
             "unreachable",
@@ -647,17 +672,21 @@ class JevClient:
 
     @staticmethod
     def _error_detail(response: httpx.Response) -> str:
-        """Pull the message out of ``{"detail": {...}}``, truncated.
+        """Pull the message out of an error body, truncated.
 
-        The vendor's own SDK truncates error bodies, and the shape here is confirmed against the
-        live endpoint rather than guessed: a 403 arrives as
-        ``{"detail": {"error_type": "authentication_error", "message": "..."}}``.
+        Both envelopes the vendor's hosts use are handled, because they differ and guessing
+        produced a real bug: this host answers ``{"error": "Invalid or revoked API key."}``, while
+        ``api.typesafe.ai`` answers ``{"detail": {"error_type": ..., "message": ...}}``.
         """
         try:
             body = response.json()
         except ValueError:
             return response.text[:200]
-        detail = body.get("detail") if isinstance(body, dict) else None
+        if not isinstance(body, dict):
+            return str(body)[:200]
+        if isinstance(body.get("error"), str):
+            return body["error"][:200]
+        detail = body.get("detail")
         if isinstance(detail, dict):
             return str(detail.get("message") or detail.get("error_type") or "")[:200]
         return str(detail or "")[:200]
@@ -680,7 +709,7 @@ class JevClient:
         if not questions:
             raise JevError("at least one question is required")
         if not self.config.enabled:
-            raise JevAuthError("no_key", "TYPESAFE_API_KEY is not set")
+            raise JevAuthError("no_key", f"no {' or '.join(API_KEY_VARS)} in the environment")
 
         payload = {
             "state": state,
@@ -722,7 +751,18 @@ class JevClient:
         usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
         input_tokens = int(usage.get("input_tokens") or 0)
         output_tokens = int(usage.get("output_tokens") or 0)
-        cost = input_tokens * USD_PER_INPUT_TOKEN
+        # This host **does** report the cost, which the SDK schema does not describe and the first
+        # draft of docs/jev.md therefore claimed it did not. Prefer the vendor's own number: it is
+        # the figure that will be billed, and recomputing it ourselves would drift from it silently
+        # the day the price or the rounding changes. The multiplication stays as the fallback for a
+        # host that omits the field.
+        reported_cost = usage.get("cost_usd")
+        cost = (
+            float(reported_cost)
+            if isinstance(reported_cost, (int, float))
+            else input_tokens * USD_PER_INPUT_TOKEN
+        )
+        credits = usage.get("credits_remaining_usd")
 
         result = JevResponse(
             answers=answers,
@@ -732,6 +772,10 @@ class JevClient:
             latency_ms=latency_ms,
             cost_usd=cost,
             network_floor_ms=self.config.network_floor_ms,
+            credits_remaining_usd=float(credits) if isinstance(credits, (int, float)) else None,
+            # Whether the figure above is the vendor's or ours. The dashboard says which, because
+            # "cost" and "our estimate of cost" are different claims.
+            cost_reported=isinstance(reported_cost, (int, float)),
         )
         self._log_call(result, payload)
         return result
@@ -753,13 +797,21 @@ class JevClient:
                 "latency_ms": round(result.latency_ms, 1),
                 "floor_ms": floor,
                 "cost_usd": result.cost_usd,
+                "cost_reported": result.cost_reported,
+                "credits_remaining_usd": result.credits_remaining_usd,
             }
         )
+        credits = (
+            "" if result.credits_remaining_usd is None
+            else f", ${result.credits_remaining_usd:.4f} credit left"
+        )
         logger.info(
-            "jev: %d question(s), %d input tokens, $%.8f, %.0f ms%s, answered by %s",
+            "jev: %d question(s), %d input tokens, $%.6f%s%s, %.0f ms%s, answered by %s",
             question_count,
             result.input_tokens,
             result.cost_usd,
+            "" if result.cost_reported else " (computed, not reported)",
+            credits,
             result.latency_ms,
             "" if floor is None else f" (network floor {floor:.0f} ms)",
             result.model,
@@ -920,7 +972,7 @@ def _changed_only(state: dict, previous: Mapping[str, Any]) -> dict:
 # ------------------------------------------------------------------------- network floor (J1)
 
 
-def measure_network_floor_ms(host: str = "api.typesafe.ai", *, port: int = 443, timeout: float = 8.0) -> float:
+def measure_network_floor_ms(host: str = "", *, port: int = 443, timeout: float = 8.0) -> float:
     """Time a bare TCP connect plus a TLS handshake, in milliseconds.
 
     This is the number the latency discipline exists for. Every Jev latency figure is
@@ -931,7 +983,12 @@ def measure_network_floor_ms(host: str = "api.typesafe.ai", *, port: int = 443, 
     Measured with a raw socket rather than ``httpx`` on purpose: an HTTP request would include the
     server's own time, which is the thing that should be reported separately. It blocks, so call
     it through ``asyncio.to_thread`` from async code.
+
+    Defaults to the host actually configured, so the number beside a latency figure describes the
+    path that latency came from rather than the path of whichever host was written here first.
     """
+    if not host:
+        host = urlparse(JevConfig.from_env().endpoint).hostname or "jevtypesafeai.com"
     started = time.perf_counter()
     with socket.create_connection((host, port), timeout=timeout) as raw:
         context = ssl.create_default_context()

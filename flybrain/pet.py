@@ -175,8 +175,22 @@ def derive(obs: Observation, *, startle_s: float = STARTLE_S) -> tuple[str | Non
     if obs.bursting or (
         obs.seconds_since_burst is not None and obs.seconds_since_burst <= startle_s
     ):
-        movers = sorted(obs.sensor_changes.items(), key=lambda kv: abs(kv[1]), reverse=True)
-        who = ", ".join(f"{entity} ({value:+.2f})" for entity, value in movers[:3]) or "a sensor"
+        # Drop movements that would *print* as zero. A delta of -0.004 formats as "-0.00", and
+        # "-0.00" in a sentence a person reads is worse than useless: it looks like a display
+        # rounding bug when it is really a real-but-imperceptible drift being reported as an
+        # event. The trigger has its own threshold and is unaffected — this decides what is worth
+        # *saying*, not what counts as a change.
+        movers = sorted(
+            ((e, v) for e, v in obs.sensor_changes.items() if round(v, 2)),
+            key=lambda kv: abs(kv[1]),
+            reverse=True,
+        )
+        who = (
+            ", ".join(f"{entity} ({value:+.2f})" for entity, value in movers[:3])
+            # Nothing numeric worth naming: the trigger fired on a discrete sensor changing
+            # state, which has no magnitude to print.
+            or "a sensor changed state"
+        )
         contributors = [
             Contributor("change", who, "", "sensor"),
             Contributor(

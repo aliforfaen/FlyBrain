@@ -540,6 +540,13 @@ class BrainService:
         # without the key ever leaving the process.
         payload["config"] = self._jev.config.redacted()
         payload["calls"] = len(self._jev.calls)
+        # The accounting from the most recent real call. Shown because a credit balance reaching
+        # zero is how a feature stops working without anyone noticing, and because the cost is the
+        # number that decides whether generous labelling is affordable.
+        if self._jev.calls:
+            last = self._jev.calls[-1]
+            payload["last_call"] = dict(last)
+            payload["spent_usd"] = round(sum(c.get("cost_usd") or 0.0 for c in self._jev.calls), 8)
         return payload
 
     async def aclose(self) -> None:

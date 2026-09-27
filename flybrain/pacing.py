@@ -61,10 +61,12 @@ BURST = "burst"
 #: One decision consumes 300 ms of brain time, which costs ~2.34 s of GPU work at 0.13x
 #: realtime, and the measured power model is ``mean = IDLE_W + duty * LOAD_W``.
 #:
-#: These three numbers are a *copy* of measurements that ``docs/live-view.md`` owns, and they
-#: are here so that the duty cycle can be reported from one place for every pacing mode. If the
-#: GPU or the engine changes, both the doc and these constants are wrong together rather than
-#: the doc being right and the dashboard quietly lying.
+#: These numbers were re-verified on this machine with the pacing code in place: flat out measured
+#: 160 W total / 137 W above the paused floor, against the 165 / 146 below, and the floor here is
+#: 23.8 W rather than 19 W because a desktop compositor and other apps also hold the card. The
+#: *ratios* are the durable part, which is what the dashboard relies on — but note that what it
+#: shows is therefore a model of a machine, not a measurement of this one. docs/live-view.md owns
+#: the numbers and the method; change both together or neither.
 STEP_COST_S = 2.34
 IDLE_W = 19.0
 LOAD_W = 146.0

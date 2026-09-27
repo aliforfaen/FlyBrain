@@ -3,15 +3,20 @@
   "answers": {
     "failure_mode": {
       "type": "choice",
-      "choice": "stale_sensor",
-      "confidence": 0.979,
+      "choice": "healthy",
+      "confidence": 0.56,
       "probabilities": {
-        "healthy": 0.006,
-        "stale_sensor": 0.979,
-        "readout_drift": 0.011,
-        "unknown": 0.004
+        "stale_sensor": 0,
+        "unknown": 0.01,
+        "healthy": 0.67,
+        "drifting": 0.32
       }
     }
   },
-  "usage": {"input_tokens": 214, "output_tokens": 9}
+  "usage": {
+    "input_tokens": 458,
+    "output_tokens": 50,
+    "cost_usd": 0.000193,
+    "credits_remaining_usd": 4.997265
+  }
 }

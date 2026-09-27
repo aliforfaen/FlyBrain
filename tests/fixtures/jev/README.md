@@ -1,37 +1,32 @@
-# Jev fixtures — **constructed, not captured**
+# Jev fixtures — **captured from the live API**
 
-These files were **written by hand from the vendor's published schema**, not recorded from a live
-successful response. Be precise about that, because the distinction matters:
+These are **verbatim responses**, re-indented only. Nothing was added or removed, so a fixture
+cannot describe an envelope the API does not actually produce.
 
-- The **error** fixtures (`error_401.json`, `error_403.json`) are the real bodies, observed by
-  probing `POST /v1/systemone` from this machine with no key (403) and with a key the server
-  rejects (401).
-- `models_200.json` and the three `response_*.json` files are **constructed**. The configured
-  `TYPESAFE_API_KEY` was rejected with HTTP 401 for the whole of the session in which this client
-  was written, so no successful response could be captured.
+Captured 2026-09-27 from `POST https://jevtypesafeai.com/api/v1/decide`, with
+`model: jev-1.13.0`.
 
-What they are derived from is stronger than a guess, though. The wire shapes come from the
-official SDK's generated models (`typesafe_sdk/_schemas/models.py` in `typesafe-sdk==0.7.2`,
-which mirrors the vendor's OpenAPI schema) and the HTTP surface was verified by live probe:
-
-| Fact | Source |
+| File | What it pins |
 |---|---|
-| Response envelope is `{"model", "answers", "usage"}` | generated schema |
-| `choice` answers carry `choice`, `confidence`, `probabilities` | generated schema |
-| `score` answers carry `score`, `confidence`, `legend`, `probabilities` | generated schema |
-| `noul` answers carry only `noul` — **no `confidence`** | generated schema |
-| `usage` is `{"input_tokens", "output_tokens"}` | generated schema |
-| A `choice` **question** takes `criteria` (a label→description mapping), not `options` | generated schema |
-| `score` **question** takes `criteria` as an ordered sequence | generated schema |
-| Errors arrive as `{"detail": {"error_type", "message"}}` | live probe |
-| `GET /v1/models` answers 403 with no key, 401 with a rejected key | live probe |
+| `response_choice.json` | a `choice` answer: `choice`, `confidence`, and `probabilities` **keyed by label** |
+| `response_score.json` | a `score` answer: `score`, `confidence`, `legend`, and `probabilities` **keyed by level string** |
+| `response_noul.json` | a `noul` answer: `noul` and **nothing else** — no `confidence` key at all |
 
-**Two of those contradict what `docs/jev.md` originally claimed**, and the doc was corrected:
+That last file is the whole argument for the routing rule in one line: `{"type": "noul", "noul":
+0.67}`. There is no confidence field to gate on, which is why `route()` refuses to route one.
 
-1. `choice` keys its `probabilities` by **choice label**, not by index string. It is `score` that
-   keys them by level (`"0"`, `"1"`, ...). The two kinds genuinely differ.
-2. `choice` questions are written with `criteria`, a mapping. `options` is not a field.
+Three things these captures settled that guessing had got wrong:
 
-When a valid key exists, capture real responses here and delete this caveat — and at the same
-time re-base the token budget in `tests/test_jev.py` on the `usage.input_tokens` the real API
-reports, rather than on the character proxy it uses today.
+1. **`choice` keys `probabilities` by choice label; `score` keys them by level.** The two kinds
+   genuinely differ, and the first draft of `docs/jev.md` claimed index strings for both.
+2. **The API reports the cost.** `usage.cost_usd` and `usage.credits_remaining_usd` are present on
+   every response. The doc had claimed the first-party API reported no cost field and that the
+   multiplication was ours; it is now the fallback, not the source.
+3. **The error envelope differs between the vendor's hosts.** This one answers
+   `{"error": "Invalid or revoked API key."}`; `api.typesafe.ai` answers
+   `{"detail": {"error_type": ..., "message": ...}}`. Both are parsed.
+
+`error_401.json`, `error_403.json` and `models_200.json` are still hand-written, and are marked as
+such: the first two were observed by probing, and `models_200.json` documents an endpoint that
+**this host does not have** (`/api/v1/models` answers `unknown_endpoint`), so it is kept only for
+the client test that exercises the older host's shape.

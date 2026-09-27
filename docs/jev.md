@@ -10,8 +10,11 @@ practical description is a classifier with a language model inside.
 
 Two decisions shape everything below:
 
-1. **Jev is called first-party, at `api.typesafe.ai` — not through a reseller gateway.** The
-   measurement that forced this is in [Why hosted, and why first-party](#why-hosted-and-why-first-party).
+1. **Jev is called first-party, never through a reseller gateway.** The measurement that forced
+   this is in [Why hosted, and why first-party](#why-hosted-and-why-first-party). The host is
+   `jevtypesafeai.com` — **not** the `api.typesafe.ai` the public quickstart names, which refused
+   a perfectly good key with HTTP 401. See
+   [The endpoint was wrong, not the key](#the-endpoint-was-wrong-not-the-key).
 2. **It is not self-hosted, and it never enters the frame path.**
 
 How those calls are made is not an implementation detail. The disciplines in
@@ -139,6 +142,51 @@ That is enough to justify the experiment. It is not enough to justify a claim th
 **better** than the alternatives, and this document should not pretend otherwise.
 
 ---
+
+### What the confidences actually look like
+
+The margin quoted at the top of this document (0.979 clear / 0.841 ambiguous) came from someone
+else's ticket-triage data. **Measured here, on this project's own questions and states**, the
+picture is different and more useful. Six calls, ~$0.0013:
+
+| The state… | Confidence |
+|---|---|
+| determines the answer (fresh reading → tracks, stale → holding, drifted → drifting) | **0.940 · 0.980 · 0.990** |
+| genuinely under-determines it (age 45 s but still choosing, small delta) | **0.340** |
+| partially determines it (small delta, ambiguous drift) | 0.880 |
+
+So the separation is **wider** than the borrowed figures suggested — a state that fixes the answer
+lands at 0.94–0.99, and one that does not collapses to 0.34. That is good news for routing.
+
+**And a caveat that constrains it.** A byte-identical request sent six times:
+
+| | min | median | max | spread |
+|---|---|---|---|---|
+| `choice` confidence | 0.490 | 0.590 | 0.660 | **0.170** |
+| `score` | 2.46 | 2.485 | 2.53 | 0.070 |
+| `score` confidence | 0.440 | 0.470 | 0.490 | 0.050 |
+| latency | 694 ms | 726 ms | 977 ms | 283 ms |
+
+The answer never changed; the confidence moved by **0.17**. Three consequences, and the third is
+the one that matters:
+
+1. **A threshold must not sit on a knife-edge.** A router that treats 0.945 and 0.955 as different
+   outcomes is reading noise.
+2. **Re-calibration is not a one-off.** Any threshold is a statement about a distribution, not a
+   number, and it should be re-measured rather than inherited.
+3. **The conservative default is doing real work.** `JEV_LABEL_ACT=0.95` against a 0.17 spread and
+   a 0.94 floor means an under-determined answer *cannot* write a label, which is the outcome the
+   whole risk ladder exists to produce. The default looks over-cautious only if you assume the
+   confidences are stable, and they are not.
+
+**The methodological catch worth recording.** The first two cases I tried to measure inverts the
+labelling: the state I called "clear" (a healthy window whose chosen colour sat 30 K from the
+ideal) scored **0.33**, and the state I called "ambiguous" (literally `stale: true`) scored **1.0**.
+Confidence tracks how well *the state determines the answer to the question asked* — not how hard
+the situation feels to the person writing the probe. My "clear" case contained a contradiction
+(a 30 K gap is evidence for `drifting`), so the model was right to be unsure and my label was
+wrong. Any calibration harness has to be built from states whose answer is fixed by construction,
+which is what the table above is.
 
 ## Why hosted, and why first-party
 
@@ -465,7 +513,8 @@ systemd unit or container env block works unchanged. See [`.env.example`](../.en
 |---|---|
 | `TYPESAFE_API_KEY` | The credential, from the [TypeSafe console](https://console.typesafe.ai/keys). Absent ⇒ the whole feature is off |
 | `JEV_MODEL` | **`jev-1.13.0`** — the versioned id, deliberately, *not* the `jev-latest` alias. See below |
-| `JEV_BASE_URL` | `https://api.typesafe.ai/v1/systemone`; the bare root also works, since the SDK treats its base as a root and both spellings turn up |
+| `JEV_API_KEY` | The credential, from the provider console. **Absent ⇒ the whole feature is off.** The older `TYPESAFE_API_KEY` spelling is still read, so an existing `.env` is not silently ignored |
+| `JEV_BASE_URL` | `https://jevtypesafeai.com/api/v1/decide`; the bare host also works |
 | `JEV_TIMEOUT_S` | Request timeout; default `30` |
 | `JEV_NETWORK_FLOOR_MS` | The measured floor, recorded beside every latency figure. Unset ⇒ reported as "not measured", never as `0` |
 | `JEV_STRICT_MODEL` | Default `1`. Refuse an answer from a version other than the pinned one |
@@ -482,8 +531,8 @@ threshold: the failure that matters is `JEV_LABEL_ACT` being mistyped into "writ
 Verified against [the official docs](https://docs.typesafe.ai/introduction/quickstart) rather
 than inferred from a third party:
 
-- **One endpoint for every model:** `POST https://api.typesafe.ai/v1/systemone`, with
-  `Authorization: Bearer $TYPESAFE_API_KEY` and `Content-Type: application/json`.
+- **One endpoint:** `POST https://jevtypesafeai.com/api/v1/decide`, with
+  `Authorization: Bearer $JEV_API_KEY` and `Content-Type: application/json`.
 - **Body:** `{"state": ..., "model": "jev-1.13.0", "questions": {...}}`.
 - **Official Python SDK:** `typesafe_sdk` — `TypeSafeClient`, `client.system_one(...)`, and typed
   `Choice` / `Score` / `Noul` objects. It **retries with backoff by default and honours
@@ -498,9 +547,42 @@ than inferred from a third party:
 - Jev accepts **text only** — a string, a JSON object, or an array of text values. English is the
   primary training language; other languages are accepted but less accurate, so watch
   `confidence` if the state is ever non-English.
-- `GET https://api.typesafe.ai/v1/models` exists, is authenticated, and **costs no input tokens**.
-  It is what the client probes to answer "is this usable, and if not why" without spending a
-  judgment.
+- **There is no free endpoint to probe on this host.** `GET /api/v1/models` answers
+  `{"error": "Unknown endpoint /api/v1/models."}`, so the availability check asks one *trivial
+  question* instead. That costs a fraction of a cent rather than nothing, which is why the result
+  is cached and `refresh` is explicit. The other host did have such an endpoint; this one does not,
+  and the client says which situation it is in rather than pretending the check is free.
+
+### The endpoint was wrong, not the key
+
+Recorded because it cost real time and the symptom was actively misleading.
+
+This project was built against `POST https://api.typesafe.ai/v1/systemone`, the host the vendor's
+public quickstart names. Every request was refused:
+
+```
+HTTP 401  {"detail": {"error_type": "authentication_error",
+                      "message": "Cannot authenticate with the server..."}}
+```
+
+That reads as a bad credential. The key was well-formed (`jv_live_…`, 51 characters, no
+whitespace), so the reasonable conclusions were "revoked", "mistyped", or "from another
+environment" — and all three were wrong. The key was fine. **The host was not the one that serves
+this account**, and the working endpoint (`https://jevtypesafeai.com/api/v1/decide`) was found by
+the operator, not by reading the docs harder.
+
+Three lessons, all of which are already this repository's stated ones:
+
+- **A 401 is a statement about the pair (key, endpoint), not about the key.** Nothing in the
+  response distinguished "this key is bad" from "this host does not know this key".
+- **Two hosts under one vendor can differ in more than the hostname.** These two disagree on the
+  error envelope (`{"error": ...}` vs `{"detail": {...}}`), on whether a cheap probe endpoint
+  exists, and on whether the cost is reported. Every one of those was assumed from the wrong host
+  and had to be corrected.
+- **The client now reports the distinction the operator needs.** `available()` separates
+  `no_key`, `unauthorized`, and `unreachable`, and because a *missing* key and an *invalid* key
+  both come back as **401** on this host, the message is read rather than the status code trusted:
+  `"Missing API key…"` and `"Invalid or revoked API key."` send a person to different places.
 
 ### We use `httpx`, not the SDK — and why
 
@@ -542,11 +624,26 @@ this repository has been burned by before.
 Log the `model` field from every response: it reports the versioned id that actually answered, so
 drift becomes visible in the logs rather than inferred from behaviour that has quietly got worse.
 
-### Cost accounting is ours to do
+### Cost accounting
 
-The first-party API reports `input_tokens` and `output_tokens` but **no `cost` field** — that was
-a gateway addition. Cost is therefore computed: `input_tokens × $0.042 / 1e6`. Log it per call,
-next to the latency, next to the measured network floor.
+**Corrected:** the API *does* report the cost. Every response carries
+`usage.cost_usd` and `usage.credits_remaining_usd`, which the SDK's published schema does not
+describe and the first draft of this document therefore denied:
+
+```json
+"usage": {"input_tokens": 458, "output_tokens": 50,
+          "cost_usd": 0.000193, "credits_remaining_usd": 4.997265}
+```
+
+The client prefers the vendor's figure and falls back to `input_tokens × $0.042 / 1e6` only when
+the field is absent, recording which it used (`cost_reported`). Recomputing our own number when the
+billed one is right there would drift from it silently the day the price or the rounding changes.
+
+The credit balance is surfaced in the dashboard, because **a balance reaching zero is how a feature
+stops working without anyone noticing.** Measured spend: a three-question call with a small state
+cost $0.000233; a single-question call $0.00014–$0.00019. A dashboard that probes availability
+every five minutes costs roughly **$0.03 a day** if left open, which is worth knowing before
+leaving it open for a month.
 
 ---
 
@@ -557,7 +654,7 @@ next to the latency, next to the measured network floor.
 still do not exist. The one thing that is *blocked* rather than unbuilt is called out below.
 
 **J0 — credential surface — done**
-- [x] Document `TYPESAFE_API_KEY` / `JEV_*` in `.env.example` and `.env`
+- [x] Document `JEV_API_KEY` / `JEV_*` in `.env.example` and `.env`
 - [x] A `JevConfig` reader following the `os.environ.get(...)` pattern, with tests
 - [x] Default `JEV_MODEL` to the **versioned id `jev-1.13.0`**, never the alias, and refuse to
       proceed if a response's `model` field differs from the pinned id
@@ -573,9 +670,9 @@ still do not exist. The one thing that is *blocked* rather than unbuilt is calle
       quietly dropped
 - [x] `flybrain/jev.py`: one call to `POST /v1/systemone`; typed `choice` / `score` / `noul`
       helpers; `legend` and per-kind `probabilities` parsing
-- [x] **Measured the network floor to `api.typesafe.ai` on this machine** — and found that the
-      *first* sample is ~3× the warm median, so the measurement is repeated and the method is
-      recorded
+- [x] **Measured the network floor on this machine** — and found that the *first* sample is
+      ~3× the warm median, so the measurement is repeated and the method is recorded. Median
+      **49.2 ms** over 5 warm samples to the configured host
 - [x] Reconcile `score` against `probabilities` to ±0.02
 - [x] A test that runs the whole client against fixtures with no network — and one live test that
       asserts the client's *diagnosis* is truthful, so it is useful even while the credential is
@@ -595,17 +692,9 @@ still do not exist. The one thing that is *blocked* rather than unbuilt is calle
 - [x] A cost log line per call: computed cost, latency, the measured floor beside it, and the
       `model` id that answered
 
-**Blocked on a valid credential.** The `TYPESAFE_API_KEY` in `.env` is well-formed
-(`jv_live_…`, 51 characters, no whitespace) and the server **rejects it with HTTP 401**
-persistently. Until that is re-minted at <https://console.typesafe.ai/keys>:
-
-- the confidence thresholds cannot be calibrated on real answers;
-- no live latency figure can be recorded (the floor can, and was);
-- J2's vocabulary cannot be validated against real verdicts.
-
-Everything else in J0–J1a is verified offline or against the real error paths, and
-`tests/test_jev_live.py` will begin reporting real answers the moment the key works, with no code
-change.
+**No longer blocked.** The credential works: `available()` reports `ok` against
+`https://jevtypesafeai.com/api/v1/decide`, and a real three-question call costs $0.000233. What
+remains for J2 is the vocabulary and the UI, not access.
 
 **J2 — placement A, offline first**
 - [ ] Define the failure-mode vocabulary in code, including `unknown`
@@ -645,16 +734,13 @@ Recorded rather than smoothed over:
 1. **Does Jev add anything a threshold does not?** Placement A is the test. If it returns
    `healthy` for everything, or if its verdicts never change anyone's behaviour, it has not
    earned its dependency.
-2. **What are the right confidence thresholds, and how stable are they?** The measured margin
-   between clear (0.979) and deliberately ambiguous (0.841) cases is narrower than a router would
-   like, and the docs are explicit that thresholds are domain-specific and must be tested on your
-   own data. **They must be calibrated here before anything writes a label.** Until then every
-   threshold stays conservative and every low-confidence answer becomes `needs_human`.
-   *Partly answered in code:* the three tiers now exist as settings rather than literals, and
-   `JEV_LABEL_ACT` defaults to `0.95` — deliberately between the two measurements, so the
-   measured *clear* case writes a label and the measured *ambiguous* case only proposes one. That
-   is a starting point that is honest about its provenance, not a calibration; the numbers still
-   come from someone else's data. Calibrating them is blocked on a working credential.
+2. **What are the right confidence thresholds, and how stable are they?** Answered, with a
+   caveat that matters more than the answer. Measured here: a state that determines the answer
+   scores 0.94–0.99 and one that does not drops to 0.34 — a wider separation than the borrowed
+   figures implied. But a byte-identical request varies by **0.17** in `choice` confidence, so the
+   thresholds must sit with margin and be re-measured rather than inherited. The defaults are
+   deliberately conservative *because of* that spread, not despite it. See
+   [What the confidences actually look like](#what-the-confidences-actually-look-like).
 3. **What happens when the label vocabulary is wrong?** If every option is wrong, one still
    wins. The `unknown` option is the mitigation, not a solution.
 4. **Does Jev's judgment drift?** Partly mitigated by pinning `jev-1.13.0` — a vendor release can

@@ -23,7 +23,7 @@ population → learned ridge readout → colour temperature (K) → HA light.tur
 ```bash
 uv sync                                        # Python 3.11 → .venv (torch + CUDA wheels)
 .venv/bin/python tools/fetch_data.py           # connectome + annotations, ~140 MB, one time
-.venv/bin/python -m pytest tests/ -q           # 422 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q           # 430 tests, no connectome needed
 
 .venv/bin/python -m flybrain.experiment        # train the readout, ~50 s
 .venv/bin/python -m flybrain.server            # dashboard + live loop
@@ -86,7 +86,7 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
 | `flybrain/server.py` | FastAPI dashboard + the loop's clock |
 | `flybrain/ha.py` | Home Assistant adapters (mock and REST) |
 | `flybrain/env.py` | Loads `.env`, so no house-specific value is ever hardcoded or hand-sourced |
-| `flybrain/jev.py` | The optional Jev judgment layer: typed questions, confidence routing, credential surface. Off unless `TYPESAFE_API_KEY` is set |
+| `flybrain/jev.py` | The optional Jev judgment layer: typed questions, confidence routing, credential surface. Off unless `JEV_API_KEY` is set |
 | `tools/fetch_data.py` | Downloads and byte-verifies the connectome and annotation tables |
 | `web/` | three.js dashboard, no bundler, three.js vendored |
 | `validation/` | Brian2 comparison and a closed-form integrator test |

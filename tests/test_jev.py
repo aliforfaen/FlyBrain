@@ -110,18 +110,20 @@ class TestConfig:
         assert cfg.api_key == "jv_live_x", "surrounding whitespace must not become part of a key"
 
     def test_the_base_url_is_normalized_whichever_way_it_is_written(self) -> None:
-        """The docs give the full endpoint; the vendor's SDK treats its base as a root.
+        """A bare host and the full endpoint are the same endpoint.
 
-        Both spellings arrive in the wild, so neither is treated as a mistake.
+        Both spellings arrive in the wild — a reader copies the full path out of the docs, a
+        base-URL habit writes only the host — so neither is treated as a mistake.
         """
-        full = JevConfig(base_url=f"{DEFAULT_BASE_URL}/v1/systemone")
-        bare = JevConfig(base_url=DEFAULT_BASE_URL)
-        assert full.endpoint == bare.endpoint == f"{DEFAULT_BASE_URL}/v1/systemone"
-        assert full.root == bare.root == DEFAULT_BASE_URL
-        assert full.models_url == f"{DEFAULT_BASE_URL}/v1/models"
+        host = "https://jevtypesafeai.com"
+        assert JevConfig(base_url=host).endpoint == DEFAULT_BASE_URL
+        assert JevConfig(base_url=DEFAULT_BASE_URL).endpoint == DEFAULT_BASE_URL
 
     def test_a_trailing_slash_is_tolerated(self) -> None:
-        assert JevConfig(base_url=f"{DEFAULT_BASE_URL}/").endpoint == f"{DEFAULT_BASE_URL}/v1/systemone"
+        assert JevConfig(base_url=f"{DEFAULT_BASE_URL}/").endpoint == DEFAULT_BASE_URL
+
+    def test_an_empty_url_falls_back_to_the_default(self) -> None:
+        assert JevConfig(base_url="   ").endpoint == DEFAULT_BASE_URL
 
     def test_the_redacted_config_carries_no_key(self) -> None:
         secret = "jv_live_supersecretvalue"
@@ -229,26 +231,27 @@ class TestParseAnswer:
         """Not by index. The doc originally claimed index strings for both kinds; only score does."""
         answer = parse_answer("failure_mode", fixture("response_choice.json")["answers"]["failure_mode"])
         assert answer.kind == "choice"
-        assert answer.choice == "stale_sensor"
-        assert answer.confidence == pytest.approx(0.979)
-        assert set(answer.probabilities) == {"healthy", "stale_sensor", "readout_drift", "unknown"}
+        assert answer.choice == "healthy"
+        assert answer.confidence == pytest.approx(0.56)
+        # Keyed by LABEL, which is the half of this that the first draft of the docs got wrong.
+        assert set(answer.probabilities) == {"healthy", "stale_sensor", "drifting", "unknown"}
 
     def test_a_score_answer_carries_score_legend_and_confidence(self) -> None:
         answer = parse_answer("how_busy", fixture("response_score.json")["answers"]["how_busy"])
         assert answer.kind == "score"
-        assert answer.score == pytest.approx(2.18)
-        assert answer.confidence == pytest.approx(0.841)
+        assert answer.score == pytest.approx(1.35)
+        assert answer.confidence == pytest.approx(0.44)
         assert answer.legend["3"] == "busy"
 
     def test_a_score_answer_keys_probabilities_by_level(self) -> None:
         answer = parse_answer("how_busy", fixture("response_score.json")["answers"]["how_busy"])
-        assert set(answer.probabilities) == {"0", "1", "2", "3"}
+        assert set(answer.probabilities) == {"0", "1", "2", "3", "4"}
 
     def test_a_noul_answer_has_no_confidence(self) -> None:
         """Absence, not zero. Zero would read as 'certainly uncertain' and route confidently."""
         answer = parse_answer("is_responding", fixture("response_noul.json")["answers"]["is_responding"])
         assert answer.kind == "noul"
-        assert answer.noul == pytest.approx(0.91)
+        assert answer.noul == pytest.approx(0.67)
         assert answer.confidence is None
         assert answer.gateable is False
 
@@ -267,8 +270,8 @@ class TestParseAnswer:
 class TestScoreReconciliation:
     def test_a_consistent_score_reconciles(self) -> None:
         answer = parse_answer("how_busy", fixture("response_score.json")["answers"]["how_busy"])
-        # 0*0.02 + 1*0.08 + 2*0.6 + 3*0.3 = 2.18, exactly the reported score.
-        assert reconcile_score(answer) == pytest.approx(0.0, abs=1e-9)
+        # A real response: 0.16*0 + 0.33*1 + 0.5*2 + 0.01*3 = 1.35, and the API reported 1.35.
+        assert reconcile_score(answer) < 0.02
 
     def test_the_two_decimal_rounding_is_within_tolerance(self) -> None:
         """The mismatch is expected: probabilities are rounded, the score is not.
@@ -379,7 +382,7 @@ class TestAsking:
     def test_the_answers_come_back_keyed_by_question_id(self) -> None:
         client = client_for(fixture_text("response_choice.json"))
         response = run(client.ask({"window": {}}, {"failure_mode": choice("Which?", {"a": "b"})}))
-        assert response.answers["failure_mode"].choice == "stale_sensor"
+        assert response.answers["failure_mode"].choice == "healthy"
 
     def test_every_question_goes_in_one_request(self) -> None:
         """Batching: five questions cost and take the same as one, so there must be one call."""
@@ -401,12 +404,26 @@ class TestAsking:
         run(client_for(fixture_text("response_noul.json"), calls=calls).ask({}, {"q": noul("?")}))
         assert calls[0].headers["authorization"] == "Bearer jv_live_test"
 
-    def test_the_cost_is_computed_because_the_api_does_not_report_it(self) -> None:
+    def test_the_reported_cost_is_preferred_over_our_own_multiplication(self) -> None:
+        """The vendor's number is the one that will be billed; ours would drift from it."""
         response = run(client_for(fixture_text("response_choice.json")).ask({}, {"q": noul("?")}))
-        assert response.input_tokens == 214
-        assert response.cost_usd == pytest.approx(214 * 42.0 / 1e9)
-        # The order of magnitude is the point: a judgment is ~$0.00001, not ~$0.0004.
-        assert response.cost_usd < 1e-5
+        assert response.input_tokens == 458
+        assert response.cost_reported is True
+        assert response.cost_usd == pytest.approx(0.000193)
+        assert response.credits_remaining_usd is not None
+
+    def test_a_host_that_reports_no_cost_falls_back_to_computing_it(self) -> None:
+        body = fixture("response_noul.json")
+        del body["usage"]["cost_usd"]
+        body["usage"].pop("credits_remaining_usd", None)
+        response = run(client_for(json.dumps(body)).ask({}, {"q": noul("?")}))
+        assert response.cost_reported is False
+        assert response.cost_usd == pytest.approx(305 * 42.0 / 1e9)
+
+    def test_a_judgment_costs_a_fraction_of_a_cent(self) -> None:
+        """The order of magnitude is what makes generous labelling affordable."""
+        response = run(client_for(fixture_text("response_choice.json")).ask({}, {"q": noul("?")}))
+        assert response.cost_usd < 0.001
 
     def test_the_call_log_records_tokens_latency_and_the_floor(self) -> None:
         """A latency number without the floor beside it describes geography, not the model."""
@@ -419,7 +436,7 @@ class TestAsking:
         run(client.ask({}, {"q": noul("?")}))
         entry = client.calls[0]
         assert entry["floor_ms"] == 154.0
-        assert entry["input_tokens"] == 198
+        assert entry["input_tokens"] == 305
         assert entry["questions"] == 1
 
     def test_an_empty_question_set_is_refused(self) -> None:
@@ -509,7 +526,7 @@ class TestErrorHandling:
 
         client._sleep = fake_sleep
         response = run(client.ask({}, {"q": noul("?")}))
-        assert response.answers["is_responding"].noul == pytest.approx(0.91)
+        assert response.answers["is_responding"].noul == pytest.approx(0.67)
         assert len(calls) == 2
         assert slept == [2.5], "the server's own backoff instruction must win over ours"
 
@@ -551,8 +568,15 @@ class TestErrorHandling:
         assert len(calls) == 1
 
     def test_a_caller_can_drive_routing_straight_off_the_response(self) -> None:
+        """A real capture at confidence 0.56 is not allowed to touch the training set.
+
+        The risk ladder doing its job on captured data rather than on a synthetic number: the same
+        answer may paint a verdict (>= 0.50) and may not write a label (< 0.80), because a wrong
+        label corrupts the only training data this project has.
+        """
         response = run(client_for(fixture_text("response_choice.json")).ask({}, {"q": noul("?")}))
-        assert response.routed(LABEL)["failure_mode"].action == "act"
+        assert response.routed(LABEL)["failure_mode"].action == "needs_human"
+        assert response.routed(PAINT)["failure_mode"].action == "confirm"
 
 
 class TestAvailability:
@@ -566,11 +590,15 @@ class TestAvailability:
         assert status.reason == "no_key" and status.available is False
         assert calls == []
 
-    def test_a_good_key_reports_ok_and_the_models_on_offer(self) -> None:
-        client = client_for(fixture_text("models_200.json"))
+    def test_a_good_key_reports_ok(self) -> None:
+        client = client_for(fixture_text("response_noul.json"))
         status = run(client.available())
         assert status.available is True and status.reason == "ok"
-        assert "jev-1.13.0" in status.models
+
+    def test_a_reported_credit_balance_is_surfaced(self) -> None:
+        """A silent zero is how a feature stops working without anyone noticing."""
+        response = run(client_for(fixture_text("response_choice.json")).ask({}, {"q": noul("?")}))
+        assert response.credits_remaining_usd == pytest.approx(4.997265)
 
     def test_a_rejected_key_says_unauthorized(self) -> None:
         client = client_for(fixture_text("error_401.json"), status=401)
@@ -589,13 +617,18 @@ class TestAvailability:
         assert status.reason == "unreachable"
         assert "ConnectError" in status.detail
 
-    def test_the_probe_uses_no_input_tokens(self) -> None:
-        """It hits /v1/models rather than asking a question, so a refresh cannot cost money."""
+    def test_the_probe_asks_one_trivial_question(self) -> None:
+        """This host has no free endpoint to probe, so a check costs a fraction of a cent.
+
+        `/api/v1/models` answers `unknown_endpoint` here, which is why the probe is a real (tiny)
+        question rather than a GET — and why the answer is cached and `refresh` is explicit.
+        """
         calls: list[httpx.Request] = []
-        client = client_for(fixture_text("models_200.json"), calls=calls)
+        client = client_for(fixture_text("response_noul.json"), calls=calls)
         run(client.available())
-        assert calls[0].method == "GET"
-        assert calls[0].url.path == "/v1/models"
+        assert calls[0].method == "POST"
+        assert calls[0].url.path.endswith("/decide")
+        assert len(json.loads(calls[0].content)["questions"]) == 1
 
     def test_the_probe_is_cached(self) -> None:
         calls: list[httpx.Request] = []
