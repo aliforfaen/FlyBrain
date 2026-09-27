@@ -28,6 +28,7 @@ See [`data.md`](data.md) for exactly what is fetched and from where.
 | [`data.md`](data.md) | How to fetch the data, schemas, provenance, parsing gotchas |
 | [`engine.md`](engine.md) | Performance, power draw, and the plan for a real-time engine |
 | [`wiring.md`](wiring.md) | Which Home Assistant entity drives which fly sensory pathway, and why the order of those rules matters |
+| [`jev.md`](jev.md) | The optional Jev judgment layer: **placement A (the decision inspector) is built and off by default**; placements B and C are design only. Most of it is the argument for where *not* to use a language model |
 | [`vision.md`](vision.md) | The camera → visual-column design. **Designed only, not built.** |
 | [`roadmap.md`](roadmap.md) | What to build next, and an honest assessment of what a fly brain is good for |
 | [`ha-inventory.md`](ha-inventory.md) | What a real house's Home Assistant actually exposes, and which plausible ideas that rules out |

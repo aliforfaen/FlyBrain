@@ -80,7 +80,9 @@ Clients send text JSON: `{"type":"pause","value":true}`, `{"type":"settings","se
 | `GET /api/groups/ids` | raw `Uint8Array`, `n*2` — family id then sense id per neuron, in connectome order |
 | `GET /api/regions` | per-cell-class usage (`regions`) **and** per-family usage (`families`) |
 | `GET /api/trace` | where one family or sense sends its signals: top target classes, exact synapse counts, group-to-group geometry |
-| `GET`/`POST /api/settings` | read / patch the live settings |
+| `GET`/`POST /api/settings` | read / patch the live settings (the viewer: colours, thresholds, what is drawn) |
+| `POST /api/loop/settings` | patch the **control loop**: sensitivity, limits, smoothing, deadband, pacing, dry run. What the *Light connection* panel writes, and what anything else should write — `POST /api/settings` is the dashboard's own appearance |
+| `POST /api/loop/fit-range` | fit the sensitivity span from the readings seen so far ("Fit sensitivity to this room") |
 | `POST /api/drive` | set or clear a persistent drive on a named role |
 | `GET /api/frame` | last frame summary |
 | `GET /api/loop` | the control loop's whole state, including pacing and the last action |
@@ -471,11 +473,11 @@ swatch cannot disagree.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HA_MODE` | `mock` | `mock` uses the in-process home simulator; `rest` talks to a real instance |
+| `HA_MODE` | `mock` | `mock` uses the in-process home simulator; `rest` talks to a real instance. **The simulator only contains its own entities**, so in `mock` mode the two entity ids below are mapped onto `sensor.living_room_temperature` and `light.kitchen` and a warning says so — a real id there is a reading that can never arrive, which looks exactly like an unplugged sensor: the page renders and the cloud animates, but no decision is ever made and *Colour chosen* stays empty. `rest` is the mode where your own ids apply |
 | `HA_DRY_RUN` | `1` | When true, a **real** Home Assistant is never called — the loop records what it *would* send. The mock is not a real device, so mock mode always applies its calls and the simulated light genuinely changes |
 | `HA_BASE_URL`, `HA_TOKEN` | — | Required for `rest`. The token is a long-lived access token |
-| `FLYBRAIN_TEMPERATURE_ENTITY` | `sensor.living_room_temperature` | **Must be set for a real house** — the default names the *mock* home |
-| `FLYBRAIN_LIGHT_ENTITY` | `light.kitchen` | Target light; must actually support the colour command (see below) |
+| `FLYBRAIN_TEMPERATURE_ENTITY` | `sensor.living_room_temperature` | **Must be set for a real house** — the default names the *mock* home, and `mock` mode always uses the mock's own |
+| `FLYBRAIN_LIGHT_ENTITY` | `light.kitchen` | Target light; must actually support the colour command (see below). In `mock` mode the simulated home's own `light.kitchen` is used |
 | `FLYBRAIN_SOURCE_MIN_C` / `_MAX_C` | `10` / `35` | Sensor span stretched onto the full trained colour range |
 | `FLYBRAIN_INVERT` | `0` | Flip the direction for a sensor that reads high when you want it cool |
 | `FLYBRAIN_SMOOTH_MS` | `5000` | Exponential smoothing on the reading |
@@ -689,7 +691,7 @@ more than the memory is worth.
 
 ## The pet panels: what each one is for
 
-![The dashboard with the pet, pacing, memory trail, three layers and trust panels populated](images/pet-panels.png)
+![The dashboard paused: the pet says "paused" and labels its last observation with its age](images/pet-panels.png)
 
 Five panels were added on top of the original view, and the goal of all five is the same: make
 every part of the system visible from one screen, in plain numbers, without reading a log.
@@ -706,11 +708,33 @@ The activity comparison is a *ratio to its own recent self*, never an absolute t
 neurons join in depends on the drive, the connectome and the window length, so a fixed cut-off
 would be a calibration that silently rots.
 
+**A paused pet says "paused".** This is the one place the panel would otherwise lie by omission,
+and the screenshot above is that state. The pet is fed only by a *completed* window, so pausing
+freezes its last answer — and for a while the page showed a pink `startled` next to the sentence
+"the brain is running at full rate", with a **Resume** button beside it. Two fixes, because there
+were two problems:
+
+- The word is now `paused`, and the observation is kept but **dated**: *"Before pausing — last
+  observed 38s ago: …"*. The evidence is not thrown away (it is the reason the word was ever
+  anything), it is attributed to the window it came from.
+- `since_s` is now read **at request time** rather than stamped at the last window, so "startled
+  for 4s" no longer sits on screen forty seconds later. The state clock does not stop when windows
+  do, and a value frozen at the last observation understates the age by up to a heartbeat while
+  running and by the whole pause once stopped. `pet.observed_age_s` is what the panel uses to say
+  how stale the *evidence* is; the two are different numbers and the payload carries both.
+
 **Pacing** — a heartbeat dial, and the numbers that decide what it costs. The dialect shows time
 to the next decision and turns pink while bursting. The important detail is that the **duty cycle
 and the wattage are measured**, from decisions actually made, not computed from the settings: once
 a trigger is in play the cost depends on how interesting the house has been, which no formula over
 the configuration can predict.
+
+Both are **averages since the process started**, not instantaneous readings, and the panel says
+"average" for that reason. Nothing here can measure the card's current draw, so a paused brain
+keeps reporting the run's mean — which is a true statement about the run and a false one about the
+moment, and is exactly why the label carries the word. Watch the duty fall over the first minute
+after a burst if you want to see the averaging: it is decaying toward the heartbeat's share, not
+following the GPU.
 
 **Why that colour** — the three-layer explanation, kept visibly separate. *The house said* (the
 reading, its age, what moved, how many senses are wired). *The brain did* (neurons active, spikes,
@@ -755,9 +779,9 @@ Recorded so they do not have to be re-derived. Roughly in order of value per uni
   on the same device as the thermometer, is `binary_sensor.hallway_motion` and
   `sensor.hallway_illuminance`. Illuminance maps to the fly's `visual` population, its largest;
   motion gives the readout a genuinely temporal question to answer.
-- **Show the readout's weights.** The loop is a linear map over 512 neurons; drawing those 512
-  coefficients as a bar strip beside the brain would show *which* neurons the colour actually
-  depends on. It is the most direct answer to "is the brain doing something sensible?".
+- **Show the readout's weights.** Not built. The loop is a linear map over 512 neurons; drawing
+  those 512 coefficients as a bar strip beside the brain would show *which* neurons the colour
+  actually depends on. It is the most direct answer to "is the brain doing something sensible?".
 - **A "why" trace for one decision.** Record the per-neuron rates behind the current colour and
   let the user click a decision in the history to replay it. Turns the dashboard from a
   readout into a debugger. ~~Designed~~ **Built** — this is placement A in [`jev.md`](jev.md),
@@ -772,10 +796,6 @@ Recorded so they do not have to be re-derived. Roughly in order of value per uni
   spotlight, which is what placement C would drive automatically. A slow loop that picks which
   family to emphasise would make the cloud readable on its own; it now has somewhere to plug in,
   since spotlighting is a single uniform.
-- **Show the readout's weights.** Still not built, and still the most direct answer to "is the
-  brain doing something sensible?" — the loop is a linear map over 512 neurons, and drawing those
-  512 coefficients as a bar strip beside the brain would show *which* neurons the colour actually
-  depends on.
 - **Real-time engine.** Everything above is cheap; this is not. 0.13× realtime means a decision
   every ~2.3 s, which is fine for a thermostat and hopeless for anything that reacts. The
   active-set integrator is the documented route (see `engine.md`).

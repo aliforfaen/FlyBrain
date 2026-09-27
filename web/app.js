@@ -1809,7 +1809,7 @@ function startTimelinePolling() {
 function paintStatus(s) {
   if (!s) return;
   state.status = s;
-  paintPet(s.pet);
+  paintPet(s.pet, s.trust);
   paintPacing(s.pacing, s.journal);
   paintLayers(s.layers);
   paintTrust(s.trust, s.jev);
@@ -1818,26 +1818,42 @@ function paintStatus(s) {
 
 /* --- the pet ------------------------------------------------------------- */
 
-function paintPet(pet) {
+function paintPet(pet, trust) {
   if (!pet) return;
-  const key = PET_TONES[pet.state] || 'waking';
-  setSummary('pet', pet.state ? `${pet.state}${pet.since_s ? ` · ${fmtDuration(pet.since_s)}` : ''}` : 'starting');
+  // A pause stops windows, and the pet is only fed by a completed window -- so its state is a
+  // frozen snapshot, not a description of now. Showing "startled · running at full rate" next to
+  // a Paused button is a claim about a moment that has passed, which is the one thing this panel
+  // exists not to do. The observation is kept (it is data, and it is the evidence for the word),
+  // and labelled with its age instead of being presented as current.
+  const paused = !!(trust && trust.paused);
+  const age = Number.isFinite(Number(pet.observed_age_s)) ? Number(pet.observed_age_s) : null;
+  const seen = age == null ? 'no window observed yet' : `last observed ${fmtDuration(age)} ago`;
+  const key = paused ? 'paused' : (PET_TONES[pet.state] || 'waking');
+  setSummary('pet', paused
+    ? `paused · ${pet.state ? `last seen ${pet.state} ` : ''}${age == null ? '' : `${fmtDuration(age)} ago`}`.trim()
+    : (pet.state ? `${pet.state}${pet.since_s ? ` · ${fmtDuration(pet.since_s)}` : ''}` : 'starting'));
 
   const glyph = $('#pet-glyph');
   if (glyph) glyph.dataset.state = key;
   const chip = $('#pet-chip');
   if (chip) chip.dataset.state = key;
 
-  const word = pet.state || 'waking up';
+  const word = paused ? 'paused' : (pet.state || 'waking up');
   setText('#pet-state', word);
   setText('#pet-chip-label', word);
 
   const held = pet.since_s >= 1 ? `for ${fmtDuration(pet.since_s)}` : 'just changed';
-  setText('#pet-since', pet.state ? held : 'no window yet');
+  setText('#pet-since', paused ? seen : (pet.state ? held : 'no window yet'));
 
-  setText('#pet-sentence', pet.sentence || '—');
+  // Attribute the sentence to the window it came from rather than to now. Only when there is a
+  // state to attribute: with no completed window the default sentence already says so.
+  setText('#pet-sentence', paused && pet.state
+    ? `Before pausing — ${seen}: ${pet.sentence || '—'}`
+    : (pet.sentence || '—'));
   setText('#pet-honesty', pet.honesty || '—');
-  if ($('#pet-source')) $('#pet-source').textContent = pet.state ? 'measured' : 'no data';
+  if ($('#pet-source')) {
+    $('#pet-source').textContent = paused ? 'paused' : (pet.state ? 'measured' : 'no data');
+  }
 
   // Every label shows its contributors. A chip is a number and where it came from; a label
   // without one would be a claim, which is exactly what this panel exists to avoid.
@@ -2505,9 +2521,11 @@ function paintConnect(loop) {
       pace.textContent = 'flat out · ~165 W';
     } else if (trig > 0) {
       const base = Math.round(19 + Math.min(1, 2.34 / iv) * 146);
+      // "average" rather than "measured" on its own: the number is the mean over the whole run,
+      // from a power model, so while the brain is paused it stays high and describes the past.
       pace.textContent = observed == null
         ? `every ${iv}s + bursts · ~${base} W at rest`
-        : `every ${iv}s + bursts · ~${Math.round(observed)} W measured`;
+        : `every ${iv}s + bursts · ~${Math.round(observed)} W average`;
     } else {
       pace.textContent = `every ${iv}s · ~${Math.round(19 + Math.min(1, 2.34 / iv) * 146)} W`;
     }
@@ -2562,7 +2580,16 @@ function paintConnect(loop) {
     note.innerHTML =
       `Reading <code>${s.temperature_entity}</code> \u2192 <code>${s.light_entity}</code>. ` +
       `A 1 \u00b0C change in the room moves the light <b>${perDeg.toFixed(0)} K</b>.`
-      + (obs ? ` This room has been ${obs[0]}\u2013${obs[1]} \u00b0C so far.` : '');
+      + (obs ? ` This room has been ${obs[0]}\u2013${obs[1]} \u00b0C so far.` : '')
+      // The simulated house only contains its own entities, so a real id here would read as
+      // unavailable forever -- the loop makes no decisions and the colour chart stays empty.
+      // `LoopConfig.from_env` resolves this at startup; saying it here is what makes the entity
+      // ids above explicable rather than suspicious when someone opens a `.env`-configured mock.
+      + (loop.mode === 'mock'
+        ? ' <b>Simulated house</b> \u2014 it only contains <code>sensor.living_room_temperature</code>'
+          + ' and <code>light.kitchen</code>, so those are what a real-house <code>.env</code>'
+          + ' is mapped onto. Set <code>HA_MODE=rest</code> to use your own ids.'
+        : '');
   }
 }
 

@@ -1,6 +1,11 @@
 # Jev: a judgment layer for the dashboard
 
-**Status: design only. Nothing in this document is built.** This is the design record for
+**Status: partly built — the credential surface, the client and placement A are shipped.** J0, J1,
+J1a and **J2 (placement A, the decision inspector)** exist in [`flybrain/jev.py`](../flybrain/jev.py),
+are tested in `tests/test_jev.py` and `tests/test_jev_live.py`, and have a UI: click any point in
+*Colour chosen*. **Placements B and C are design only** — they are J3 and J4 in
+[`roadmap.md`](roadmap.md). Jev is **off unless `JEV_ENABLED=1`**: a key is a credential, not a
+decision to spend. Everything below is the design record for
 adding [Jev](https://docs.typesafe.ai) — TypeSafe's "System One" model — to the live view, plus
 the evaluation that says where it earns its place and where it does not.
 
@@ -527,7 +532,7 @@ systemd unit or container env block works unchanged. See [`.env.example`](../.en
 | `JEV_STRICT_MODEL` | Default `1`. Refuse an answer from a version other than the pinned one |
 | `JEV_PAINT_ACT` / `_CONFIRM` | Thresholds for a judgment that only paints a verdict on screen |
 | `JEV_LABEL_ACT` / `_CONFIRM` | The ones that matter: a wrong label silently corrupts the training set. Default act `0.95` — above the under-determined case (0.34) so it can never write, and below the top of the determined range (0.99) so a maximally determined answer can |
-| `JEV_HA_ACT` / `_CONFIRM` | Thresholds for a judgment that gates a Home Assistant action. Default act `0.98` |
+| `JEV_HA_ACTION_ACT` / `_CONFIRM` | Thresholds for a judgment that gates a Home Assistant action. Default act `0.98`. The name is derived from the tier (`ha_action`), not abbreviated — `JEV_HA_ACT` was documented here and in `.env.example` for a while and **the code never read it**, so the override was a silent no-op |
 
 ### Jevless mode, and why it is the default
 
@@ -776,13 +781,22 @@ one.
 `https://jevtypesafeai.com/api/v1/decide`, and a real three-question call costs $0.000233. What
 remains for J2 is the vocabulary and the UI, not access.
 
-**J2 — placement A, offline first**
-- [ ] Define the failure-mode vocabulary in code, including `unknown`
+**J2 — placement A — built** (the heading used to read "offline first"; the live path landed, so
+it is no longer a scoping note)
+- [x] Define the failure-mode vocabulary in code, including `unknown` — seven labels in
+      `FAILURE_MODES`, and a real captured response in `tests/fixtures/jev/`
 - [ ] Build the state from a *recorded* window via `build_state()`, and run it over
-      `data/recordings/session-20260924-135739` (37 windows, no labels) as a pipeline test
-- [ ] `POST /api/jev` on the server, backed by the client and keyed by frame `seq`
-- [ ] Clickable points in the **Colour chosen** chart; verdict beside the point, with age and
-      confidence shown
+      `data/recordings/session-20260924-135739` (37 windows, no labels) as a pipeline test.
+      **Still not done as written**, and honestly no longer on the critical path: `build_state()`
+      is built and boundary-tested against fixtures, and the inspector builds its state from the
+      loop's own history rows (`decision_state()`) rather than from a session. What the original
+      item would still buy is the one thing fixtures cannot: proof that the trimmed state is enough
+      on real recorded data, where 289 Home Assistant entities made the full state unusable.
+- [x] `POST /api/jev` on the server, backed by the client and keyed by frame `seq` — cached by
+      `seq`, so re-clicking a point is free
+- [x] Clickable points in the **Colour chosen** chart; verdict beside the point, with age and
+      confidence shown — the first real verdict was `throttled` at 0.24 confidence and the card
+      said *"not enough to call it"*
 
 **J3 — placement B**
 - [ ] Proposal panel beside the recorder controls; confirm / correct / skip

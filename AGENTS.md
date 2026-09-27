@@ -23,7 +23,7 @@ population → learned ridge readout → colour temperature (K) → HA light.tur
 ```bash
 uv sync                                        # Python 3.11 → .venv (torch + CUDA wheels)
 .venv/bin/python tools/fetch_data.py           # connectome + annotations, ~140 MB, one time
-.venv/bin/python -m pytest tests/ -q           # 503 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q           # 523 passing, 3 skipped (live Jev), no connectome needed
 
 .venv/bin/python -m flybrain.experiment        # train the readout, ~50 s
 .venv/bin/python -m flybrain.server            # dashboard + live loop
@@ -92,6 +92,8 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
 | `flybrain/ha.py` | Home Assistant adapters (mock and REST) |
 | `flybrain/env.py` | Loads `.env`, so no house-specific value is ever hardcoded or hand-sourced |
 | `flybrain/jev.py` | The optional Jev judgment layer: typed questions, confidence routing, credential surface, and the seven-label decision inspector. **Off unless `JEV_ENABLED=1`** — a key alone is not enough, because a dashboard being watched must not spend |
+| `flybrain/codec.py`, `learn.py`, `mapping.py`, `types.py`, `activity.py` | The rest of the package: spike encoding/decoding, the ridge learner, role → connectome-index resolution, the shared dataclasses every module imports, and the viewer's activity quantisation |
+| `CONTRACT.md` | **Historical, superseded.** The pre-implementation interface contract between parallel workstreams, kept as the record of what was planned. Some paths and names in it were never built (see its own status note and the annotations inline) — read `docs/architecture.md` for what actually exists |
 | `tools/fetch_data.py` | Downloads and byte-verifies the connectome and annotation tables |
 | `web/` | three.js dashboard, no bundler, three.js vendored |
 | `validation/` | Brian2 comparison and a closed-form integrator test |
@@ -127,6 +129,9 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
 ## Conventions
 
 - Python 3.11 via `uv`; `ruff check .` and `pytest` must both pass.
+- `pytest` **skips three live Jev checks by default**, because they make real paid HTTP calls. Run
+  them deliberately with `FLYBRAIN_LIVE_TESTS=1`. Everything else in the suite is offline, so
+  `pytest` never needs a key, a GPU or the connectome.
 - `.venv-validation` exists only because Brian2 does not support NumPy 2.x. Anything needing
   brian2 runs there. It is built by hand, not by `uv sync`:
   `uv venv .venv-validation --python 3.11 && uv pip install --python

@@ -147,8 +147,10 @@
         <div class="pace-power">
           <div class="kv"><span class="k">Measured duty</span><span class="v accent" id="pace-duty">—</span></div>
           <!-- Duty is measured from decisions actually made; the watts are a model of that duty,
-               so the label says so rather than implying a meter reading. -->
-          <div class="kv"><span class="k">Average power <i class="dim">model</i></span><span class="v accent" id="pace-watts" title="Modelled from the measured duty: 19 W + duty x 146 W. See docs/live-view.md for the measurement.">—</span></div>
+               so the label says so rather than implying a meter reading. It is also an average
+               over the whole run rather than the current draw: pausing freezes it, and a number
+               that stays high beside a paused brain needs to say what it is an average of. -->
+          <div class="kv"><span class="k">Average power <i class="dim">model</i></span><span class="v accent" id="pace-watts" title="Average since this process started, modelled from the duty achieved: 19 W + duty x 146 W. Not the current draw — a paused brain keeps reporting the run's average. See docs/live-view.md for the measurement.">—</span></div>
           <div class="kv"><span class="k">Energy per day</span><span class="v" id="pace-kwh">—</span></div>
           <div class="kv"><span class="k">Decisions this run</span><span class="v" id="pace-steps">—</span></div>
           <div class="power-bar" id="pace-bar"><i></i></div>

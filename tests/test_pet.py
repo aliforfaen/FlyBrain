@@ -228,6 +228,23 @@ class TestWatcher:
         assert journal["seconds_in_state"][RESTING] == pytest.approx(100.0, abs=1.0)
         assert journal["observed_s"] == pytest.approx(100.0, abs=1.0)
 
+    def test_the_state_age_is_read_rather_than_remembered(self) -> None:
+        """The state clock does not stop when windows do.
+
+        `since_s` is stamped at observation time, so using it for the *displayed* age freezes it
+        at the last window -- understating by up to a heartbeat while running, and by the whole
+        pause once stopped. `state_age` is asked the time, so it keeps counting.
+        """
+        watcher = PetWatcher()
+        watcher.observe(now=0.0, active_neurons=10_000, total_spikes=30_000)
+        stamped = watcher.observe(now=10.0, active_neurons=10_000, total_spikes=30_000)
+        assert stamped.since_s == pytest.approx(10.0)
+        # Same state, no new window: the age keeps growing, the stamp does not.
+        assert watcher.state_age(400.0) == pytest.approx(400.0)
+
+    def test_an_empty_watcher_has_no_state_age(self) -> None:
+        assert PetWatcher().state_age(1000.0) is None
+
     def test_the_journal_lists_every_state_including_the_empty_ones(self) -> None:
         """The proportion is the interesting fact; a list of only the states that happened hides it."""
         watcher = PetWatcher()
@@ -281,6 +298,17 @@ class TestSummary:
         line = summarise_journal({"observed_s": 0.0, "seconds_in_state": {}}, windows=0, labels=0,
                                  watts=None)
         assert line == "0 windows"
+
+    def test_the_wattage_says_that_it_is_an_average(self) -> None:
+        """The number is a run average, not a current draw, and it stays high when paused.
+
+        A reviewer read "~102 W" beside a Paused badge and reasonably concluded the panel was
+        lying: the card was idling. The number was true of the run and false of the moment, and
+        the fix is the word, not the arithmetic.
+        """
+        line = summarise_journal({"observed_s": 60.0, "seconds_in_state": {RESTING: 60.0}},
+                                 windows=8, labels=0, watts=103.4)
+        assert "103 W average" in line
 
 
 # ------------------------------------------------------------------ server wiring

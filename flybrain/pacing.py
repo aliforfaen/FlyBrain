@@ -291,6 +291,11 @@ class Pacer:
         Reporting the *observed* duty rather than the configured one matters once a trigger is
         in play: the whole point is that energy depends on how interesting the house has been,
         which no formula for a fixed interval can predict.
+
+        Both the duty and the watts it implies are averages **since the process started**, not
+        instantaneous readings. That distinction is invisible while the brain is stepping and
+        obvious the moment it is paused, when a true average keeps describing the run that ended
+        while the card draws idle power -- which is why the dashboard labels them as averages.
         """
         if self.flat_out:
             mode = FLAT_OUT
@@ -322,6 +327,11 @@ class Pacer:
 
     def observed_duty(self, now: float) -> float | None:
         """Steps taken times the cost of a step, over the time in which they were taken.
+
+        A **lifetime average**, and monotonically harder to move as the process ages: ten minutes
+        of flat-out work still shows as a high duty an hour after it stopped. That is the useful
+        answer to "what has this run cost me", and it is deliberately not the answer to "what is
+        it drawing now" -- nothing here can measure the latter.
 
         ``None`` until at least one step has happened, because "0% duty" from no data would be a
         claim rather than a measurement -- and the dashboard would draw it as real.

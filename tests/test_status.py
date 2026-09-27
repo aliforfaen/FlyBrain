@@ -83,6 +83,9 @@ def service(*, stale: bool = False, signals=(), channels=(), bursts=()) -> Brain
     host.loop = _StubLoop(stale=stale, signals=signals, channels=channels)
     host.pet = PetWatcher()
     host.pet_state = None
+    # `__init__` is bypassed above, so every attribute it sets has to be recreated here or the
+    # payload reads as though the feature were missing.
+    host.pet_observed_at = None
     host._prev_sensor_values = {}
     host._last_regions = [{"name": "ALPN", "spikes": 812, "rate_hz": 41.2}]
     host._bursts = list(bursts)
@@ -191,6 +194,20 @@ class TestTimeline:
         burst = next(e for e in entries if e["kind"] == "burst")
         assert "sensor.room +0.40" in burst["detail"]
 
+    def test_the_action_is_described_in_words_rather_than_a_dict_repr(self) -> None:
+        """The trail is read by someone who does not write Python, and the dict was truncated.
+
+        The old detail was ``f"{entity} · {data}"``, which rendered
+        ``light.kitchen · {'color_temp_kelvin': 4955}`` and then ellipsised it -- so the panel
+        showed Python syntax *and* hid the one number that mattered.
+        """
+        host = service()
+        entries = host.timeline()["entries"]
+        action = next(e for e in entries if e["kind"] == "action")
+        assert action["detail"] == "light.kitchen · 4120 K"
+        for syntax in ("{", "}", "'", "color_temp_kelvin"):
+            assert syntax not in action["detail"], syntax
+
     def test_every_entry_can_be_placed_on_a_timeline(self) -> None:
         """A missing timestamp means a mark the browser cannot draw, so it is filtered here."""
         host = service(bursts=[{"t": None, "changes": {}}])
@@ -208,6 +225,27 @@ class TestTimeline:
         host.loop = None
         payload = host.timeline()
         assert payload["entries"] == [] and "now" in payload
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"color_temp_kelvin": 4955}, "4955 K"),
+        ({"color_temp": 300}, "300 mired"),
+        ({"brightness_pct": 40}, "brightness 40%"),
+        ({"brightness": 128}, "brightness 128/255"),
+        # An unknown key falls through rather than being dropped: the panel is generic, and a
+        # silently missing field is how a dashboard starts lying about what it sent.
+        ({"effect": "candle"}, "effect candle"),
+        ({"color_temp_kelvin": 2700, "brightness_pct": 10}, "2700 K · brightness 10%"),
+        (None, "no data"),
+        ({}, "no data"),
+    ],
+)
+def test_action_data_is_described_without_python_syntax(data, expected: str) -> None:
+    from flybrain.server import _describe_action_data
+
+    assert _describe_action_data(data) == expected
 
 
 # ----------------------------------------------------------------------- the status
@@ -245,6 +283,48 @@ class TestStatus:
         assert pet["state"] == RESTING
         assert pet["sentence"]
         assert pet["contributors"], "a label without its contributors is a claim"
+
+    def test_the_pet_reports_how_old_its_evidence_is(self) -> None:
+        """The client needs this to stop describing a past moment as the present.
+
+        A pause stops windows, and the pet is only fed by a completed one -- so without an age the
+        panel shows a frozen "startled, running at full rate" beside a Pause button that says
+        Resume. The server is where the clock lives; the browser cannot know when the last window
+        ended.
+        """
+        host = service()
+        host.pet_state = host.pet.observe(now=time.time() - 90, active_neurons=10_000,
+                                         total_spikes=99)
+        host.pet_observed_at = time.time() - 90
+        pet = self._status(host)["pet"]
+        assert pet["observed_age_s"] == pytest.approx(90.0, abs=2.0)
+
+    def test_before_any_window_there_is_no_observation_to_age(self) -> None:
+        pet = self._status(service())["pet"]
+        assert pet["observed_age_s"] is None
+
+    def test_a_paused_brain_still_exposes_the_pet_and_its_age(self) -> None:
+        """Pausing must not blank the panel -- the observation is data, and it is the evidence
+        for the word. It has to keep being served, clearly labelled, which is what the pairing of
+        `trust.paused` with `pet.observed_age_s` gives the client."""
+        host = service()
+        host.paused = True
+        host.pet_state = host.pet.observe(now=time.time() - 600, active_neurons=10_000,
+                                         total_spikes=99)
+        host.pet_observed_at = time.time() - 600
+        payload = self._status(host)
+        assert payload["trust"]["paused"] is True
+        assert payload["pet"]["state"] == RESTING
+        assert payload["pet"]["observed_age_s"] == pytest.approx(600.0, abs=2.0)
+
+    def test_the_state_age_is_read_at_request_time_not_at_the_last_window(self) -> None:
+        """Otherwise "startled for 4s" is still on screen forty seconds later."""
+        host = service()
+        host.pet_state = host.pet.observe(now=time.time() - 120, active_neurons=10_000,
+                                         total_spikes=99)
+        host.pet_observed_at = time.time() - 120
+        pet = self._status(host)["pet"]
+        assert pet["since_s"] == pytest.approx(120.0, abs=2.0)
 
     def test_the_trust_block_answers_what_it_may_touch(self) -> None:
         trust = self._status(service())["trust"]
@@ -312,3 +392,20 @@ def test_every_vocabulary_word_has_a_colour_in_the_stylesheet(state: str) -> Non
 
     css = pathlib.Path("web/app.css").read_text(encoding="utf-8")
     assert f'data-state="{state}"' in css, state
+
+
+def test_the_paused_presentation_has_both_a_branch_and_a_style() -> None:
+    """`paused` is deliberately *not* a fifth vocabulary word -- it says the pet has stopped
+    observing, so it is a presentation built from `trust.paused` plus the observation's age.
+
+    There is no JS test harness here, so this is the only thing standing between 'the client
+    stopped drawing the paused state' and a frozen "startled" beside a Resume button -- which is
+    exactly the bug this pair of keys was added to fix.
+    """
+    import pathlib
+
+    js = pathlib.Path("web/app.js").read_text(encoding="utf-8")
+    css = pathlib.Path("web/app.css").read_text(encoding="utf-8")
+    assert "trust && trust.paused" in js
+    assert "observed_age_s" in js, "the age is what makes the frozen state honest"
+    assert 'data-state="paused"' in css

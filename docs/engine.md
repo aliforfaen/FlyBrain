@@ -220,7 +220,10 @@ predictor, and replaces `ChangeTrigger` without `pacing.py` learning anything ab
 
 The pacer reports the duty cycle it *actually* achieved, not the one its settings imply, because
 once a trigger is in play the cost depends on how interesting the house has been. That is what
-the dashboard shows.
+the dashboard shows. It is a **running average since the process started** — the honest answer to
+"what has this cost me", and deliberately not an answer to "what is it drawing now", which the
+process cannot observe about itself. Pausing does not reset it, so the panel labels it an average
+rather than leaving a high number beside a paused brain.
 
 ### Two traps
 

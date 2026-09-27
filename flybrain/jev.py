@@ -145,9 +145,13 @@ class Risk:
 #: genuinely under-determines it collapses to ~0.34. ``label``'s 0.95 therefore lets the strongest
 #: answers write while a determined-but-not-maximal 0.94 only proposes, and 0.34 never acts. The
 #: separation is wide, but a **byte-identical** request varies by up to 0.17 across calls, which is
-#: why the floors sit with margin instead of on a measured value. No placement is built yet, so
-#: nothing has exercised these against real data; every tier is overridable from the environment
-#: (``JEV_LABEL_ACT`` and friends) rather than fixed here.
+#: why the floors sit with margin instead of on a measured value. **``paint`` is the tier placement A
+#: actually uses** (J2, the decision inspector), and its first real answer landed in the middle band:
+#: `throttled` at 0.24 confidence, which `needs_human` carries to the card as "not enough to call it"
+#: rather than a label. ``label`` and ``ha_action`` belong to placements B and C, which are **not
+#: built**, so those two numbers are calibrated against captured fixtures and have never gated a real
+#: write. Every tier is overridable from the environment (``JEV_LABEL_ACT`` and friends) rather than
+#: fixed here.
 PAINT = Risk("paint", act_at=0.70, confirm_at=0.50)
 LABEL = Risk("label", act_at=0.95, confirm_at=0.80)
 HA_ACTION = Risk("ha_action", act_at=0.98, confirm_at=0.90)

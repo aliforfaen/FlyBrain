@@ -51,9 +51,11 @@ import logging
 import os
 import struct
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -117,6 +119,34 @@ def recording_meta(loop_cfg) -> dict:
     }
 
 
+def _describe_action_data(data: Mapping[str, Any] | None) -> str:
+    """The service call's payload in words, because a dict repr is a Python leak.
+
+    The memory trail used to print whatever ``last_action["data"]`` held, which put
+    ``{'color_temp_kelvin': 4955}`` on a panel designed for a non-programmer -- and then truncated
+    it, so the one number that mattered fell off the end. ``light.turn_on`` with a colour
+    temperature is the only call this loop makes; the other keys are here because the panel is
+    generic and a future action should not need this function edited to stay readable.
+    """
+    if not data:
+        # "suppressed" and "sensor_stale" actions carry an empty payload, and "{}" would be a
+        # second piece of Python syntax in the same line.
+        return "no data"
+    described: list[str] = []
+    for key, value in data.items():
+        if key == "color_temp_kelvin":
+            described.append(f"{value} K")
+        elif key == "color_temp":
+            described.append(f"{value} mired")
+        elif key == "brightness_pct":
+            described.append(f"brightness {value}%")
+        elif key == "brightness":
+            described.append(f"brightness {value}/255")
+        else:
+            described.append(f"{key} {value}")
+    return " · ".join(described)
+
+
 class BrainService:
     """Owns the simulator and the stepping loop, decoupled from the web layer."""
 
@@ -165,6 +195,11 @@ class BrainService:
         #: describing a *display* slice, not the window the colour was decoded from.
         self.pet = PetWatcher()
         self.pet_state = None
+        #: Wall clock of the last pet observation, so the dashboard can say how old it is. The
+        #: pet is only fed by a *completed* window, so pausing freezes its last state: without
+        #: this the panel presents a snapshot as if it described now, and says the brain is
+        #: running at full rate while the button beside it says Resume.
+        self.pet_observed_at: float | None = None
         #: The previous window's sensor values, for "the house moved by X".
         self._prev_sensor_values: dict[str, float] = {}
         #: The last region snapshot, so the pet's sentence can name the busiest cell class. Read
@@ -452,8 +487,11 @@ class BrainService:
         changes = sensor_deltas(self._prev_sensor_values, values)
         self._prev_sensor_values = values
         counts = np.asarray(counts)
+        # One clock reading for the observation and its timestamp: the age the dashboard reports
+        # is then exactly the time since the window this state describes.
+        now = time.time()
         observation = self.pet.observe(
-            now=time.time(),
+            now=now,
             active_neurons=int((counts > 0).sum()),
             total_spikes=int(counts.sum()),
             sensor_changes=changes,
@@ -463,6 +501,7 @@ class BrainService:
             busiest=tuple(row["name"] for row in (self._last_regions or ())[:3]),
         )
         self.pet_state = observation
+        self.pet_observed_at = now
 
     def _record_window(self, counts, window_ms: float) -> None:
         """Append one completed window to the recording, if recording is on.
@@ -819,6 +858,16 @@ class BrainService:
             "vocabulary": list(STATES),
             "honesty": HONESTY,
         }
+        # Two different ages, and the panel needs both. `since_s` is how long the current word has
+        # been the answer, read now rather than at the last observation -- the state clock does not
+        # stop when windows do, and a frozen value understates it by up to a heartbeat while
+        # running and by the entire pause once stopped. `observed_age_s` is how old the *evidence*
+        # is: zero while the brain is stepping, and unbounded while it is not, which is what lets
+        # the panel say "this is the last window" instead of describing a past moment as now.
+        state_age = self.pet.state_age(now)
+        pet["since_s"] = 0.0 if state_age is None else round(state_age, 1)
+        observed_age = None if self.pet_observed_at is None else max(0.0, now - self.pet_observed_at)
+        pet["observed_age_s"] = None if observed_age is None else round(observed_age, 1)
         config = self.loop.loop.to_dict() if self.loop is not None else {}
         will_send = bool(self.loop.loop.will_send) if self.loop is not None else False
         return {
@@ -1148,7 +1197,10 @@ class BrainService:
                             else "suppressed" if action.get("suppressed")
                             else action.get("reason") or "not sent"
                         ),
-                        "detail": f"{action.get('entity_id')} · {action.get('data') or {}}",
+                        "detail": (
+                            f"{action.get('entity_id')} · "
+                            f"{_describe_action_data(action.get('data'))}"
+                        ),
                     }
                 )
 

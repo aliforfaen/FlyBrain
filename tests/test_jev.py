@@ -196,7 +196,23 @@ class TestThresholds:
         assert JevConfig.from_env({"JEV_LABEL_ACT": "soon"}).risk("label") == LABEL
 
     def test_an_out_of_range_threshold_falls_back(self) -> None:
-        assert JevConfig.from_env({"JEV_HA_ACT": "1.4"}).risk("ha_action") == HA_ACTION
+        assert JevConfig.from_env({"JEV_HA_ACTION_ACT": "1.4"}).risk("ha_action") == HA_ACTION
+
+    def test_every_tier_reads_the_name_derived_from_its_own_name(self) -> None:
+        """The knob is ``JEV_<TIER>_ACT``, and this is what keeps the docs honest about it.
+
+        ``ha_action`` was documented -- and shipped in `.env.example` -- as **`JEV_HA_ACT`**, which
+        the code never read. The test that was supposed to cover it used the same wrong name, so it
+        asserted the default and passed whether or not the override worked. Deriving the name here
+        means renaming a tier cannot orphan a documented setting in silence.
+
+        The values differ from every default on purpose: an override that happens to equal the
+        default proves nothing.
+        """
+        for name in ("paint", "label", "ha_action"):
+            env = {f"JEV_{name.upper()}_ACT": "0.93", f"JEV_{name.upper()}_CONFIRM": "0.50"}
+            risk = JevConfig.from_env(env).risk(name)
+            assert (risk.act_at, risk.confirm_at) == (0.93, 0.50), name
 
     def test_an_unknown_tier_is_an_error_not_a_silent_default(self) -> None:
         """Silently defaulting would let a typo in a placement name pick its own threshold."""

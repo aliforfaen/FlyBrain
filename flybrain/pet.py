@@ -380,7 +380,7 @@ class PetWatcher:
             del self.state_log[: max(0, len(self.state_log) - self.log_limit)]
         self.prev_activity = int(active_neurons)
 
-        since_s = 0.0 if self.state_since is None else max(0.0, now - self.state_since)
+        since_s = self.state_age(now) or 0.0
         return PetState(
             state=state,
             sentence=sentence,
@@ -389,6 +389,18 @@ class PetWatcher:
         )
 
     # --------------------------------------------------------------- outputs
+
+    def state_age(self, now: float) -> float | None:
+        """How long the current state has been the answer, as of ``now``.
+
+        Read-time rather than observe-time, and ``None`` before the first state. The state clock
+        does not stop when windows do, so a value frozen at the last observation would understate
+        the age by up to a heartbeat while running and by the whole pause once stopped -- which is
+        exactly the case where a panel reading "startled · just changed" is hardest to trust.
+        """
+        if self.state_since is None:
+            return None
+        return max(0.0, now - self.state_since)
 
     def trail(self) -> list[dict]:
         """State changes, newest last, for the memory trail.
@@ -439,5 +451,8 @@ def summarise_journal(journal: Mapping[str, Any], *, windows: int, labels: int, 
         span = f"{seconds / 60:.0f} min" if seconds < 3600 else f"{seconds / 3600:.1f} h"
         parts.append(f"{share:.0%} of {span} resting")
     if watts is not None:
-        parts.append(f"~{watts:.0f} W")
+        # "average" is load-bearing: this is modelled from the duty achieved over the whole run,
+        # so beside a paused brain it stays high while the card actually draws idle power. Calling
+        # it a measurement without saying *of what* is how a true number reads as a false one.
+        parts.append(f"~{watts:.0f} W average")
     return " · ".join(parts)

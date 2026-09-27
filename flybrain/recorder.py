@@ -31,7 +31,6 @@ import argparse
 import json
 import logging
 import time
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
@@ -480,13 +479,3 @@ def _main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     raise SystemExit(_main())
-
-
-def _iter_recordings(root: str | Path = DEFAULT_ROOT) -> Iterator[Recording]:
-    """Yield every recording under ``root``, oldest first."""
-    base = Path(root)
-    if not base.exists():
-        return
-    for path in sorted(base.iterdir(), key=lambda p: p.stat().st_mtime):
-        if (path / META_FILE).exists():
-            yield Recording(path)

@@ -5,8 +5,12 @@ a design conversation, written down so it does not have to be re-derived. Everyt
 derived from the actual code and the actual hardware in this house; see
 [`ha-inventory.md`](ha-inventory.md) and [`wiring.md`](wiring.md).
 
-Today the live loop drives **one** channel (temperature). The visual population is wired
-(`wiring.md` maps camera motion/person to `visual`) but nothing feeds it yet.
+Today the live loop drives **one** channel by default (temperature). The visual population is
+already reachable without any of this: [`wiring.md`](wiring.md) maps `illuminance` and `motion` to
+`visual`, and `FLYBRAIN_CHANNELS=auto` attaches every pathway those rules find, so **a lux or
+motion sensor does drive real visual neurons today**. What is *not* built is what this document is
+about: an image, and the columnar structure that would make one mean something. A motion event is
+not a retina.
 
 ---
 

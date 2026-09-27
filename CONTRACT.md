@@ -110,6 +110,11 @@ codex v783 annotation table, with a curated fallback list and a cached JSON arti
 Wires encoder -> sim -> decoder -> HA, runs the "when this sensor goes, turn on this light"
 training loop, reports accuracy.
 
+> **Never built under these names.** There is no `flybrain/scenario.py` and no `BehavioralExperiment`;
+> the work landed as [`flybrain/experiment.py`](flybrain/experiment.py)'s `TemperatureColourLoop`.
+> Kept as written because this file is the record of what was *planned* — do not go looking for the
+> paths below without checking them first.
+
 ## Data
 - `vendor/fly-brain/data/2025_Connectivity_783.parquet` — columns:
   `Presynaptic_ID, Postsynaptic_ID, Presynaptic_Index, Postsynaptic_Index, Connectivity, Excitatory, Excitatory x Connectivity`
