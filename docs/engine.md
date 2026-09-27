@@ -103,14 +103,20 @@ about stepping it faster. This section is about stepping it *less*, which requir
 ### Where the energy actually goes
 
 Measured here: one decision is 300 ms of brain time, which costs **~2.3 s of continuous GPU
-work** at 0.13× realtime. Flat out that is **~165 W continuously** — and the shipped `.env`
-combines `FLYBRAIN_ALWAYS_ON=1` with an unset `FLYBRAIN_INTERVAL_S`, which is precisely that:
-full power, twenty-four hours a day, whether or not anything is watching.
+work** at 0.13× realtime. Flat out that is **~165 W continuously**. The shipped code no longer
+does that by default — `LoopConfig.interval_s` defaults to **15 s**, so an unconfigured install
+paces itself. Setting `FLYBRAIN_INTERVAL_S=0` puts flat out back, which is what the demo wants
+and what the live view was originally built around.
+
+*(This default was changed after the fact, and the change is worth understanding rather than
+just noting: the README already described the loop as "paced by a wall-clock interval rather than
+run flat out" while the code default was 0, so the documentation and the behaviour had been
+disagreeing about what a fresh install costs.)*
 
 `interval_s` gates the *decision*, and the loop genuinely does not advance the brain while it
 waits, so average power falls roughly with the duty cycle. The duty cycle is
 `2.34 s / interval_s`, and the measured model is `mean ≈ 19 W + duty × 146 W` — checked against
-the hardware in [`live-view.md`](live-view.md#why-flat-out-is-the-default-and-why-you-should-change-it),
+the hardware in [`live-view.md`](live-view.md#why-the-default-is-paced),
 which owns the measurements:
 
 | `interval_s` | Duty cycle | Mean power | Energy per day |
@@ -183,6 +189,39 @@ it was written for.
 Jev's part stays what [`jev.md`](jev.md) says it is: judging the windows the trigger selects,
 not selecting them.
 
+### What was actually built
+
+**Status: implemented** in [`flybrain/pacing.py`](../flybrain/pacing.py), which is pure logic over
+an injected clock — no torch, no numpy — so the cadence is testable without a GPU, and energy
+figures are not measured there because they cannot be.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `FLYBRAIN_INTERVAL_S` | `15` | The heartbeat: the **maximum** gap between decisions. `0` is flat out |
+| `FLYBRAIN_POLL_S` | `5` | How often to re-read the sensors while waiting. Costs no GPU time |
+| `FLYBRAIN_BURST_S` | `10` | How long to run at full rate once something happens |
+| `FLYBRAIN_TRIGGER_DELTA` | `0` | How far the primary sensor must move, in its own units, to count as an event. `0` disables the trigger |
+
+One field, one meaning: `interval_s` is the ceiling in every mode. A trigger can only make
+decisions *sooner*. A second, overlapping "mode" knob would be a way to express the same thing
+twice, which is how the `DEAD_STATES` bug happened in the first place.
+
+The v1 trigger is a comparison, and is honest about its limits: the primary sensor by **value**
+(in degrees Celsius for the temperature wiring) and motion/contact by **state string**. The state
+string is used only for genuinely discrete kinds, because Home Assistant reports a thermometer's
+state as its value — treating `"20.0" → "20.1"` as an event would make the trigger fire
+constantly and pacing would silently become "always burst", the most expensive possible
+misreading of the setting. Illuminance and humidity are *not* watched in v1; the multivariate
+answer is A3.
+
+The seam for A3 is the `Trigger` protocol. A trigger is an injected callable, so an A3 novelty
+trigger is constructed in `server.py` where the reservoir is in scope, closes over its own fitted
+predictor, and replaces `ChangeTrigger` without `pacing.py` learning anything about the brain.
+
+The pacer reports the duty cycle it *actually* achieved, not the one its settings imply, because
+once a trigger is in play the cost depends on how interesting the house has been. That is what
+the dashboard shows.
+
 ### Two traps
 
 **The pacing configuration is part of the training regime.** `AGENTS.md` #2 — train and run in
@@ -190,13 +229,27 @@ the same regime — applies here in a way that is easy to miss. Event-weighted w
 *different distribution* from fixed-interval ones, so a readout trained on bursts and then run
 against a steady heartbeat loses accuracy the same silent way as one trained from rest and run
 continuously. The pacing config therefore belongs in the recording's `meta.json` and has to be
-reproduced at inference time. It is not a runtime detail.
+reproduced at inference time. It is not a runtime detail. It is now written there automatically
+(`server.recording_meta`), and a test asserts the round trip reaches the file.
 
 **Pacing is visible, and that is a real trade.** With `interval_s` set, the 3D view advances in
-a burst and then holds still. `paintStaleness()` already reports that as "waiting" rather than
-"stalled", because the view was written expecting it. Constant motion is a *display* preference,
-not a modelling requirement — and bursting on novelty arguably makes the view more interesting
-than uniform churn, because it moves exactly when the house does.
+a burst and then holds still. The view reports that as **waiting**, and as **bursting** while a
+burst is running, rather than "stalled" — it was written expecting the first, and the second was
+added with this scheme so that "the house just did something" and "the GPU is idle" look
+different. Constant motion is a *display* preference, not a modelling requirement — and bursting
+on novelty arguably makes the view more interesting than uniform churn, because it moves exactly
+when the house does.
+
+### One consequence that is easy to miss
+
+Smoothing is measured in **windows**, not wall clock: `smooth()` steps by `window_ms`
+(`flybrain/loop.py`). At `smooth_ms=5000` that is about 16 windows, which at a 15 s heartbeat is
+roughly **four minutes** of wall-clock averaging. So a paced loop is slower to react to a real
+change than a flat-out one, and under a burst it is faster again — the response time becomes
+non-stationary. The *readout* is unaffected (each decision still consumes 300 ms of brain time,
+so the per-window input distribution is identical), which is why changing the default does not
+invalidate the trained colour readout. But the feel of the light does change, and that trade is
+the reason `interval_s` remains a control rather than a constant.
 
 ## Gain calibration
 

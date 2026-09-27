@@ -68,6 +68,37 @@ MAGIC = 0x4642524E  # "FBRN"
 HEADER = struct.Struct("<III f II")
 
 
+def recording_meta(loop_cfg) -> dict:
+    """The provenance a recording needs in order to be reproducible later.
+
+    A module-level function rather than an inline dict inside ``_start_recorder`` for one
+    reason: ``_start_recorder`` needs a loaded brain and a live Home Assistant to reach, so
+    anything written there is untestable. This is the part that can be wrong silently.
+
+    **Why pacing is in here at all.** ``AGENTS.md`` #2 is "train and run in the same regime".
+    Pacing looks like a runtime detail and is not: with a trigger enabled, a recording is a
+    sample of *events*, while a fixed heartbeat records a sample of *time*. Those are different
+    distributions, so a readout fitted on one and run against the other loses accuracy in
+    exactly the silent way the rest-basin bug did. Recording the pacing config is what makes
+    that checkable instead of remembered.
+
+    ``session-20260924-135739`` predates this and is implicitly flat out; it is left as it is
+    rather than rewritten, because inventing a pacing config for a file that did not have one
+    would be a worse lie than the omission.
+    """
+    return {
+        "temperature_entity": loop_cfg.temperature_entity,
+        "light_entity": loop_cfg.light_entity,
+        "mode": loop_cfg.mode,
+        "pacing": {
+            "heartbeat_s": loop_cfg.interval_s,
+            "poll_s": loop_cfg.poll_s,
+            "burst_s": loop_cfg.burst_s,
+            "trigger_delta": loop_cfg.trigger_delta,
+        },
+    }
+
+
 class BrainService:
     """Owns the simulator and the stepping loop, decoupled from the web layer."""
 
@@ -100,8 +131,6 @@ class BrainService:
         self._last_mock_tick: float | None = None
         #: Extra sensory channels are discovered once, from the first real read of the house.
         self._channels_ready = False
-        #: When the last decision completed, for wall-clock pacing (see ``interval_s``).
-        self._last_decision_at: float | None = None
 
     # ----------------------------------------------------------------- setup
 
@@ -178,11 +207,7 @@ class BrainService:
                 DEFAULT_ROOT / name,
                 feature_dim=int(self.loop.readout_indices.size),
                 window_ms=float(self.loop.config.window_ms),
-                meta={
-                    "temperature_entity": loop_cfg.temperature_entity,
-                    "light_entity": loop_cfg.light_entity,
-                    "mode": loop_cfg.mode,
-                },
+                meta=recording_meta(loop_cfg),
             )
         except Exception:
             logger.exception("could not open a recording; continuing without one")
@@ -225,13 +250,21 @@ class BrainService:
 
         The mock's sensors evolve in *simulated* minutes, so without this the temperature
         would never change and the dashboard would have nothing to show.
+
+        The clamp is the heartbeat rather than a fixed five seconds, and that matters because
+        this is called from :meth:`begin_window` - which, once pacing is on, only runs when a
+        decision is made. With a fixed 5 s clamp and a 15 s heartbeat, the simulated house would
+        advance at a third of real time and the demo would appear to have slowed down. It is a
+        demo-only concern, but the mock is the default mode, so it is the first thing anyone
+        sees.
         """
         ha = getattr(self.loop, "ha", None)
         if ha is None or self.loop_cfg is None or not self.loop_cfg.is_mock:
             return
         now = time.monotonic()
         if self._last_mock_tick is not None:
-            ha.advance(max(0.0, min(now - self._last_mock_tick, 5.0)))
+            limit = max(5.0, float(self.loop_cfg.interval_s))
+            ha.advance(max(0.0, min(now - self._last_mock_tick, limit)))
         self._last_mock_tick = now
 
     async def begin_window(self) -> None:
@@ -293,11 +326,19 @@ class BrainService:
             entry = await self.loop.decide(counts, window_ms)
         except Exception:
             logger.exception("control decision failed")
+            # Tell the pacer anyway. Otherwise a persistent decode failure leaves the heartbeat
+            # overdue, `should_step` stays true, and the loop retries at the frame rate - which
+            # turns one broken decision into a log storm at 20 lines a second. Backing off to
+            # the heartbeat is both quieter and cheaper.
+            self.loop.pacer.note_step(time.monotonic())
             return
         # Record before begin_window(): the sensor snapshot must be the one that *drove* the
         # window just decoded, not the next window's reading.
         self._record_window(counts, window_ms)
-        self._last_decision_at = time.monotonic()
+        # Tell the pacer a decision actually happened. This is what ends a burst's immediate
+        # steps and restarts the heartbeat, so it must happen only after a real decode - not
+        # when a window is merely accumulated, and not when the decision raised.
+        self.loop.pacer.note_step(time.monotonic())
         if entry is not None:
             await self.broadcast_json({"type": "loop", "loop": self.loop.snapshot()})
         await self.begin_window()
@@ -330,15 +371,29 @@ class BrainService:
             await asyncio.sleep(1.0 / fps)
             if self.paused or not (self._clients or self.always_on):
                 continue
-            # Wall-clock pacing. Running flat out holds the GPU at ~165 W continuously,
-            # because the brain steps as fast as it can to advance brain time. A context
-            # layer needs a decision every few seconds at most, so pace the *decisions* and
-            # let the GPU idle in between: average power falls roughly with the duty cycle.
-            interval = float(self.loop.loop.interval_s) if self.loop is not None else 0.0
-            if interval > 0.0 and self._last_decision_at is not None:
-                remaining = interval - (time.monotonic() - self._last_decision_at)
-                if remaining > 0.0:
-                    await asyncio.sleep(min(remaining, interval))
+            # Wall-clock pacing. Running flat out holds the GPU at ~165 W continuously, because
+            # the brain steps as fast as it can to advance brain time. A context layer needs a
+            # decision every few seconds at most, so pace the *decisions* and let the GPU idle in
+            # between: average power falls roughly with the duty cycle.
+            #
+            # The pacer refines this from "one every N seconds" into "one every N seconds, or
+            # now if the house did something" - see flybrain/pacing.py. Polling is a sensor read
+            # only, so it costs no GPU time; it is what lets a change be noticed before the next
+            # heartbeat was due.
+            pacer = self.loop.pacer if self.loop is not None else None
+            if pacer is not None:
+                now = time.monotonic()
+                if pacer.should_poll(now):
+                    try:
+                        # store=False: this read happens *between* decisions, and the snapshot
+                        # the recorder writes must stay the reading that drove the window.
+                        signals = await self.loop.read_signals(store=False)
+                    except Exception:
+                        logger.exception("pacing poll failed; waiting for the heartbeat")
+                    else:
+                        if pacer.note_poll(now, signals):
+                            logger.info("house changed; bursting for %.0fs", pacer.burst_s)
+                if not pacer.should_step(now):
                     continue
             try:
                 done = False
@@ -408,6 +463,12 @@ class BrainService:
         self.paused = bool(value)
         if self.paused:
             self.release_gpu_cache()
+            if self.loop is not None:
+                # Do not let a pause bank burst credit, and do not fire a step the instant it
+                # resumes. The store of previous sensor readings is deliberately kept: if the
+                # house changed while we were not looking, that is a real event and the first
+                # poll after resuming should catch it.
+                self.loop.pacer.on_pause(time.monotonic())
         return self.paused
 
 

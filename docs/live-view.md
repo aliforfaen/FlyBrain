@@ -341,7 +341,10 @@ swatch cannot disagree.
 | `FLYBRAIN_RECORD` | `0` | Record every completed window to `data/recordings/` |
 | `FLYBRAIN_RECORD_NAME` | timestamped | Name for that recording |
 | `FLYBRAIN_CHANNELS` | `off` | `auto` discovers and drives every sensory pathway the house has, not just temperature. See the caveat below |
-| `FLYBRAIN_INTERVAL_S` | `0` | Wall-clock seconds between decisions. `0` runs flat out (~165 W); `15` averages ~40 W |
+| `FLYBRAIN_INTERVAL_S` | `15` | The heartbeat: the **longest** wall-clock gap between decisions. `0` runs flat out (~165 W); `15` averages ~40 W |
+| `FLYBRAIN_POLL_S` | `5` | While waiting, how often to re-read the sensors looking for a change. Reading a sensor costs no GPU time. `0` disables the trigger |
+| `FLYBRAIN_BURST_S` | `10` | How long to keep running at full rate once a change fires the trigger |
+| `FLYBRAIN_TRIGGER_DELTA` | `0` | How far the primary sensor must move, **in its own units**, to count as an event. `0` turns the trigger off, leaving a plain heartbeat |
 
 All of it can also be changed at runtime from the dashboard, which overrides the environment.
 
@@ -426,11 +429,12 @@ Measured on the RTX 3070 in this machine, sampling `nvidia-smi` power draw once 
 
 CPU is a non-issue throughout: **0.1%** of one core, live or paused.
 
-### Why flat out is the default, and why you should change it
+### Why the default is paced
 
-The loop advances brain time as fast as the GPU allows, so it holds the card at **165 W
-continuously**. That is right for watching the demo and wrong for a house: nothing in a room
-changes meaningfully in two seconds.
+Flat out holds the card at **165 W continuously** — about **4 kWh a day** whether or not anything
+is watching. That is right for watching the demo and wrong for a house: nothing in a room changes
+meaningfully in two seconds. So `interval_s` defaults to **15 s**, and `FLYBRAIN_INTERVAL_S=0`
+puts flat out back for the demo.
 
 The arithmetic is simple, and worth stating because the window size is what makes it
 non-obvious. One decision consumes a **300 ms window of brain time**, which at ~0.78 ms per
@@ -447,11 +451,38 @@ dashboard can show the cost next to the control.
 `interval_s` is adjustable live from the dashboard (*Light connection* → *How often it
 decides*), which displays the estimated wattage as you change it.
 
-**The next step past a fixed interval is adaptive pacing** — a slow heartbeat plus a burst when
-the house is actually interesting, so energy scales with activity instead of with the clock. The
-design, the reason a heartbeat is not optional, and why the trigger should be the reservoir's own
-prediction error (roadmap A3) rather than a model are in
+### Past a fixed interval: the heartbeat plus a burst
+
+**Built.** A fixed interval forces a straight choice between energy and data: pace hard and you
+miss events, pace gently and you burn watts on a room that is not doing anything. Adaptive pacing
+escapes that by asking *when a window is worth taking* instead.
+
+- **Heartbeat** — a decision every `interval_s` no matter what. Not padding: the brain is never
+  reset, so this keeps the reservoir in the regime the readout was fitted on, and it produces the
+  **quiet** windows a `house_activity` readout needs as negatives. Without it, recording only
+  ever captures the house being busy.
+- **Trigger** — while waiting, the loop re-reads the sensors every `poll_s`. Reading a sensor
+  costs no GPU time. If the primary sensor moves by more than `trigger_delta`, or a motion or
+  contact sensor changes state, the loop runs at full rate for `burst_s` so the event is captured
+  in detail.
+
+The trigger is a **comparison, not a model**, deliberately — "did something change?" is a
+threshold question and a threshold wins on it. It watches the primary sensor by value and
+discrete sensors by state; illuminance and humidity are not watched in v1. The intended upgrade
+is the reservoir's own prediction error (roadmap A3), which is multivariate and needs no
+threshold in degrees Celsius. It drops into the same seam — see
 [`engine.md`](engine.md#idle-cost-and-adaptive-pacing).
+
+Two things to know before turning it on:
+
+- **Pacing is part of the training regime** (`AGENTS.md` #2). With a trigger on, a recording is a
+  sample of *events*; with a plain heartbeat it is a sample of *time*. The pacing configuration is
+  written into each recording's `meta.json` automatically, and has to be reproduced when a readout
+  is re-fitted later.
+- **Smoothing is counted in windows, not seconds.** `smooth_ms=5000` is ~16 windows, which at a
+  15 s heartbeat is about four minutes of wall-clock averaging. Under a burst it is fast again. So
+  the light's *feel* changes with pacing even though the readout does not. If it feels sluggish,
+  lower `smooth_ms` rather than lowering `interval_s` — the second one costs watts.
 
 ### Pause
 
@@ -474,11 +505,19 @@ more than the memory is worth.
 - With pacing on, frames are *supposed* to be absent between decisions. The dashboard's
   staleness indicator accounts for this and reads **waiting** rather than crying "stalled" at
   configured behaviour — a regression that appeared the moment pacing was added.
+- It also reads **bursting** while a trigger-driven burst is running. That distinction matters
+  more than it looks: "the GPU is idle, as configured" and "the house just did something" are
+  very different things to see, and a view that shows both as a still picture would hide the
+  whole mechanism.
 - The loop already does no GPU work at all when paused or when no client is connected and
   `FLYBRAIN_ALWAYS_ON` is unset.
 - Pacing also dilates brain time relative to wall clock: 300 ms of brain time per 15 s is
   **0.02× realtime** rather than 0.13×. Fine for context, and the same knob discussed in
   [`roadmap.md`](roadmap.md#6-three-honest-constraints).
+- A poll passes `store=False` to `read_signals`. The snapshot the recorder writes must stay the
+  reading that *drove* the window; a poll happens between decisions, so letting it become
+  `last_signals` would pair a later reading with an earlier window — correct row counts, wrong
+  data. There is a test, because nothing else would notice.
 
 ## Ideas for the viewer that are not built
 

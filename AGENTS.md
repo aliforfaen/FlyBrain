@@ -23,7 +23,7 @@ population → learned ridge readout → colour temperature (K) → HA light.tur
 ```bash
 uv sync                                        # Python 3.11 → .venv (torch + CUDA wheels)
 .venv/bin/python tools/fetch_data.py           # connectome + annotations, ~140 MB, one time
-.venv/bin/python -m pytest tests/ -q           # 197 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q           # 252 tests, no connectome needed
 
 .venv/bin/python -m flybrain.experiment        # train the readout, ~50 s
 .venv/bin/python -m flybrain.server            # dashboard + live loop
@@ -79,6 +79,7 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
 | `flybrain/sim.py` | Connectome as a sparse LIF network. The physics. |
 | `flybrain/experiment.py` | Trains the colour readout offline |
 | `flybrain/loop.py` | Runs it live: sensor → brain → colour → HA action |
+| `flybrain/pacing.py` | When the brain is worth stepping: the heartbeat, the burst, the change trigger |
 | `flybrain/wiring.py` | Which HA entity drives which fly sensory pathway |
 | `flybrain/recorder.py` | Records every window so new readouts can be trained later |
 | `flybrain/server.py` | FastAPI dashboard + the loop's clock |

@@ -621,7 +621,14 @@ function paintStaleness(now) {
   // behaviour. Only warn once the gap exceeds what the pacing actually asks for.
   const interval = Number(state.loop && state.loop.settings && state.loop.settings.interval_s) || 0;
   const budget = 3000 + interval * 1000 * 1.5;
-  if (age <= budget) { tag.textContent = interval > 0 ? 'waiting' : 'live'; return; }
+  if (age <= budget) {
+    // "waiting" is the heartbeat and "bursting" is the house doing something. Both are
+    // configured behaviour, so neither should read as a fault.
+    const mode = state.loop && state.loop.pacing && state.loop.pacing.mode;
+    if (mode === 'burst') { tag.textContent = 'bursting'; return; }
+    tag.textContent = interval > 0 ? 'waiting' : 'live';
+    return;
+  }
   tag.textContent = `stalled ${(age / 1000).toFixed(1)}s`;
 }
 
@@ -963,11 +970,27 @@ function paintConnect(loop) {
   set('#smooth', (Number(s.smooth_ms) / 1000).toFixed(1));
   set('#deadband', Math.round(s.deadband_k));
   set('#interval', Number(s.interval_s ?? 0).toFixed(0));
+  set('#poll', Number(s.poll_s ?? 0).toFixed(0));
+  set('#burst', Number(s.burst_s ?? 0).toFixed(0));
+  set('#trigger', Number(s.trigger_delta ?? 0).toFixed(1));
   const pace = $('#pace-note');
   if (pace) {
     const iv = Number(s.interval_s ?? 0);
-    // Say what it actually costs, since that is the reason the control exists.
-    pace.textContent = iv <= 0 ? 'flat out · ~165 W' : `every ${iv}s · ~${Math.round(19 + Math.min(1, 2.34 / iv) * 146)} W`;
+    const trig = Number(s.trigger_delta ?? 0);
+    // Say what it actually costs, since that is the reason the control exists. With a trigger
+    // the cost depends on how interesting the house has been, so prefer the *observed* duty
+    // cycle the pacer reports over a formula that assumes a fixed interval.
+    const observed = state.loop && state.loop.pacing && state.loop.pacing.observed_watts;
+    if (iv <= 0) {
+      pace.textContent = 'flat out · ~165 W';
+    } else if (trig > 0) {
+      const base = Math.round(19 + Math.min(1, 2.34 / iv) * 146);
+      pace.textContent = observed == null
+        ? `every ${iv}s + bursts · ~${base} W at rest`
+        : `every ${iv}s + bursts · ~${Math.round(observed)} W measured`;
+    } else {
+      pace.textContent = `every ${iv}s · ~${Math.round(19 + Math.min(1, 2.34 / iv) * 146)} W`;
+    }
   }
 
   const inv = !!s.invert;
@@ -1056,6 +1079,9 @@ function buildConnectUI() {
     ['#smooth', 'smooth_ms', 1000],
     ['#deadband', 'deadband_k', 1],
     ['#interval', 'interval_s', 1],
+    ['#poll', 'poll_s', 1],
+    ['#burst', 'burst_s', 1],
+    ['#trigger', 'trigger_delta', 1],
   ]) {
     const el = $(id);
     if (!el) continue;

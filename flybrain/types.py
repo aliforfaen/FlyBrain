@@ -52,6 +52,32 @@ class Signal:
     attributes: dict = field(default_factory=dict)
 
 
+def signal_is_dead(signal: Signal | None) -> bool:
+    """True when a signal is missing, or carries no usable reading.
+
+    Two checks, because they catch different things and neither alone is enough:
+
+    * the ``state`` string catches the literal values Home Assistant reports for a sensor
+      that is offline, unknown or never seen;
+    * the ``unavailable`` attribute is set by ``HAClient._parse_state`` whenever the state is
+      dead **or** the value failed to parse, so it also catches a state that is present but
+      not a number. Checking only the string would let that case through as the ``0.0``
+      fallback.
+
+    This lives beside :class:`Signal` rather than in the loop because it is a statement about
+    the type, not about the loop's policy — and because both the loop and the pacing trigger
+    need it, so putting it in either one would make the other import it in a circle. It exists
+    at all because the temperature path used to check only that the entity was *present*, while
+    the extra-channel path two lines below checked the state: an ``unavailable`` thermometer was
+    therefore driven as a genuine 0 °C reading. See :data:`DEAD_STATES`.
+    """
+    if signal is None:
+        return True
+    if signal.attributes.get("unavailable"):
+        return True
+    return signal.state.strip().lower() in DEAD_STATES
+
+
 @dataclass
 class Action:
     """One Home Assistant service call proposed by the brain."""

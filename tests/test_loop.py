@@ -366,14 +366,40 @@ class TestFromEnv:
 class TestPacing:
     """`interval_s` is the efficiency knob: it decides what it costs to leave this running."""
 
-    def test_flat_out_by_default(self) -> None:
-        assert LoopConfig().interval_s == 0.0
+    def test_paced_by_default(self) -> None:
+        """Flat out holds the GPU at ~165 W (~4 kWh/day); a room does not change that fast.
+
+        This used to assert 0.0, i.e. that the shipped default burned full power
+        twenty-four hours a day. The README already described the loop as paced, so the
+        code and its own documentation disagreed.
+        """
+        assert LoopConfig().interval_s == 15.0
 
     def test_interval_comes_from_the_environment(self) -> None:
         assert LoopConfig.from_env({"FLYBRAIN_INTERVAL_S": "15"}).interval_s == 15.0
 
-    def test_bad_interval_falls_back_to_flat_out(self) -> None:
-        assert LoopConfig.from_env({"FLYBRAIN_INTERVAL_S": "soon"}).interval_s == 0.0
+    def test_zero_still_means_flat_out(self) -> None:
+        """The demo behaviour stays reachable, it is just no longer what you get by accident."""
+        assert LoopConfig.from_env({"FLYBRAIN_INTERVAL_S": "0"}).interval_s == 0.0
+
+    def test_bad_interval_falls_back_to_the_default(self) -> None:
+        """A typo in a unit file must not take the loop down.
+
+        It also must not silently *raise* the cost: falling back to the default (paced)
+        rather than to flat out means a misspelled `FLYBRAIN_INTERVAL_S` in a systemd unit
+        degrades to the cheap behaviour instead of the expensive one.
+        """
+        assert LoopConfig.from_env({"FLYBRAIN_INTERVAL_S": "soon"}).interval_s == 15.0
+
+    def test_trigger_settings_come_from_the_environment(self) -> None:
+        cfg = LoopConfig.from_env(
+            {"FLYBRAIN_POLL_S": "2.5", "FLYBRAIN_BURST_S": "30", "FLYBRAIN_TRIGGER_DELTA": "0.4"}
+        )
+        assert (cfg.poll_s, cfg.burst_s, cfg.trigger_delta) == (2.5, 30.0, 0.4)
+
+    def test_the_trigger_is_off_by_default(self) -> None:
+        """Adaptive pacing is opt-in: with `trigger_delta` at 0 this is a plain heartbeat."""
+        assert LoopConfig().trigger_delta == 0.0
 
     def test_interval_survives_a_settings_round_trip(self) -> None:
         """The dashboard sends this as a patch, so `apply` must accept it."""
@@ -381,3 +407,10 @@ class TestPacing:
         cfg.apply({"interval_s": 20})
         assert cfg.interval_s == 20.0
         assert cfg.to_dict()["interval_s"] == 20.0
+
+    def test_the_pacing_settings_reach_the_dashboard_payload(self) -> None:
+        cfg = LoopConfig.from_env({"FLYBRAIN_TRIGGER_DELTA": "0.5"})
+        payload = cfg.to_dict()
+        for key in ("interval_s", "poll_s", "burst_s", "trigger_delta"):
+            assert key in payload
+        assert payload["trigger_delta"] == 0.5

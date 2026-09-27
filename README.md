@@ -13,7 +13,7 @@ in a fly brain knows what a kitchen light is — that mapping is ours, and the c
 
 ![Python](https://img.shields.io/badge/python-3.11-3776ab)
 ![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-ee4c2c)
-![Tests](https://img.shields.io/badge/tests-197%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-252%20passing-brightgreen)
 ![Licence](https://img.shields.io/badge/licence-MIT%20code%20%2F%20CC%20BY--NC%204.0%20data-lightgrey)
 
 ![The FlyBrain dashboard: a 3D view of 138,639 neurons with live control panels](docs/images/dashboard.png)
@@ -69,7 +69,7 @@ temperature swings between about 11 °C and 34 °C on a three-minute cycle and y
 light follow it within a minute.
 
 ```bash
-.venv/bin/python -m pytest tests/ -q      # 197 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q      # 252 tests, no connectome needed
 .venv/bin/python -m flybrain.wiring       # propose a pathway map for your own house
 ```
 
@@ -146,16 +146,22 @@ pins the integrator itself: one synaptic event of weight `w` must deflect the me
 ## What it costs to leave running
 
 One decision costs ~2.3 s of GPU work, so the loop is paced by a wall-clock interval rather than
-run flat out. Measured on an RTX 3070:
+run flat out — the default is one decision every **15 s**. Measured on an RTX 3070:
 
 | Mode | Mean power |
 |---|---|
 | Flat out | ~165 W |
 | One decision every 5 s | ~86 W |
-| **One decision every 15 s** | **~40 W** |
+| **One decision every 15 s (the default)** | **~40 W** |
 | Paused | ~19 W |
 
-CPU stays at 0.1% throughout; this is entirely GPU. The interval is adjustable live in the
+Past a fixed interval, the loop can also **burst on a change**: while it waits, it re-reads the
+sensors (free — no GPU time), and if the room moves enough it runs at full rate for a few seconds
+to capture the event rather than sample it once. The heartbeat still guarantees a decision either
+way, which is what keeps the *quiet* windows coming. Off by default
+(`FLYBRAIN_TRIGGER_DELTA`), documented in [`docs/engine.md`](docs/engine.md#idle-cost-and-adaptive-pacing).
+
+CPU stays at 0.1% throughout; this is entirely GPU. Pacing is adjustable live in the
 dashboard, and the pause button (or space bar, or `POST /api/pause`) drops the card to idle in
 about a second. More in [`docs/engine.md`](docs/engine.md).
 

@@ -186,3 +186,66 @@ def test_meta_records_the_extra_context(tmp_path) -> None:
     meta = open_recording(tmp_path / "r11").meta
     assert meta["roles"] == ["visual"] and meta["rev"] == "abc"
     assert meta["window_ms"] == 300.0
+
+
+# --------------------------------------------------- the provenance a recording carries
+
+
+class TestRecordingProvenance:
+    """Pacing is part of the training regime, so it belongs in the recording, not in a note.
+
+    ``AGENTS.md`` #2 is "train and run in the same regime". With a change trigger enabled, a
+    recording is a sample of *events*; with a plain heartbeat it is a sample of *time*. Those are
+    different distributions, and a readout fitted on one and run against the other loses accuracy
+    in exactly the silent way the rest-basin bug did. The check has to be mechanical.
+    """
+
+    def test_the_meta_includes_the_pacing_configuration(self) -> None:
+        from flybrain.loop import LoopConfig
+        from flybrain.server import recording_meta
+
+        cfg = LoopConfig(interval_s=60.0, poll_s=5.0, burst_s=10.0, trigger_delta=0.3)
+        pacing = recording_meta(cfg)["pacing"]
+        assert pacing == {
+            "heartbeat_s": 60.0,
+            "poll_s": 5.0,
+            "burst_s": 10.0,
+            "trigger_delta": 0.3,
+        }
+
+    def test_the_meta_still_carries_what_it_always_did(self) -> None:
+        """Adding a key must not quietly drop the entity ids a recording is useless without."""
+        from flybrain.loop import LoopConfig
+        from flybrain.server import recording_meta
+
+        cfg = LoopConfig(temperature_entity="sensor.hall", light_entity="light.lamp")
+        meta = recording_meta(cfg)
+        assert meta["temperature_entity"] == "sensor.hall"
+        assert meta["light_entity"] == "light.lamp"
+        assert meta["mode"] == "mock"
+
+    def test_the_pacing_config_reaches_the_file(self, tmp_path) -> None:
+        """The round trip, not just the dictionary: this is what a later refit will read."""
+        from flybrain.loop import LoopConfig
+        from flybrain.server import recording_meta
+
+        cfg = LoopConfig(trigger_delta=0.4, interval_s=30.0)
+        root = tmp_path / "paced"
+        with Recorder(root, 2, 300.0, meta=recording_meta(cfg)):
+            pass
+        meta = open_recording(root).meta
+        assert meta["pacing"]["trigger_delta"] == 0.4
+        assert meta["pacing"]["heartbeat_s"] == 30.0
+
+    def test_a_fixed_heartbeat_is_still_recorded_explicitly(self) -> None:
+        """`trigger_delta: 0` is a meaningful value, not a missing one.
+
+        A readout fitted on a plain heartbeat is only valid at that heartbeat, so the number has
+        to be in the file even when the trigger is off.
+        """
+        from flybrain.loop import LoopConfig
+        from flybrain.server import recording_meta
+
+        pacing = recording_meta(LoopConfig())["pacing"]
+        assert pacing["trigger_delta"] == 0.0
+        assert pacing["heartbeat_s"] == 15.0

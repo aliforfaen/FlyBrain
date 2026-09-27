@@ -43,36 +43,13 @@ from flybrain.experiment import (
     rate_for_temperature,
 )
 from flybrain.mapping import RoleResolver
-from flybrain.types import DEAD_STATES, Action, Signal, coerce_patch
+from flybrain.pacing import Pacer
+from flybrain.types import Action, Signal, coerce_patch, signal_is_dead
 
 logger = logging.getLogger(__name__)
 
 READOUT_FILE = "colour_readout.npz"
 META_FILE = "colour_meta.json"
-
-
-def _signal_is_dead(signal: Signal | None) -> bool:
-    """True when a signal is missing, or carries no usable reading.
-
-    Two checks, because they catch different things and neither alone is enough:
-
-    * the ``state`` string catches the literal values Home Assistant reports for a sensor
-      that is offline, unknown or never seen;
-    * the ``unavailable`` attribute is set by ``HAClient._parse_state`` whenever the state is
-      dead **or** the value failed to parse, so it also catches a state that is present but
-      not a number. Checking only the string would let that case through as the ``0.0``
-      fallback.
-
-    This helper exists because the temperature path used to check only that the entity was
-    *present*, while the extra-channel path two lines below checked the state. An
-    ``unavailable`` thermometer was therefore driven as a genuine 0 °C reading. See
-    ``types.DEAD_STATES`` for why the constant lives in one place now.
-    """
-    if signal is None:
-        return True
-    if signal.attributes.get("unavailable"):
-        return True
-    return signal.state.strip().lower() in DEAD_STATES
 
 
 class MissingReadout(RuntimeError):
@@ -123,12 +100,35 @@ class LoopConfig:
     #: spammed with changes nobody can see. 0 sends on every decision.
     deadband_k: float = 0.0
 
-    #: Wall-clock seconds to allow between decisions. 0 means "as fast as the GPU allows",
-    #: which is what the demo wants and what the live view was built around. Measured on an
-    #: RTX 3070, running flat out holds ~165 W continuously; a decision is only needed every
-    #: few seconds for a context layer, so setting this to 5 idles between windows and cuts
-    #: average power by roughly the duty cycle. This is the single biggest efficiency knob.
-    interval_s: float = 0.0
+    #: Maximum wall-clock seconds between decisions - the **heartbeat**. 0 means "as fast as the
+    #: GPU allows", which is what the demo wants; the default is paced because nothing in a room
+    #: changes meaningfully in two seconds, and flat out holds an RTX 3070 at ~165 W continuously
+    #: (~4 kWh/day) whether or not anything is watching. Measured: a decision every 15 s averages
+    #: ~40 W. The pacing model and its limits are in ``docs/engine.md``.
+    #:
+    #: This is the *maximum* gap in every pacing mode rather than one of two competing knobs.
+    #: Below, a change trigger can make decisions happen sooner; nothing can make them later.
+    interval_s: float = 15.0
+
+    #: Wall-clock seconds between sensor reads while the loop is waiting for the heartbeat.
+    #: Reading Home Assistant costs no GPU time, so this is close to free - but it is not free:
+    #: at 5 s it is ~17k requests a day, which a local instance will not notice. 0 disables
+    #: polling, which also disables the change trigger, since nothing would be re-read to notice
+    #: a change.
+    poll_s: float = 5.0
+
+    #: How long to keep running at full rate once the house does something interesting. The event
+    #: is captured in detail rather than sampled once. 0 means "one extra decision, no burst".
+    burst_s: float = 10.0
+
+    #: How far the primary sensor must move, in its own units (degrees Celsius for the default
+    #: temperature wiring) before that counts as an event worth bursting for. 0 disables the
+    #: change trigger entirely, leaving a fixed heartbeat.
+    #:
+    #: The trigger is a comparison, not a model - deliberately. It is also the cheapest part of
+    #: the scheme and the part most likely to be replaced: the intended long-term trigger is the
+    #: reservoir's own prediction error (roadmap A3), which needs no threshold in degrees.
+    trigger_delta: float = 0.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> LoopConfig:
@@ -177,6 +177,9 @@ class LoopConfig:
             kelvin_max=number("FLYBRAIN_KELVIN_MAX", cls.kelvin_max),
             deadband_k=number("FLYBRAIN_DEADBAND_K", cls.deadband_k),
             interval_s=number("FLYBRAIN_INTERVAL_S", cls.interval_s),
+            poll_s=number("FLYBRAIN_POLL_S", cls.poll_s),
+            burst_s=number("FLYBRAIN_BURST_S", cls.burst_s),
+            trigger_delta=number("FLYBRAIN_TRIGGER_DELTA", cls.trigger_delta),
         )
 
     @property
@@ -206,6 +209,9 @@ class LoopConfig:
             "kelvin_max": self.kelvin_max,
             "deadband_k": self.deadband_k,
             "interval_s": self.interval_s,
+            "poll_s": self.poll_s,
+            "burst_s": self.burst_s,
+            "trigger_delta": self.trigger_delta,
         }
 
     def apply(self, patch: dict) -> None:
@@ -276,9 +282,28 @@ class LiveLoop:
         #: :meth:`configure_channels`), and the rates last applied to each.
         self.channels: list[ChannelSpec] = []
         self.channel_rates: dict[str, float] = {}
+        #: Decides when the brain is worth stepping. Built from the config and rebuilt whenever
+        #: the settings change, so a dashboard edit takes effect without a restart.
+        self.pacer = self._build_pacer()
         # Keep the configured limits inside what the readout can honestly produce.
         self.loop.kelvin_min = max(float(self.loop.kelvin_min), float(self.band_centres[0]))
         self.loop.kelvin_max = min(float(self.loop.kelvin_max), float(self.band_centres[-1]))
+
+    def _build_pacer(self) -> Pacer:
+        """Create a pacer from the current config.
+
+        The pacer owns the cadence and the trigger, and nothing else. Keeping it constructed here
+        rather than in ``server.py`` means the settings that define the training regime travel
+        with the loop that runs it - which is what makes recording them in ``meta.json`` a
+        one-line consequence rather than a bookkeeping chore.
+        """
+        return Pacer(
+            heartbeat_s=self.loop.interval_s,
+            poll_s=self.loop.poll_s,
+            burst_s=self.loop.burst_s,
+            trigger_delta=self.loop.trigger_delta,
+            primary_entity=self.loop.temperature_entity,
+        )
 
     # ------------------------------------------------------------ construction
 
@@ -465,7 +490,7 @@ class LiveLoop:
         # The primary sensor now gets the same dead-state check the extra channels always had.
         # An ``unavailable`` thermometer arrives as its fallback *value*, which is a perfectly
         # plausible-looking temperature — only the state distinguishes the two.
-        if not _signal_is_dead(temperature):
+        if not signal_is_dead(temperature):
             idx, current, rate = self.temperature_drive(float(temperature.value))
             indices.append(idx)
             currents.append(np.broadcast_to(np.float32(current), idx.shape))
@@ -476,7 +501,7 @@ class LiveLoop:
 
         for channel in self.channels:
             signal = by_entity.get(channel.entity_id)
-            if _signal_is_dead(signal):
+            if signal_is_dead(signal):
                 continue
             rate = self.channel_rate(channel, signal.value)
             current = drive_current_for_rate(rate, self.sim.params.dt_ms, self.config)
@@ -534,12 +559,21 @@ class LiveLoop:
 
     # ------------------------------------------------------------- one decision
 
-    async def read_signals(self) -> list[Signal]:
-        """Fetch every entity state, remembering it for the recorder."""
+    async def read_signals(self, *, store: bool = True) -> list[Signal]:
+        """Fetch every entity state.
+
+        ``store`` controls whether this read becomes :attr:`last_signals`, which is the snapshot
+        the recorder writes beside a window. The pacing poll passes ``store=False``: it happens
+        *between* decisions, so letting it overwrite the snapshot would stamp a later reading
+        onto a window that an earlier reading actually drove. That is the same class of silent
+        misalignment as the recorder's crashed-row bug, and it would be just as invisible - the
+        row count would still be right and only the pairing would be wrong.
+        """
         if self.ha is None:
             return []
         signals: list[Signal] = await self.ha.get_signals()
-        self.last_signals = signals
+        if store:
+            self.last_signals = signals
         return signals
 
     async def read_temperature(self) -> float | None:
@@ -701,6 +735,11 @@ class LiveLoop:
             ),
             "temp_range_c": [self.config.temp_min_c, self.config.temp_max_c],
             "band_centres_k": {n: k for n, k in COLOUR_BANDS},
+            # Pacing state: whether the brain is waiting, bursting on something interesting, or
+            # running flat out - and the duty cycle it has *actually* achieved. The dashboard
+            # needs the first to explain a still picture, and the second because with a trigger
+            # in play the energy cost is no longer predictable from the interval alone.
+            "pacing": self.pacer.snapshot(time.monotonic()),
             "history": self.history,
             "error": self.last_error,
             # Connection settings + what the room has actually been doing, so the
@@ -743,6 +782,9 @@ class LiveLoop:
             self.loop.smooth_ms = 0.0
         if self.loop.deadband_k < 0:
             self.loop.deadband_k = 0.0
+        # Pacing settings were just replaced wholesale, so the pacer holds a stale copy of them.
+        # Rebuilding rather than mutating keeps one definition of each setting: the config.
+        self.pacer = self._build_pacer()
         self._smoothed_c = None       # a new span invalidates the smooth history
         return self.loop.to_dict()
 

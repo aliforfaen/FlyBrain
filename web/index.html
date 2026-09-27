@@ -177,12 +177,28 @@
           <div class="ctl-top"><span class="name">How often it decides</span>
             <span class="val" id="pace-note">—</span></div>
           <div class="range-row">
-            <label>one every<input class="num" type="number" id="interval" step="1" min="0"><span class="unit">s</span></label>
+            <label>at least one every<input class="num" type="number" id="interval" step="1" min="0"><span class="unit">s</span></label>
           </div>
           <div class="note">The brain steps as fast as the GPU allows, then waits this long before
             deciding again. <b>0 runs flat out (~165 W); 15 s averages ~40 W</b>, and a room does
             not change faster than that. This is the setting that decides what it costs to leave
             running.</div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top"><span class="name">Looking for something to happen</span></div>
+          <div class="range-row">
+            <label>check every<input class="num" type="number" id="poll" step="1" min="0"><span class="unit">s</span></label>
+            <label>burst for<input class="num" type="number" id="burst" step="1" min="0"><span class="unit">s</span></label>
+          </div>
+          <div class="range-row">
+            <label>if it moves<input class="num" type="number" id="trigger" step="0.1" min="0"><span class="unit">°C</span></label>
+          </div>
+          <div class="note">Reading a sensor costs no GPU time, so between decisions the loop can
+            watch the house cheaply. When the thermometer moves further than this, or a motion
+            sensor changes state, it runs at full rate for the burst — capturing the event rather
+            than sampling it once. The heartbeat above still guarantees a decision either way,
+            which is what keeps the <i>quiet</i> windows coming. <b>0 turns the trigger off.</b></div>
         </div>
 
         <div class="ctl">
