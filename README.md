@@ -13,7 +13,7 @@ in a fly brain knows what a kitchen light is — that mapping is ours, and the c
 
 ![Python](https://img.shields.io/badge/python-3.11-3776ab)
 ![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-ee4c2c)
-![Tests](https://img.shields.io/badge/tests-345%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-422%20passing-brightgreen)
 ![Licence](https://img.shields.io/badge/licence-MIT%20code%20%2F%20CC%20BY--NC%204.0%20data-lightgrey)
 
 ![The FlyBrain dashboard: a 3D view of 138,639 neurons with live control panels](docs/images/dashboard.png)
@@ -69,7 +69,7 @@ temperature swings between about 11 °C and 34 °C on a three-minute cycle and y
 light follow it within a minute.
 
 ```bash
-.venv/bin/python -m pytest tests/ -q      # 345 tests, no connectome needed
+.venv/bin/python -m pytest tests/ -q      # 422 tests, no connectome needed
 .venv/bin/python -m flybrain.wiring       # propose a pathway map for your own house
 ```
 

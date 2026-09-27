@@ -80,6 +80,11 @@ Clients send text JSON: `{"type":"pause","value":true}`, `{"type":"settings","se
 | `GET`/`POST /api/settings` | read / patch the live settings |
 | `POST /api/drive` | set or clear a persistent drive on a named role |
 | `GET /api/frame` | last frame summary |
+| `GET /api/loop` | the control loop's whole state, including pacing and the last action |
+| `GET /api/status` | the pet, journal, three layers, pacing state, trust block and Jev status |
+| `GET /api/timeline` | the memory trail: state changes, bursts, decisions, labels, actions |
+| `GET /api/jev/status` | whether the Jev judgment layer is usable, and if not, *why* |
+| `POST /api/pause` | pause or resume without opening a browser (phone shortcut, cron, HA) |
 
 ## Settings that are live-tunable
 
@@ -519,6 +524,60 @@ more than the memory is worth.
   `last_signals` would pair a later reading with an earlier window — correct row counts, wrong
   data. There is a test, because nothing else would notice.
 
+## The pet panels: what each one is for
+
+![The dashboard with the pet, pacing, memory trail, three layers and trust panels populated](images/pet-panels.png)
+
+Five panels were added on top of the original view, and the goal of all five is the same: make
+every part of the system visible from one screen, in plain numbers, without reading a log.
+
+**What it's doing** — the pet. A closed vocabulary of `resting`, `curious`, `startled`,
+`settling`, derived in [`flybrain/pet.py`](../flybrain/pet.py) from measurements only: brain
+activity against **its own moving baseline**, how far a sensor moved, and whether the pacing
+trigger fired. There is no mapping from a temperature to a mood anywhere in it, and the panel says
+so out loud. Every state ships with its **contributors** — the numbers behind the word, each
+tagged with where it came from (`frame`, `sensor`, `pacer`) — because a label whose inputs are
+visible is a measurement and a label whose inputs are hidden is a claim.
+
+The activity comparison is a *ratio to its own recent self*, never an absolute threshold: how many
+neurons join in depends on the drive, the connectome and the window length, so a fixed cut-off
+would be a calibration that silently rots.
+
+**Pacing** — a heartbeat dial, and the numbers that decide what it costs. The dialect shows time
+to the next decision and turns pink while bursting. The important detail is that the **duty cycle
+and the wattage are measured**, from decisions actually made, not computed from the settings: once
+a trigger is in play the cost depends on how interesting the house has been, which no formula over
+the configuration can predict.
+
+**Why that colour** — the three-layer explanation, kept visibly separate. *The house said* (the
+reading, its age, what moved, how many senses are wired). *The brain did* (neurons active, spikes,
+which regions were busiest). *We mapped it to* (the colour, the ideal, the error, and what
+happened to the action). The colour is our readout's output, not something the fly knows, and this
+is the one panel that says which layer did what.
+
+**Memory trail** — every mark is something that actually happened: a state change, a burst, a
+decision, a label, an action. Labels are stored as **training examples, not weight changes**; the
+brain does not learn live, and the panel says so rather than implying otherwise.
+
+**What it may touch** — the question that matters before leaving anything running, answered at a
+glance: simulated or real house, dry run or live, paused or running, recording or not, whether it
+runs with no dashboard open, which entity may be written to and how, which session the readout was
+trained on — and **the state of the Jev credential**, which is the difference between "off" and
+"broken". A rejected key reads as *key rejected (HTTP 401)* rather than as a silent absence.
+
+**Today so far** — time spent in each state as bars, plus the counters. It is **in memory only**:
+a restart begins a new session rather than inventing history it did not see.
+
+Two endpoints feed it all, and the split is deliberate:
+
+| Endpoint | Polled | Carries |
+|---|---|---|
+| `GET /api/status` | 1 s | the pet, the journal, the three layers, the pacing state, the trust block, the Jev status |
+| `GET /api/timeline` | 5 s | the memory trail, newest first |
+
+One payload for the panels rather than five, because five responses would let five panels render
+five different moments side by side and quietly disagree with each other.
+
 ## Ideas for the viewer that are not built
 
 Recorded so they do not have to be re-derived. Roughly in order of value per unit of work.
@@ -549,23 +608,11 @@ Recorded so they do not have to be re-derived. Roughly in order of value per uni
 - **Real-time engine.** Everything above is cheap; this is not. 0.13× realtime means a decision
   every ~2.3 s, which is fine for a thermostat and hopeless for anything that reacts. The
   active-set integrator is the documented route (see `engine.md`).
-- **A pet card.** One expressive silhouette and a plain status sentence; a tap opens *"what
-  changed?"* — the contributing sensor history, the activity, and the readout output. Animated from
-  measured state, with the pause and stale states shown rather than hidden. It is meant to be
-  readable **at a glance**, which is the point: the 3D cloud is for looking at, a pet card is for
-  reading. The pet direction is [`roadmap.md` §9](roadmap.md#9-the-house-pet-direction).
-- **The three-layer explanation**, in this order: *"the house said"* / *"the brain did"* / *"we
-  mapped it to"*. The same ordering is specified in [`jev.md`](jev.md#where-jev-goes) for the
-  decision inspector, because it is the arrangement that keeps the middle layer genuinely the fly
-  while leaving no doubt that the third layer is ours.
-- **A memory trail.** A sparse timeline of meaningful changes, labels and corrections, where an
-  entry can be marked *"yes, that fits"* or *"no, just passing through"*. Those marks are stored as
-  **training examples, not instant weight changes** — the brain does not learn live, and a UI that
-  implied otherwise would be misrepresenting the architecture.
-- **Trust controls, obvious at a glance.** Mock or live, dry run on or off, when the sensor last
-  updated (the loop now reports `reading_stale` and `reading_age_s` — see *When the sensor stops
-  reporting* above), which session the readout was trained on, and which outputs are currently
-  allowed. Most of these exist; the work is putting them where they can be seen at once.
+- ~~**A pet card, the three-layer explanation, a memory trail and trust controls.**~~ **Built** —
+  see *The pet panels* above. What is still missing from them is the *interactive* half: marking a
+  trail entry *"yes, that fits"* or *"no, just passing through"* is not built, and neither is the
+  click-through from a decision to a Jev verdict (that is placement A,
+  [`jev.md`](jev.md#where-jev-goes)).
 - **A time-of-day prior.** A fly brain has circadian clock neurons, and as of the `clock` role fix
   they resolve correctly (48 cells — see [`roadmap.md`](roadmap.md#resolved-the-circadian-clock-role-was-unreachable)).
   Driving them from `sun.sun` elevation would be a cheap contextual input. It is not free, though:

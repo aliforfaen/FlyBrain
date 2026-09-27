@@ -47,6 +47,7 @@ import os
 import struct
 import time
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +58,8 @@ from fastapi.staticfiles import StaticFiles
 from flybrain.activity import ActivitySettings, MemoryBrain
 from flybrain.env import load_dotenv
 from flybrain.mapping import RoleResolver, default_output_roles, default_sensor_roles
+from flybrain.pet import HONESTY, STATES, PetWatcher, sensor_deltas, summarise_journal
+from flybrain.types import signal_is_dead
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +137,20 @@ class BrainService:
         #: The Jev client is built lazily: with no API key there is nothing to build, and
         #: constructing it at import time would make an optional feature part of startup.
         self._jev = None
+        #: The house pet. Holds only the activity baseline and the state clock - everything it
+        #: says is derived from a window that actually happened, which is why it lives here
+        #: rather than in the browser: a state computed client-side from the last frame would be
+        #: describing a *display* slice, not the window the colour was decoded from.
+        self.pet = PetWatcher()
+        self.pet_state = None
+        #: The previous window's sensor values, for "the house moved by X".
+        self._prev_sensor_values: dict[str, float] = {}
+        #: The last region snapshot, so the pet's sentence can name the busiest cell class. Read
+        #: from the cached copy rather than recomputed, to keep the region poll the only caller.
+        self._last_regions: list[dict] | None = None
+        #: Bursts, for the memory trail. Capped: the trail is a glance, not a log.
+        self._bursts: list[dict] = []
+        self._started_at = time.time()
 
     # ----------------------------------------------------------------- setup
 
@@ -338,6 +355,11 @@ class BrainService:
         # Record before begin_window(): the sensor snapshot must be the one that *drove* the
         # window just decoded, not the next window's reading.
         self._record_window(counts, window_ms)
+        # Feed the pet from the window that was just decided on, so its state describes the same
+        # moment the colour does. Reading it from the frame loop instead would compare a window
+        # against a different window, which is how a "usual" baseline quietly stops meaning
+        # anything.
+        self._observe_pet(counts)
         # Tell the pacer a decision actually happened. This is what ends a burst's immediate
         # steps and restarts the heartbeat, so it must happen only after a real decode - not
         # when a window is merely accumulated, and not when the decision raised.
@@ -345,6 +367,66 @@ class BrainService:
         if entry is not None:
             await self.broadcast_json({"type": "loop", "loop": self.loop.snapshot()})
         await self.begin_window()
+
+    def _note_burst(self, signals) -> None:
+        """Record that the trigger fired, for the pet's clock and the memory trail.
+
+        The pet is *told* about a burst rather than inferring one from activity, because the pacer
+        already knows exactly when it happened and why. Inferring it would be a second, worse
+        answer to a question that was already answered.
+
+        **Wall clock, not monotonic.** ``run_loop`` hands its pacer a ``time.monotonic()`` value,
+        and using that here would put the burst on a different epoch from the windows the pet
+        observes with ``time.time()``. It renders as "since the last change 1790499452s" — the
+        kind of number that looks like a formatting bug and is really a clock bug. The trail needs
+        wall clock anyway, because the browser places its marks on a timeline.
+        """
+        wall = time.time()
+        self.pet.note_burst(wall)
+        values = {
+            s.entity_id: float(s.value) for s in (signals or []) if not signal_is_dead(s)
+        }
+        changes = sensor_deltas(self._prev_sensor_values, values)
+        self._bursts.append({"t": wall, "changes": changes})
+        del self._bursts[: max(0, len(self._bursts) - 200)]
+
+    def _sensor_values(self) -> dict[str, float]:
+        """``{entity_id: value}`` from the last read, skipping anything not reporting.
+
+        The dead readings are dropped *here* rather than in the pet, because "the house moved" is a
+        sentence a person reads: a thermometer going ``unavailable`` and coming back would
+        otherwise appear as a large temperature change, which is the plumbing moving, not the room.
+        """
+        out: dict[str, float] = {}
+        for signal in getattr(self.loop, "last_signals", []) or []:
+            if signal_is_dead(signal):
+                continue
+            out[signal.entity_id] = float(signal.value)
+        return out
+
+    def _observe_pet(self, counts) -> None:
+        """One pet observation per completed control window.
+
+        Window-level counts, not the last published frame: a frame is a display slice and the pet
+        should describe the same 300 ms the colour was decoded from.
+        """
+        if self.loop is None or counts is None:
+            return
+        values = self._sensor_values()
+        changes = sensor_deltas(self._prev_sensor_values, values)
+        self._prev_sensor_values = values
+        counts = np.asarray(counts)
+        observation = self.pet.observe(
+            now=time.time(),
+            active_neurons=int((counts > 0).sum()),
+            total_spikes=int(counts.sum()),
+            sensor_changes=changes,
+            stale=bool(getattr(self.loop, "reading_stale", False)),
+            reading_age_s=self.loop.snapshot().get("reading_age_s"),
+            bursting=bool(self.loop.pacer.snapshot(time.monotonic())["mode"] == "burst"),
+            busiest=tuple(row["name"] for row in (self._last_regions or ())[:3]),
+        )
+        self.pet_state = observation
 
     def _record_window(self, counts, window_ms: float) -> None:
         """Append one completed window to the recording, if recording is on.
@@ -396,6 +478,7 @@ class BrainService:
                     else:
                         if pacer.note_poll(now, signals):
                             logger.info("house changed; bursting for %.0fs", pacer.burst_s)
+                            self._note_burst(signals)
                 if not pacer.should_step(now):
                     continue
             try:
@@ -464,6 +547,268 @@ class BrainService:
         if self._jev is not None:
             await self._jev.aclose()
             self._jev = None
+
+    # ------------------------------------------------------------------ status
+
+    def _trained(self) -> dict | None:
+        """What the colour readout was fitted with, read from its own metadata.
+
+        The dashboard shows this because "which brain is this" and "how was it trained" are the
+        questions that decide whether a number on screen means anything — and because a readout
+        fitted under one regime is not valid under another (AGENTS.md #2).
+        """
+        from flybrain.experiment import ARTIFACT_DIR
+        from flybrain.loop import META_FILE, READOUT_FILE
+
+        path = Path(ARTIFACT_DIR) / META_FILE
+        readout = Path(ARTIFACT_DIR) / READOUT_FILE
+        if not path.exists():
+            return None
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return {
+            "regime": meta.get("regime"),
+            "window_ms": meta.get("window_ms"),
+            "input_roles": meta.get("input_roles"),
+            "readout_roles": meta.get("readout_roles"),
+            "temp_range_c": meta.get("temp_range_c"),
+            "band_centres_k": meta.get("band_centres_k"),
+            "trained_at": datetime.fromtimestamp(
+                readout.stat().st_mtime, tz=UTC
+            ).isoformat(timespec="seconds")
+            if readout.exists()
+            else None,
+        }
+
+    def _journal(self, now: float, watts: float | None) -> dict:
+        """Counters for "today so far" — what happened, in numbers, without adjectives."""
+        journal = self.pet.journal(now)
+        windows = int(self.recorder.n_windows) if self.recorder is not None else 0
+        labels: list[dict] = []
+        session = None
+        if self.recorder is not None:
+            session = self.recorder.root.name
+            labels = self._labels()
+        journal.update(
+            {
+                "windows": windows,
+                "labels": len(labels),
+                "session": session,
+                "recording": self.recorder is not None,
+                "outputs": self._outputs(),
+            }
+        )
+        journal["line"] = summarise_journal(
+            journal, windows=windows, labels=len(labels), watts=watts
+        )
+        return journal
+
+    def _labels(self) -> list[dict]:
+        """Labels written this session, newest last.
+
+        Read from the file rather than kept in memory: the recorder is the owner of that file, and
+        a second in-memory copy would be a second answer to "what has been labelled".
+        """
+        if self.recorder is None:
+            return []
+        path = self.recorder.root / "labels.jsonl"
+        if not path.exists():
+            return []
+        out: list[dict] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        except (OSError, ValueError):
+            return out
+        return out[-200:]
+
+    def _outputs(self) -> list[dict]:
+        """Which Home Assistant entities this loop is allowed to write to, and how.
+
+        Stated explicitly because it is the question that matters before leaving anything running:
+        not "is it working" but "what can it touch". The answer is one light's colour temperature,
+        and the dry-run flag decides whether even that is real.
+        """
+        if self.loop is None:
+            return []
+        cfg = self.loop.loop
+        will_send = bool(cfg.will_send)
+        outputs = [
+            {
+                "entity_id": cfg.light_entity,
+                "what": "colour temperature only",
+                "enabled": will_send,
+                "reason": "dry run — logged, never sent" if not will_send else "live",
+            }
+        ]
+        for channel in getattr(self.loop, "channels", []) or []:
+            outputs.append(
+                {
+                    "entity_id": channel.entity_id,
+                    "what": "read only (drives the brain)",
+                    "enabled": True,
+                    "reason": "inbound",
+                }
+            )
+        return outputs
+
+    def _layers(self) -> dict:
+        """The three-layer explanation: house said, brain did, we mapped it to.
+
+        Deliberately assembled server-side from the same values each layer *acts* on, rather than
+        from the raw inputs the browser also receives. If the panel and the behaviour came from
+        two places, the panel could explain something the loop did not do.
+        """
+        snapshot = self.loop.snapshot() if self.loop is not None else {}
+        frame = self._frame or {}
+        regions = (self._last_regions or [])[:3]
+        action = snapshot.get("last_action") or {}
+
+        house = {
+            "entity": snapshot.get("temperature_entity"),
+            "value": snapshot.get("temperature_c"),
+            "unit": "°C",
+            "age_s": snapshot.get("reading_age_s"),
+            "stale": bool(snapshot.get("reading_stale")),
+            "changed": sensor_deltas(
+                self._prev_sensor_values, self._sensor_values()
+            ),
+            "senses": [
+                {
+                    "entity_id": ch.get("entity_id"),
+                    "kind": ch.get("kind"),
+                    "rate_hz": ch.get("rate_hz"),
+                }
+                for ch in snapshot.get("channels", [])
+            ],
+        }
+        brain = {
+            "active_neurons": frame.get("active_neurons"),
+            "spikes": frame.get("total_spikes"),
+            "sim_ms": frame.get("sim_ms"),
+            "seq": frame.get("seq"),
+            "driven_neurons": snapshot.get("driven_neurons"),
+            "readout_neurons": snapshot.get("readout_neurons"),
+            "regions": [
+                {"name": r.get("name"), "spikes": r.get("spikes"), "rate_hz": r.get("rate_hz")}
+                for r in regions
+            ],
+        }
+        mapped = {
+            "kelvin": snapshot.get("kelvin"),
+            "ideal_kelvin": snapshot.get("ideal_kelvin"),
+            "error_k": snapshot.get("error_k"),
+            "band": snapshot.get("band"),
+            "entity": snapshot.get("light_entity"),
+            "action": action or None,
+            "decisions": snapshot.get("decisions"),
+        }
+        return {"house": house, "brain": brain, "mapped": mapped}
+
+    async def status(self) -> dict:
+        """Everything the dashboard needs that is not the frame stream or the region list."""
+        now = time.time()
+        pacer = self.loop.pacer.snapshot(time.monotonic()) if self.loop is not None else None
+        watts = pacer.get("observed_watts") if pacer else None
+        pet = self.pet_state.to_dict() if self.pet_state is not None else {
+            "state": None,
+            "sentence": "waking up — no completed window yet, so there is nothing to describe.",
+            "contributors": [],
+            "since_s": 0.0,
+            "vocabulary": list(STATES),
+            "honesty": HONESTY,
+        }
+        config = self.loop.loop.to_dict() if self.loop is not None else {}
+        will_send = bool(self.loop.loop.will_send) if self.loop is not None else False
+        return {
+            "pet": pet,
+            "journal": self._journal(now, watts),
+            "layers": self._layers(),
+            "pacing": pacer,
+            "trust": {
+                "mode": config.get("mode"),
+                "dry_run": not will_send,
+                "will_send": will_send,
+                "paused": bool(self.paused),
+                "always_on": bool(self.always_on),
+                "recording": self.recorder is not None,
+                "sensor_entity": config.get("temperature_entity"),
+                "trained": self._trained(),
+                "outputs": self._outputs(),
+            },
+            "jev": await self.jev_status(),
+        }
+
+    def timeline(self) -> dict:
+        """The memory trail: state changes, bursts, decisions, labels and actions, newest first.
+
+        Five sources merged into one list because they are one story — something happened in the
+        house, the brain did something, and the loop mapped it to a colour. Each entry carries its
+        own ``kind`` so the client can colour it without knowing what produced it.
+        """
+        entries: list[dict] = []
+
+        for state in self.pet.trail():
+            entries.append(
+                {
+                    "t": state["t"],
+                    "kind": "state",
+                    "text": state["text"],
+                    "detail": state["detail"],
+                }
+            )
+
+        for burst in self._bursts[-40:]:
+            movers = sorted(
+                (burst.get("changes") or {}).items(), key=lambda kv: abs(kv[1]), reverse=True
+            )
+            detail = ", ".join(f"{k} {v:+.2f}" for k, v in movers[:3]) or "a change"
+            entries.append(
+                {"t": burst["t"], "kind": "burst", "text": "burst", "detail": detail}
+            )
+
+        if self.loop is not None:
+            for row in self.loop.history[-60:]:
+                entries.append(
+                    {
+                        "t": row.get("t"),
+                        "kind": "decision",
+                        "text": f"{row.get('kelvin')} K",
+                        "detail": f"{row.get('temperature_c')} °C · {row.get('band')}",
+                    }
+                )
+            action = self.loop.last_action
+            if action:
+                entries.append(
+                    {
+                        "t": action.get("at"),
+                        "kind": "action",
+                        "text": (
+                            "sent" if action.get("sent")
+                            else "suppressed" if action.get("suppressed")
+                            else action.get("reason") or "not sent"
+                        ),
+                        "detail": f"{action.get('entity_id')} · {action.get('data') or {}}",
+                    }
+                )
+
+        for label in self._labels():
+            entries.append(
+                {
+                    "t": label.get("t"),
+                    "kind": "label",
+                    "text": str(label.get("label")),
+                    "detail": f"source: {label.get('source', 'manual')}",
+                }
+            )
+
+        entries = [e for e in entries if e.get("t") is not None]
+        entries.sort(key=lambda e: e["t"], reverse=True)
+        return {"entries": entries[:80], "now": time.time()}
 
     def release_gpu_cache(self) -> None:
         """Hand cached GPU blocks back to the driver while the brain is not stepping.
@@ -548,7 +893,11 @@ async def get_positions() -> Response:
 async def get_regions() -> dict:
     if service.brain is None:
         raise HTTPException(503, "brain still loading")
-    return {"regions": await asyncio.to_thread(service.brain.region_usage)}
+    regions = await asyncio.to_thread(service.brain.region_usage)
+    # Kept so the pet's sentence can name the busiest cell class without a second, slower
+    # recomputation of the same thing on the status path.
+    service._last_regions = regions
+    return {"regions": regions}
 
 
 @app.get("/api/settings")
@@ -616,16 +965,36 @@ async def get_loop() -> dict:
 async def get_jev_status(refresh: bool = False) -> dict:
     """Whether the Jev judgment layer can be used, and if not, *why*.
 
-    There is no dashboard panel for this yet — the feature has no placement built, and a panel
-    would imply otherwise. The endpoint exists so the credential surface is observable from
-    ``curl`` and so "off", "misconfigured" and "unreachable" are distinguishable without reading
-    a log: with no key it says ``no_key``; with a key the server rejects it says ``unauthorized``
-    (which is what a revoked or mistyped key looks like); with no network it says ``unreachable``.
+    The dashboard shows this beside the trust badges, because "Jev is off" and "Jev is broken"
+    look identical in a log and identical in a UI that only renders a boolean. The endpoint
+    distinguishes them without anyone reading a file: ``no_key`` (nothing configured),
+    ``unauthorized`` (a key was sent and the server refused it), ``unreachable`` (no network).
 
     ``refresh=true`` re-probes instead of using the cached answer. The probe is a real request, so
-    it is cached — but it costs no input tokens, so a dashboard may call it freely.
+    it is cached — but it asks ``GET /v1/models``, which costs no input tokens, so a dashboard may
+    call it freely.
     """
     return await service.jev_status(refresh=refresh)
+
+
+@app.get("/api/status")
+async def get_status() -> dict:
+    """The pet, the journal, the three layers, the pacing state and the trust badges.
+
+    One endpoint rather than five, because the dashboard polls it at about 1 Hz and five round
+    trips would be five chances to render a panel from a different moment than the one next to it.
+    """
+    return await service.status()
+
+
+@app.get("/api/timeline")
+async def get_timeline() -> dict:
+    """The memory trail: state changes, bursts, decisions, labels and actions, newest first.
+
+    Polled far more slowly than ``/api/status`` — the trail only changes when something happens,
+    which is the point of it.
+    """
+    return service.timeline()
 
 
 @app.post("/api/pause")

@@ -42,6 +42,12 @@
     </div>
   </div>
 
+  <!-- The pet's state lives up here as well as in its panel, because it is the one number that
+       answers "what is it doing" and it should not require scrolling. -->
+  <button class="pet-chip" id="pet-chip" data-state="waking" title="What the brain and the house are doing right now">
+    <span class="pet-dot"></span><span id="pet-chip-label">waking up</span>
+  </button>
+
   <div class="conn" id="conn" data-state="connecting" title="Activity stream status">
     <span class="dot"></span><span id="conn-label">connecting</span>
   </div>
@@ -52,6 +58,26 @@
 
   <!-- ------------------------------------------------ left column ----- -->
   <aside class="col left">
+
+    <!-- The synthesis of everything below it. First, because "what is it doing" is the question
+         a person actually asks, and because every number in this panel is a contributor to it. -->
+    <section class="panel pet" id="panel-pet">
+      <h2>What it's doing <span class="tag" id="pet-source">measured</span></h2>
+      <div class="body">
+        <div class="pet-hero">
+          <div class="pet-glyph" id="pet-glyph" data-state="waking" aria-hidden="true">
+            <span class="core"></span><span class="ring"></span><span class="flare"></span>
+          </div>
+          <div class="pet-headline">
+            <div class="pet-state" id="pet-state">waking up</div>
+            <div class="pet-since" id="pet-since">no window yet</div>
+          </div>
+        </div>
+        <div class="pet-sentence" id="pet-sentence">Waiting for the first completed window.</div>
+        <div class="chips" id="pet-contributors"><span class="chip dim">no measurements yet</span></div>
+        <div class="note" id="pet-honesty">—</div>
+      </div>
+    </section>
 
     <section class="panel" id="panel-loop">
       <h2>Room <span class="arrow">→</span> light colour
@@ -88,6 +114,59 @@
         <div class="kv"><span class="k">Driven · readout neurons</span>
           <span class="v" id="loop-drive">—</span></div>
         <div class="note" id="loop-note">Waiting for the control loop to produce its first decision.</div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-pacing">
+      <h2>Pacing <span class="tag" id="pace-mode">—</span></h2>
+      <div class="body">
+        <div class="pace-row">
+          <div class="pace-dial" id="pace-dial" data-mode="waiting">
+            <div class="pace-fill"></div>
+            <div class="pace-inner">
+              <div class="pace-when" id="pace-when">—</div>
+              <div class="pace-when-sub">until next</div>
+            </div>
+          </div>
+          <div class="pace-stats">
+            <div class="kv"><span class="k">Heartbeat</span><span class="v" id="pace-heart">—</span></div>
+            <div class="kv"><span class="k">Burst</span><span class="v" id="pace-burst">—</span></div>
+            <div class="kv"><span class="k">Trigger</span><span class="v" id="pace-trigger">—</span></div>
+            <div class="kv"><span class="k">Polling</span><span class="v" id="pace-poll">—</span></div>
+          </div>
+        </div>
+        <div class="pace-power">
+          <div class="kv"><span class="k">Measured duty</span><span class="v accent" id="pace-duty">—</span></div>
+          <div class="kv"><span class="k">Average power</span><span class="v accent" id="pace-watts">—</span></div>
+          <div class="kv"><span class="k">Energy per day</span><span class="v" id="pace-kwh">—</span></div>
+          <div class="kv"><span class="k">Decisions this run</span><span class="v" id="pace-steps">—</span></div>
+          <div class="power-bar" id="pace-bar"><i></i></div>
+        </div>
+        <div class="note" id="pace-note2">The brain runs hard when the house is interesting and
+          idles when it is not. <b>The heartbeat is not padding</b> — it is what keeps the
+          reservoir in the regime the readout was trained on, and the only source of quiet
+          windows. Duty and power are <i>measured from decisions actually made</i>, not from the
+          settings, because with a trigger the cost depends on how busy the house has been.</div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-trail">
+      <h2>Memory trail <span class="h2-right" id="trail-span">—</span></h2>
+      <div class="body tight">
+        <div class="trail" id="trail"><div class="trail-axis"></div></div>
+        <div class="trail-keys">
+          <span><i class="tk state"></i> state</span>
+          <span><i class="tk burst"></i> burst</span>
+          <span><i class="tk decision"></i> decision</span>
+          <span><i class="tk label"></i> label</span>
+          <span><i class="tk action"></i> action</span>
+        </div>
+        <div class="rows trail-list" id="trail-list">
+          <div class="empty">nothing has happened yet</div>
+        </div>
+        <div class="note">Every mark is something that actually happened, newest at the right.
+          Labels here are training examples, not weight changes — they are stored and used the
+          next time a readout is fitted.</div>
       </div>
     </section>
 
@@ -143,6 +222,49 @@
         </div>
         <div class="note">These are counts, not percentages — read them as “how much of the
           brain is joining in”.</div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-layers">
+      <h2>Why that colour <span class="tag">three layers</span></h2>
+      <div class="body tight">
+        <div class="layer" data-layer="house">
+          <div class="layer-k">The house said</div>
+          <div class="layer-v" id="layer-house-v">—</div>
+          <div class="layer-d" id="layer-house-d">—</div>
+        </div>
+        <div class="layer" data-layer="brain">
+          <div class="layer-k">The brain did</div>
+          <div class="layer-v" id="layer-brain-v">—</div>
+          <div class="layer-d" id="layer-brain-d">—</div>
+        </div>
+        <div class="layer" data-layer="mapped">
+          <div class="layer-k">We mapped it to</div>
+          <div class="layer-v" id="layer-mapped-v">—</div>
+          <div class="layer-d" id="layer-mapped-d">—</div>
+        </div>
+        <div class="note">Kept separate on purpose. The colour is <b>our</b> readout's output, not
+          something the fly knows — this panel is the one place that says which layer did what.</div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-trust">
+      <h2>What it may touch <span class="tag" id="trust-mode">—</span></h2>
+      <div class="body tight">
+        <div class="badges" id="trust-badges"></div>
+        <div class="rows" id="trust-outputs"><div class="empty">no outputs configured</div></div>
+        <div class="note" id="trust-trained">—</div>
+        <div class="note" id="trust-jev">—</div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-journal">
+      <h2>Today so far <span class="h2-right" id="journal-session">—</span></h2>
+      <div class="body tight">
+        <div class="journal-line" id="journal-line">—</div>
+        <div class="vocab" id="journal-states"></div>
+        <div class="note">Time in each state since this process started. <b>In memory only</b> —
+          a restart begins a new session rather than inventing history it did not see.</div>
       </div>
     </section>
 

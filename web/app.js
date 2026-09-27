@@ -36,6 +36,14 @@ function el(tag, cls, text) {
   return n;
 }
 
+/* Set an element's text, if it exists. Deliberately not named `set`: that name is local to
+ * buildConnectUI and writes input *values*, so reusing it here would silently write to
+ * .value on a div and appear to do nothing at all. */
+function setText(sel, text) {
+  const node = $(sel);
+  if (node) node.textContent = text == null ? '\u2014' : String(text);
+}
+
 const fmtInt = (n) => (Number.isFinite(n) ? Math.round(n).toLocaleString('en-US') : '—');
 
 function fmtCount(n) {
@@ -689,6 +697,416 @@ function renderRegions(regions) {
   }
 }
 
+/* ================================================================= pet */
+/* The state word, its contributors, the pacing dial, the three layers, the trust badges and
+ * the memory trail all arrive from /api/status and /api/timeline. They are rendered from one
+ * payload on purpose: five panels assembled from five responses would show five different
+ * moments side by side and quietly disagree with each other. */
+
+const PET_TONES = {
+  resting: 'resting', curious: 'curious', startled: 'startled', settling: 'settling',
+};
+
+let statusTimer = null, timelineTimer = null, statusFails = 0;
+// Interpolated countdown, so the dial moves between polls instead of ticking in 1 Hz steps.
+let paceDeadline = null, paceHeartbeat = 0;
+
+function fmtDuration(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
+function startStatusPolling() {
+  const tick = async () => {
+    let data;
+    try {
+      data = await getJSON('/api/status');
+    } catch (err) {
+      statusFails += 1;
+      // One notice, not one per second: a backend that is restarting is not sixty problems.
+      if (statusFails === 3) showNotice(`Status poll is failing (${err.message}).`, 12000);
+      return;
+    }
+    statusFails = 0;
+    // Kept in its own try on purpose. A rendering bug and a dead backend look identical from the
+    // outside if they share a catch -- and the wrong one gets debugged.
+    try {
+      paintStatus(data);
+    } catch (err) {
+      console.error('paintStatus failed', err);
+    }
+  };
+  tick();
+  clearInterval(statusTimer);
+  statusTimer = setInterval(tick, 1000);
+}
+
+function startTimelinePolling() {
+  const tick = async () => {
+    let data;
+    try {
+      data = await getJSON('/api/timeline');
+    } catch (_) {
+      return; // the trail is decoration; it must never produce a notice
+    }
+    try {
+      paintTrail(data);
+    } catch (err) {
+      console.error('paintTrail failed', err);
+    }
+  };
+  tick();
+  clearInterval(timelineTimer);
+  timelineTimer = setInterval(tick, 5000);
+}
+
+function paintStatus(s) {
+  if (!s) return;
+  state.status = s;
+  paintPet(s.pet);
+  paintPacing(s.pacing, s.journal);
+  paintLayers(s.layers);
+  paintTrust(s.trust, s.jev);
+  paintJournal(s.journal);
+}
+
+/* --- the pet ------------------------------------------------------------- */
+
+function paintPet(pet) {
+  if (!pet) return;
+  const key = PET_TONES[pet.state] || 'waking';
+
+  const glyph = $('#pet-glyph');
+  if (glyph) glyph.dataset.state = key;
+  const chip = $('#pet-chip');
+  if (chip) chip.dataset.state = key;
+
+  const word = pet.state || 'waking up';
+  setText('#pet-state', word);
+  setText('#pet-chip-label', word);
+
+  const held = pet.since_s >= 1 ? `for ${fmtDuration(pet.since_s)}` : 'just changed';
+  setText('#pet-since', pet.state ? held : 'no window yet');
+
+  setText('#pet-sentence', pet.sentence || '—');
+  setText('#pet-honesty', pet.honesty || '—');
+  if ($('#pet-source')) $('#pet-source').textContent = pet.state ? 'measured' : 'no data';
+
+  // Every label shows its contributors. A chip is a number and where it came from; a label
+  // without one would be a claim, which is exactly what this panel exists to avoid.
+  const host = $('#pet-contributors');
+  if (!host) return;
+  host.textContent = '';
+  const contributors = Array.isArray(pet.contributors) ? pet.contributors : [];
+  if (!contributors.length) {
+    host.appendChild(el('span', 'chip dim', 'no measurements yet'));
+    return;
+  }
+  for (const c of contributors) {
+    const chip = el('span', 'chip');
+    chip.dataset.source = c.source || '';
+    chip.appendChild(el('span', '', `${c.label} `));
+    if (typeof c.value === 'boolean') {
+      chip.appendChild(el('b', '', c.value ? 'yes' : 'no'));
+    } else if (typeof c.value === 'number') {
+      // A ratio gets two decimals: `fmtInt(0.99)` is "1", and "1" reads as *exactly* baseline
+      // when the honest answer is 0.99. Counts stay rounded, because a spike count is an integer.
+      const shown = c.unit === 'x' ? `${c.value.toFixed(2)}×` : `${fmtInt(c.value)}${c.unit || ''}`;
+      chip.appendChild(el('b', '', shown));
+    } else {
+      chip.appendChild(el('b', '', String(c.value ?? '—')));
+    }
+    host.appendChild(chip);
+  }
+}
+
+/* --- pacing -------------------------------------------------------------- */
+
+function paintPacing(pacing, journal) {
+  if (!pacing) return;
+  const mode = pacing.mode || 'waiting';
+  const dial = $('#pace-dial');
+  if (dial) dial.dataset.mode = mode;
+
+  const label = { flat_out: 'flat out', waiting: 'waiting', burst: 'bursting' }[mode] || mode;
+  setText('#pace-mode', label);
+  const tag = $('#pace-mode');
+  if (tag) {
+    tag.classList.toggle('warn', mode === 'burst' || mode === 'flat_out');
+    tag.classList.toggle('on', mode === 'waiting');
+  }
+
+  paceHeartbeat = Number(pacing.heartbeat_s) || 0;
+  // The dial counts down locally between polls; polling at 1 Hz and repainting the ring only
+  // then would make a 60 s heartbeat look like a slideshow.
+  paceDeadline = mode === 'waiting' && Number.isFinite(Number(pacing.next_in_s))
+    ? performance.now() + Number(pacing.next_in_s) * 1000
+    : null;
+  paintPaceCountdown();
+
+  const trigger = Number(pacing.trigger_delta);
+  setText('#pace-heart', paceHeartbeat > 0 ? `every ${paceHeartbeat}s` : 'flat out (0)');
+  setText('#pace-burst', paceHeartbeat > 0 && Number(pacing.burst_s) > 0
+    ? `${pacing.burst_s}s on a change` : 'off');
+  setText('#pace-trigger', trigger > 0
+    ? `${trigger} °C · ${pacing.trigger}` : 'off — plain heartbeat');
+  setText('#pace-poll', Number(pacing.poll_s) > 0 ? `every ${pacing.poll_s}s` : 'off');
+
+  // Measured, not configured: with a trigger the cost depends on how interesting the house has
+  // been, which no formula over the settings can predict.
+  const duty = pacing.observed_duty;
+  const watts = pacing.observed_watts;
+  setText('#pace-duty', duty == null ? 'measuring…' : `${(duty * 100).toFixed(1)}%`);
+  setText('#pace-watts', watts == null ? 'measuring…' : `~${Math.round(watts)} W`);
+  setText('#pace-kwh', watts == null ? '—' : `~${(watts * 24 / 1000).toFixed(2)} kWh`);
+  setText('#pace-steps', fmtInt(pacing.steps));
+  const bar = $('#pace-bar i');
+  if (bar) bar.style.width = `${Math.min(100, (duty || 0) * 100)}%`;
+
+  if (journal && journal.recording === false && $('#pace-note2')) {
+    // Nothing to add: the note is static prose. Kept as a hook rather than an unused branch.
+  }
+}
+
+function paintPaceCountdown() {
+  const dial = $('#pace-dial');
+  const when = $('#pace-when');
+  if (!dial || !when) return;
+  const mode = dial.dataset.mode;
+  if (mode === 'flat_out') {
+    when.textContent = 'now';
+    dial.style.setProperty('--pct', 100);
+    return;
+  }
+  if (mode === 'burst') {
+    when.textContent = 'now';
+    dial.style.setProperty('--pct', 100);
+    return;
+  }
+  if (paceDeadline == null || !paceHeartbeat) {
+    when.textContent = '—';
+    return;
+  }
+  const remaining = Math.max(0, (paceDeadline - performance.now()) / 1000);
+  when.textContent = remaining >= 1 ? `${Math.round(remaining)}s` : 'now';
+  const elapsed = paceHeartbeat - remaining;
+  dial.style.setProperty('--pct', Math.max(0, Math.min(100, (elapsed / paceHeartbeat) * 100)));
+}
+
+/* --- the three layers ---------------------------------------------------- */
+
+function paintLayers(layers) {
+  if (!layers) return;
+  const { house, brain, mapped } = layers;
+
+  if (house) {
+    setText('#layer-house-v', house.value == null ? 'no reading'
+      : `${Number(house.value).toFixed(1)} °C`);
+    const bits = [house.entity];
+    if (house.stale) bits.push('STALE — the loop is not acting on this');
+    else if (house.age_s != null) bits.push(`${fmtDuration(house.age_s)} ago`);
+    const moved = Object.entries(house.changed || {})
+      .map(([k, v]) => `${k.split('.').pop()} ${v > 0 ? '+' : ''}${v}`).slice(0, 3);
+    if (moved.length) bits.push(`moved: ${moved.join(', ')}`);
+    if ((house.senses || []).length) {
+      bits.push(`${(house.senses || []).length} extra sense(s) wired`);
+    }
+    setText('#layer-house-d', bits.filter(Boolean).join(' · '));
+  }
+
+  if (brain) {
+    setText('#layer-brain-v', `${fmtInt(brain.active_neurons)} active · ${fmtInt(brain.spikes)} spikes`);
+    const regions = (brain.regions || [])
+      .map((r) => `${r.name} ${r.spikes}`).join(', ');
+    setText('#layer-brain-d', [
+      `${fmtInt(brain.driven_neurons)} driven → ${fmtInt(brain.readout_neurons)} read out`,
+      `${Number(brain.sim_ms || 0).toFixed(0)} ms of brain time`,
+      regions ? `busiest: ${regions}` : null,
+    ].filter(Boolean).join(' · '));
+  }
+
+  if (mapped) {
+    setText('#layer-mapped-v', mapped.kelvin == null ? 'not yet decided'
+      : `${fmtInt(mapped.kelvin)} K · ${mapped.band || ''}`);
+    const action = mapped.action;
+    let what = `${mapped.entity}`;
+    if (action) {
+      if (action.reason === 'sensor_stale') what += ' · held: no reading';
+      else if (action.sent) what += ' · sent';
+      else if (action.suppressed) what += ' · suppressed by the deadband';
+      else if (action.dry_run) what += ' · dry run, not sent';
+      else what += ' · not sent';
+    }
+    setText('#layer-mapped-d', [
+      mapped.ideal_kelvin == null ? null : `ideal ${fmtInt(mapped.ideal_kelvin)} K`,
+      mapped.error_k == null ? null : `off by ${mapped.error_k > 0 ? '+' : ''}${mapped.error_k} K`,
+      `${fmtInt(mapped.decisions)} decision(s)`,
+      what,
+    ].filter(Boolean).join(' · '));
+  }
+}
+
+/* --- trust --------------------------------------------------------------- */
+
+function paintTrust(trust, jev) {
+  if (!trust) return;
+  const host = $('#trust-badges');
+  const live = trust.mode && trust.mode !== 'mock';
+  setText('#trust-mode', live ? 'real house' : 'simulated house');
+  const tag = $('#trust-mode');
+  if (tag) tag.classList.toggle('warn', live);
+
+  if (host) {
+    host.textContent = '';
+    const badge = (text, tone, title) => {
+      const b = el('span', 'badge', text);
+      b.dataset.tone = tone || '';
+      if (title) b.title = title;
+      host.appendChild(b);
+      return b;
+    };
+    badge(trust.mode === 'mock' ? 'simulated home' : 'real home', live ? 'warn' : '');
+    badge(trust.dry_run ? 'dry run — nothing sent' : 'live — it can send',
+      trust.dry_run ? 'good' : 'bad',
+      trust.dry_run ? 'Service calls are logged and never dispatched.' : 'Service calls are real.');
+    if (trust.paused) badge('paused', 'mute');
+    else badge('running', 'good');
+    badge(trust.recording ? 'recording windows' : 'not recording', trust.recording ? 'good' : 'mute');
+    if (trust.always_on) badge('always on', 'warn', 'Runs with no dashboard open.');
+  }
+
+  const outputs = $('#trust-outputs');
+  if (outputs) {
+    outputs.textContent = '';
+    const rows = Array.isArray(trust.outputs) ? trust.outputs : [];
+    if (!rows.length) {
+      outputs.appendChild(el('div', 'empty', 'no outputs configured'));
+    } else {
+      for (const o of rows) {
+        const row = el('div', 'kv');
+        row.appendChild(el('span', 'k', o.entity_id));
+        const v = el('span', o.enabled ? 'v accent' : 'v', o.enabled ? o.what : `${o.what} (off)`);
+        v.title = o.reason || '';
+        row.appendChild(v);
+        outputs.appendChild(row);
+      }
+    }
+  }
+
+  const trained = trust.trained;
+  if ($('#trust-trained')) {
+    if (!trained) {
+      $('#trust-trained').textContent = 'No trained readout found — the loop cannot decide.';
+    } else {
+      const when = trained.trained_at ? new Date(trained.trained_at).toLocaleDateString() : 'unknown date';
+      const range = Array.isArray(trained.temp_range_c) ? trained.temp_range_c.join('–') + ' °C' : '—';
+      $('#trust-trained').innerHTML =
+        `Readout: <b>${trained.regime || 'unknown regime'}</b> · trained ${when} · ` +
+        `${range} → ${Object.keys(trained.band_centres_k || {}).join('/')} · ` +
+        `window ${trained.window_ms} ms. A readout is only valid under the regime it was fitted in.`;
+    }
+  }
+
+  if ($('#trust-jev') && jev) {
+    const reasons = {
+      ok: 'answering',
+      no_key: 'no key set',
+      unauthorized: 'key rejected (HTTP 401)',
+      unreachable: 'unreachable',
+      disabled: 'off',
+    };
+    const tone = jev.available ? 'good' : 'mute';
+    const floor = jev.floor_ms == null ? 'floor not measured'
+      : `network floor ${Math.round(jev.floor_ms)} ms`;
+    $('#trust-jev').innerHTML =
+      `Jev judgment layer: <b>${reasons[jev.reason] || jev.reason}</b> · ` +
+      `model ${jev.config?.model || '—'} · ${floor}` +
+      (jev.config?.key_hint ? ` · key ${jev.config.key_hint}` : '') +
+      `. <span style="color:var(--dim)">${tone === 'good' ? '' : String(jev.detail || '').slice(0, 120)}</span>`;
+  }
+}
+
+/* --- journal ------------------------------------------------------------ */
+
+function paintJournal(journal) {
+  if (!journal) return;
+  setText('#journal-line', journal.line || '—');
+  setText('#journal-session', journal.session || (journal.recording ? 'recording' : 'not recording'));
+
+  const host = $('#journal-states');
+  if (!host) return;
+  const seconds = journal.seconds_in_state || {};
+  const total = Math.max(1, Number(journal.observed_s) || 0);
+  host.textContent = '';
+  for (const name of ['resting', 'curious', 'startled', 'settling']) {
+    const value = Number(seconds[name]) || 0;
+    const row = el('div', 'vocab-row');
+    row.dataset.state = name;
+    row.appendChild(el('span', 'name', name));
+    const bar = el('span', 'bar');
+    const fill = el('i');
+    fill.style.width = `${Math.min(100, (value / total) * 100)}%`;
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    row.appendChild(el('span', 'val', value >= 1 ? fmtDuration(value) : '—'));
+    host.appendChild(row);
+  }
+}
+
+/* --- memory trail -------------------------------------------------------- */
+
+function paintTrail(data) {
+  const host = $('#trail');
+  if (!host || !data) return;
+  const entries = Array.isArray(data.entries) ? data.entries : [];
+  const now = Number(data.now) || (Date.now() / 1000);
+
+  host.textContent = '';
+  host.appendChild(el('div', 'trail-axis'));
+  if (!entries.length) {
+    setText('#trail-span', 'nothing yet');
+    const list = $('#trail-list');
+    if (list) { list.textContent = ''; list.appendChild(el('div', 'empty', 'nothing has happened yet')); }
+    return;
+  }
+
+  // The window is the span the entries actually cover, floored at five minutes so a quiet
+  // fifteen seconds does not get stretched across the whole strip and look busy.
+  const oldest = Math.min(...entries.map((e) => e.t));
+  const span = Math.max(300, now - oldest);
+  setText('#trail-span', `last ${fmtDuration(span)} · ${entries.length} mark(s)`);
+
+  for (const entry of entries) {
+    const mark = el('span', 'mark');
+    mark.dataset.kind = entry.kind || 'decision';
+    const pct = Math.max(0, Math.min(98, ((entry.t - (now - span)) / span) * 100));
+    mark.style.left = `${pct}%`;
+    mark.title = `${new Date(entry.t * 1000).toLocaleTimeString('en-GB', { hour12: false })} · ` +
+      `${entry.text}${entry.detail ? ' — ' + entry.detail : ''}`;
+    host.appendChild(mark);
+  }
+
+  const list = $('#trail-list');
+  if (!list) return;
+  list.textContent = '';
+  for (const entry of entries.slice(0, 8)) {
+    // Deliberately not `.row`: that class is a three-column grid for the region panels, and two
+    // children inside it land in the wrong tracks and overlap.
+    const row = el('div', 'trail-row');
+    row.appendChild(el('span', 'when', new Date(entry.t * 1000)
+      .toLocaleTimeString('en-GB', { hour12: false })));
+    const meta = el('span', 'what');
+    meta.appendChild(el('b', '', entry.text));
+    if (entry.detail) meta.appendChild(el('span', '', ` — ${entry.detail}`));
+    row.appendChild(meta);
+    row.title = entry.detail || entry.text;
+    list.appendChild(row);
+  }
+}
+
 /* ============================================================== senses */
 
 /* The fly's own names for the pathways a sensor is wired to. Showing the biological word
@@ -1260,6 +1678,14 @@ async function boot() {
 
     requestAnimationFrame(animate);
     startRegionPolling();
+    startStatusPolling();
+    startTimelinePolling();
+    // The dial's own clock. Painting it only on each poll would make a 60 s heartbeat move in
+    // one-second jumps; this is what makes it read as a heartbeat rather than a progress bar.
+    setInterval(paintPaceCountdown, 200);
+    $('#pet-chip')?.addEventListener('click', () => {
+      $('#panel-pet')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
     connectWS();
     hideBoot();
 

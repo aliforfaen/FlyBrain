@@ -399,6 +399,17 @@ evidence beside the answer on screen.
 
 ### Observation only, to start
 
+**Built, in the dashboard.** The five pet panels — state with contributors, pacing, the three
+layers, the memory trail and the trust badges — are described in
+[`live-view.md`](live-view.md#the-pet-panels-what-each-one-is-for). They watch and show; they
+control nothing. The state vocabulary is `resting` / `curious` / `startled` / `settling`, derived
+in [`flybrain/pet.py`](../flybrain/pet.py) from measured activity, sensor movement and the pacing
+trigger, and every label carries the numbers behind it.
+
+What is deliberately still missing: marking a trail entry *"yes, that fits"* or *"no, just passing
+through"*. That is the interactive half, and it writes to the training set, so it waits for the
+same confidence discipline placement B needs ([`jev.md`](jev.md)).
+
 The first version **watches and never controls anything essential**. It may read motion, illuminance,
 temperature and time of day, and express itself through a small accent light, a desk animation or a
 notification. It does not own the room's lighting policy.

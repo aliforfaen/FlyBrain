@@ -693,3 +693,268 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .btn-col { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; }
 .btn-col button { width: 100%; text-align: left; }
+
+/* ============================================================================
+   The house pet — observable personality with honest provenance.
+   Every state is a function of measured quantities, and every label shows the numbers
+   behind it. Nothing here animates from a timer; it animates from what was measured.
+   ========================================================================= */
+
+/* --- the always-visible chip in the topbar -------------------------------- */
+
+.pet-chip {
+  display: flex; align-items: center; gap: 7px;
+  margin-right: 10px; padding: 4px 10px 4px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-2);
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease;
+}
+.pet-chip:hover { border-color: var(--line-2); color: var(--text); }
+.pet-chip .pet-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--dim); flex: 0 0 auto;
+}
+.pet-chip[data-state="resting"]  { color: var(--text-2); }
+.pet-chip[data-state="resting"] .pet-dot  { background: var(--accent); box-shadow: 0 0 8px var(--accent-d); }
+.pet-chip[data-state="curious"] .pet-dot  { background: var(--amber); box-shadow: 0 0 9px rgba(244,168,63,0.6); }
+.pet-chip[data-state="startled"] .pet-dot { background: var(--pink); box-shadow: 0 0 12px rgba(255,95,141,0.8); }
+.pet-chip[data-state="settling"] .pet-dot { background: var(--good); box-shadow: 0 0 9px rgba(79,224,138,0.55); }
+.pet-chip[data-state="startled"] { color: var(--pink); border-color: rgba(255,95,141,0.45); }
+.pet-chip[data-state="curious"]  { color: var(--amber); border-color: rgba(244,168,63,0.40); }
+
+/* --- the pet panel -------------------------------------------------------- */
+
+.panel.pet { border-color: var(--line-2); }
+
+.pet-hero { display: flex; align-items: center; gap: 14px; }
+
+.pet-glyph {
+  position: relative; width: 62px; height: 62px; flex: 0 0 auto;
+}
+.pet-glyph .core,
+.pet-glyph .ring,
+.pet-glyph .flare {
+  position: absolute; border-radius: 50%; inset: 0;
+}
+.pet-glyph .core {
+  inset: 22px; background: var(--accent);
+  box-shadow: 0 0 14px var(--accent-d);
+}
+.pet-glyph .ring { border: 1px solid var(--line-2); }
+.pet-glyph .flare { border: 1px solid transparent; }
+
+/* State drives the motion. `resting` breathes slowly, `curious` reaches, `startled` snaps,
+   `settling` decays — all of them a shape for a real measurement, none of them a mood. */
+.pet-glyph[data-state="resting"] .core  { animation: pet-breathe 4.6s ease-in-out infinite; }
+.pet-glyph[data-state="resting"] .ring  { animation: pet-halo 4.6s ease-in-out infinite; }
+.pet-glyph[data-state="curious"] .core  { background: var(--amber); box-shadow: 0 0 16px rgba(244,168,63,0.55);
+                                          animation: pet-reach 1.5s ease-in-out infinite; }
+.pet-glyph[data-state="curious"] .ring  { border-color: rgba(244,168,63,0.5); animation: pet-halo 1.5s ease-in-out infinite; }
+.pet-glyph[data-state="startled"] .core { background: var(--pink); box-shadow: 0 0 24px rgba(255,95,141,0.85);
+                                          animation: pet-snap 620ms cubic-bezier(.2,.9,.2,1) infinite; }
+.pet-glyph[data-state="startled"] .flare{
+  border-color: rgba(255,95,141,0.75); animation: pet-burst 1.05s ease-out infinite; }
+.pet-glyph[data-state="settling"] .core { background: var(--good); box-shadow: 0 0 14px rgba(79,224,138,0.5);
+                                          animation: pet-settle 2.4s ease-out infinite; }
+.pet-glyph[data-state="settling"] .ring { border-color: rgba(79,224,138,0.4); animation: pet-halo 2.4s ease-out infinite; }
+.pet-glyph[data-state="waking"] .core   { background: var(--dim); box-shadow: none; }
+.pet-glyph[data-state="waking"] .ring   { animation: pet-halo 1.2s ease-in-out infinite; }
+
+@keyframes pet-breathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.18); } }
+@keyframes pet-reach   { 0%,100% { transform: scale(1); } 50% { transform: scale(1.34); } }
+@keyframes pet-snap    { 0% { transform: scale(1.5); } 40% { transform: scale(1); } 100% { transform: scale(1.5); } }
+@keyframes pet-settle  { 0% { transform: scale(1.32); } 100% { transform: scale(1); } }
+@keyframes pet-halo    { 0%,100% { transform: scale(0.92); opacity: 0.55; } 50% { transform: scale(1.06); opacity: 0.9; } }
+@keyframes pet-burst   { 0% { transform: scale(0.7); opacity: 0.9; } 100% { transform: scale(1.25); opacity: 0; } }
+
+.pet-headline { min-width: 0; }
+.pet-state {
+  font-size: 25px; line-height: 1.05; letter-spacing: 0.02em;
+  color: var(--text); text-transform: lowercase;
+}
+.pet-glyph[data-state="startled"] ~ .pet-headline .pet-state { color: var(--pink); }
+.pet-since { font-size: 9.5px; color: var(--dim); letter-spacing: 0.08em; margin-top: 3px; }
+
+.pet-sentence {
+  margin-top: 10px; font-size: 11px; line-height: 1.45; color: var(--text-2);
+}
+
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 9px; }
+.chip {
+  font-size: 8.5px; letter-spacing: 0.05em;
+  padding: 2.5px 6px; border-radius: 2px;
+  background: rgba(124, 164, 204, 0.10);
+  border: 1px solid var(--line);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.chip b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.chip.dim { color: var(--dim); border-style: dashed; }
+.chip[data-source="frame"]  { border-color: rgba(67,215,239,0.30); }
+.chip[data-source="sensor"] { border-color: rgba(244,168,63,0.30); }
+.chip[data-source="pacer"]  { border-color: rgba(255,95,141,0.30); }
+.chip[data-source="settings"] { border-color: rgba(79,224,138,0.30); }
+
+/* ============================================================================
+   Pacing — the dial is the heartbeat, and the numbers are measured, not configured.
+   ========================================================================= */
+
+.pace-row { display: flex; align-items: center; gap: 12px; }
+
+.pace-dial {
+  position: relative; width: 74px; height: 74px; flex: 0 0 auto;
+  border-radius: 50%;
+  background: rgba(124, 164, 204, 0.10);
+}
+.pace-dial .pace-fill {
+  position: absolute; inset: 0; border-radius: 50%;
+  background: conic-gradient(var(--accent) calc(var(--pct, 0) * 1%), rgba(124,164,204,0.10) 0);
+  mask: radial-gradient(circle, transparent 61%, #000 62%);
+  -webkit-mask: radial-gradient(circle, transparent 61%, #000 62%);
+}
+.pace-inner {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 1px;
+}
+.pace-when { font-size: 15px; color: var(--text); font-variant-numeric: tabular-nums; }
+.pace-when-sub { font-size: 8px; letter-spacing: 0.12em; color: var(--dim); text-transform: uppercase; }
+
+.pace-dial[data-mode="burst"] .pace-fill {
+  background: conic-gradient(var(--pink) calc(var(--pct, 0) * 1%), rgba(255,95,141,0.12) 0);
+  animation: pace-flash 900ms ease-in-out infinite;
+}
+.pace-dial[data-mode="burst"] .pace-when { color: var(--pink); }
+.pace-dial[data-mode="flat_out"] .pace-fill {
+  background: conic-gradient(var(--amber) 100%, transparent 0);
+}
+.pace-dial[data-mode="flat_out"] .pace-when { color: var(--amber); }
+@keyframes pace-flash { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+.pace-stats { flex: 1 1 auto; min-width: 0; }
+.pace-power { margin-top: 9px; }
+.power-bar {
+  margin-top: 6px; height: 5px; border-radius: 3px;
+  background: rgba(124, 164, 204, 0.12); overflow: hidden;
+}
+.power-bar i {
+  display: block; height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--accent), var(--amber));
+  transition: width 400ms ease;
+}
+
+/* ============================================================================
+   Memory trail — marks, not a log. Position is time; colour is what happened.
+   ========================================================================= */
+
+.trail {
+  position: relative; height: 34px;
+  background: rgba(124, 164, 204, 0.05);
+  border: 1px solid var(--line); border-radius: 3px;
+  overflow: hidden;
+}
+.trail-axis {
+  position: absolute; left: 0; right: 0; top: 50%; height: 1px;
+  background: var(--line);
+}
+.trail .mark {
+  position: absolute; transform: translateX(-50%);
+  width: 3px; border-radius: 2px;
+  bottom: 5px;
+}
+.trail .mark[data-kind="state"]    { background: var(--accent); height: 20px; opacity: 0.85; }
+.trail .mark[data-kind="burst"]    { background: var(--pink); height: 26px; width: 2px; }
+.trail .mark[data-kind="decision"] { background: rgba(124,164,204,0.55); height: 12px; width: 1px; }
+.trail .mark[data-kind="label"]    { background: var(--good); height: 26px; width: 4px; }
+.trail .mark[data-kind="action"]   { background: var(--amber); height: 8px; width: 2px; }
+.trail .mark:hover { outline: 1px solid var(--text); }
+
+.trail-keys { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 5px; font-size: 8.5px; color: var(--dim); }
+.trail-keys .tk { display: inline-block; width: 3px; height: 8px; margin-right: 3px; vertical-align: middle; }
+.trail-keys .tk.state { background: var(--accent); }
+.trail-keys .tk.burst { background: var(--pink); }
+.trail-keys .tk.decision { background: rgba(124,164,204,0.55); }
+.trail-keys .tk.label { background: var(--good); }
+.trail-keys .tk.action { background: var(--amber); }
+
+.trail-list { margin-top: 8px; max-height: 124px; overflow-y: auto; }
+.trail-list .trail-row {
+  display: flex; align-items: baseline; gap: 7px;
+  padding: 2.5px 6px; border-radius: 2px;
+  background: rgba(6, 10, 17, 0.5);
+  border: 1px solid rgba(124, 164, 204, 0.10);
+}
+.trail-list .trail-row .when {
+  flex: 0 0 52px; font-size: 9px; color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.trail-list .trail-row .what {
+  flex: 1 1 auto; min-width: 0; font-size: 9.5px; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.trail-list .trail-row .what b { color: var(--text); font-weight: 600; }
+
+/* ============================================================================
+   The three layers, kept visibly separate.
+   ========================================================================= */
+
+.layer {
+  padding: 7px 8px; border-radius: 2px;
+  background: var(--panel-2);
+  border-left: 2px solid var(--line-2);
+}
+.layer + .layer { margin-top: 5px; }
+.layer[data-layer="house"]  { border-left-color: var(--amber); }
+.layer[data-layer="brain"]  { border-left-color: var(--accent); }
+.layer[data-layer="mapped"] { border-left-color: var(--good); }
+.layer-k {
+  font-size: 8px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--dim);
+}
+.layer-v { font-size: 13px; color: var(--text); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.layer-d { font-size: 9.5px; color: var(--text-2); margin-top: 2px; }
+
+/* ============================================================================
+   Trust badges — "what may it touch", answered at a glance.
+   ========================================================================= */
+
+.badges { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 8.5px; letter-spacing: 0.06em;
+  padding: 3px 7px; border-radius: 2px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  color: var(--text-2);
+}
+.badge b { color: var(--text); font-weight: 600; }
+.badge[data-tone="good"] { border-color: rgba(79,224,138,0.42); color: var(--good); }
+.badge[data-tone="warn"] { border-color: rgba(244,168,63,0.42); color: var(--amber); }
+.badge[data-tone="bad"]  { border-color: rgba(255,91,110,0.45); color: var(--bad); }
+.badge[data-tone="mute"] { color: var(--dim); border-style: dashed; }
+
+/* ============================================================================
+   Journal — time in each state, as bars. The proportion is the interesting fact.
+   ========================================================================= */
+
+.journal-line {
+  font-size: 10.5px; color: var(--text-2); padding: 6px 7px;
+  background: var(--panel-2); border-radius: 2px;
+}
+.vocab { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.vocab-row { display: grid; grid-template-columns: 62px 1fr 52px; gap: 7px; align-items: center; }
+.vocab-row .name { font-size: 9px; letter-spacing: 0.08em; color: var(--text-2); }
+.vocab-row .bar { height: 6px; border-radius: 3px; background: rgba(124,164,204,0.12); overflow: hidden; }
+.vocab-row .bar i { display: block; height: 100%; width: 0; transition: width 400ms ease; }
+.vocab-row[data-state="resting"]  .bar i { background: var(--accent); }
+.vocab-row[data-state="curious"]  .bar i { background: var(--amber); }
+.vocab-row[data-state="startled"] .bar i { background: var(--pink); }
+.vocab-row[data-state="settling"] .bar i { background: var(--good); }
+.vocab-row .val { font-size: 9px; color: var(--dim); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Respect a reduced-motion preference: the state word and the colour still carry it. */
+@media (prefers-reduced-motion: reduce) {
+  .pet-glyph .core, .pet-glyph .ring, .pet-glyph .flare,
+  .pace-dial .pace-fill { animation: none !important; }
+}

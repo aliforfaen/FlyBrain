@@ -124,6 +124,36 @@ after every row had shifted. All four are now covered by tests that were confirm
 against the pre-fix source — because a regression test that passes either way is the degenerate
 validation described above, wearing a different hat.
 
+### Two clock-and-scope bugs, found by looking at the screen (2026-09-27)
+
+Both were in the new dashboard code, both were invisible to the test suite, and both were caught
+in the first minute of loading the page. They are recorded because *how* they were caught
+generalises: the unit suite was green, and the screen was not.
+
+1. **`set is not defined` — a name that was right and wrong at once.** The new panel code called a
+   helper `set(selector, text)`. That name existed, but only *inside* `buildConnectUI`, and it
+   assigns to an input's `.value` rather than to text. The ReferenceError meant the entire status
+   payload rendered as em dashes, which is indistinguishable from "this feature was never built".
+   The fix is a distinctly-named module-level `setText`. A shadowed-but-similar helper is worse
+   than a missing one: had `set` been in scope, the panels would have silently written to the
+   wrong property and merely looked empty.
+2. **A burst stamped on a different clock from the windows.** `run_loop` works in
+   `time.monotonic()` — correct for cadence, because it cannot jump — while the pet observes
+   windows and the trail is drawn on a timeline, both of which need wall-clock time. The burst was
+   recorded in monotonic time, so the UI read **"since the last change 1,790,499,452 s"**. It looks
+   like a formatting bug and is not: two epochs were being subtracted. On Linux `monotonic` is time
+   since boot, so the difference was almost exactly the current epoch.
+
+The generalisable part of the second: **a duration is only meaningful if both ends came from the
+same clock, and nothing in the arithmetic tells you when they did not.** The regression test
+asserts the stamp falls inside a wall-clock window measured around the call, which fails for any
+monotonic value.
+
+A third lesson belongs next to the degenerate-validation story: the rendering error was being
+swallowed by the *same* `catch` as a network error, so a broken panel presented as a failing
+backend. Fetch failures and paint failures now have separate handlers, and a paint failure goes to
+`console.error` where a person will see it.
+
 ## Corrections to commonly repeated claims
 
 | Claim | Reality |
