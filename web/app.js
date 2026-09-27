@@ -969,9 +969,17 @@ function paintTrust(trust, jev) {
       return b;
     };
     badge(trust.mode === 'mock' ? 'simulated home' : 'real home', live ? 'warn' : '');
-    badge(trust.dry_run ? 'dry run — nothing sent' : 'live — it can send',
-      trust.dry_run ? 'good' : 'bad',
-      trust.dry_run ? 'Service calls are logged and never dispatched.' : 'Service calls are real.');
+    // In mock mode `will_send` is true by design — the simulated light genuinely changes — so
+    // "live, it can send" in red would be both alarming and beside the point: there is no real
+    // device on the other end. The three cases are genuinely different and are labelled so.
+    if (!live) {
+      badge('applies to the mock only', 'good',
+        'No real device is involved: HA_MODE=mock, so the action changes the simulated light.');
+    } else if (trust.dry_run) {
+      badge('dry run — nothing sent', 'good', 'Service calls are logged and never dispatched.');
+    } else {
+      badge('live — it can send', 'bad', 'Service calls reach the real device.');
+    }
     if (trust.paused) badge('paused', 'mute');
     else badge('running', 'good');
     badge(trust.recording ? 'recording windows' : 'not recording', trust.recording ? 'good' : 'mute');
