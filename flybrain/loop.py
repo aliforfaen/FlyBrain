@@ -42,6 +42,7 @@ from flybrain.experiment import (
     drive_current_for_rate,
     rate_for_temperature,
 )
+from flybrain.ha import MockHomeAssistant, simulated_entities
 from flybrain.mapping import RoleResolver
 from flybrain.pacing import Pacer
 from flybrain.types import Action, Signal, coerce_patch, signal_is_dead
@@ -186,10 +187,35 @@ class LoopConfig:
                 logger.warning("ignoring non-numeric %s=%r", name, raw)
                 return default
 
+        mode = (e.get("HA_MODE") or "mock").strip().lower()
+        temperature_entity = e.get("FLYBRAIN_TEMPERATURE_ENTITY", cls.temperature_entity)
+        light_entity = e.get("FLYBRAIN_LIGHT_ENTITY", cls.light_entity)
+        if mode == "mock":
+            # `.env` describes a *real* house, and the simulator only contains its own entities, so
+            # a real sensor id in mock mode is a reading that can never arrive: the page renders,
+            # the cloud animates, and no decision is ever made. Say so rather than leaving a live-
+            # looking dashboard that is quietly doing nothing.
+            temperature_entity, light_entity, overridden = simulated_entities(
+                temperature_entity, light_entity
+            )
+            if overridden:
+                logger.warning(
+                    "HA_MODE=mock: using the simulated house's own entities. It has no %s, so the "
+                    "loop would read what you configured as unavailable and never make a decision "
+                    "-- a dashboard that renders and streams while the colour chart stays empty. "
+                    "Set HA_MODE=rest to use your real house, or point the ids at the simulated "
+                    "ones (%s=%s, %s=%s).",
+                    " or ".join(overridden),
+                    "FLYBRAIN_TEMPERATURE_ENTITY",
+                    MockHomeAssistant.TEMPERATURE_ENTITY,
+                    "FLYBRAIN_LIGHT_ENTITY",
+                    MockHomeAssistant.LIGHT_ENTITY,
+                )
+
         return cls(
-            temperature_entity=e.get("FLYBRAIN_TEMPERATURE_ENTITY", cls.temperature_entity),
-            light_entity=e.get("FLYBRAIN_LIGHT_ENTITY", cls.light_entity),
-            mode=(e.get("HA_MODE") or "mock").strip().lower(),
+            temperature_entity=temperature_entity,
+            light_entity=light_entity,
+            mode=mode,
             dry_run=flag("HA_DRY_RUN", True),
             source_min_c=number("FLYBRAIN_SOURCE_MIN_C", cls.source_min_c),
             source_max_c=number("FLYBRAIN_SOURCE_MAX_C", cls.source_max_c),

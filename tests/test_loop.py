@@ -330,12 +330,50 @@ class TestFromEnv:
     def test_entities_come_from_the_environment(self) -> None:
         cfg = LoopConfig.from_env(
             {
+                "HA_MODE": "rest",
                 "FLYBRAIN_TEMPERATURE_ENTITY": "sensor.hallway_temperature",
                 "FLYBRAIN_LIGHT_ENTITY": "light.hall_lamp",
             }
         )
         assert cfg.temperature_entity == "sensor.hallway_temperature"
         assert cfg.light_entity == "light.hall_lamp"
+
+    def test_mock_mode_uses_the_simulated_house_s_own_entities(self, caplog) -> None:
+        """A real entity id in mock mode is a reading that can never arrive.
+
+        This was found by starting the server the ordinary way: `.env` named a real sensor, the
+        mock house had never heard of it, and the dashboard rendered, animated and streamed while
+        making **zero** decisions. Nothing said why, because "no usable sensor reading" is also
+        what an unplugged sensor looks like.
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            cfg = LoopConfig.from_env(
+                {
+                    "HA_MODE": "mock",
+                    "FLYBRAIN_TEMPERATURE_ENTITY": "sensor.illamasensor_temperature",
+                    "FLYBRAIN_LIGHT_ENTITY": "light.datalys_2",
+                }
+            )
+        assert cfg.temperature_entity == "sensor.living_room_temperature"
+        assert cfg.light_entity == "light.kitchen"
+        assert "never make a decision" in caplog.text
+        assert "sensor.illamasensor_temperature" in caplog.text
+
+    def test_mock_mode_is_quiet_when_the_ids_already_match(self, caplog) -> None:
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            cfg = LoopConfig.from_env(
+                {
+                    "HA_MODE": "mock",
+                    "FLYBRAIN_TEMPERATURE_ENTITY": "sensor.living_room_temperature",
+                    "FLYBRAIN_LIGHT_ENTITY": "light.kitchen",
+                }
+            )
+        assert cfg.temperature_entity == "sensor.living_room_temperature"
+        assert caplog.text == ""
 
     def test_dry_run_stays_on_unless_explicitly_disabled(self) -> None:
         assert LoopConfig.from_env({"HA_DRY_RUN": "1"}).dry_run is True

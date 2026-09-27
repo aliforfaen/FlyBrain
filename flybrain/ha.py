@@ -178,9 +178,19 @@ class MockHomeAssistant:
     drawn from a seeded :class:`random.Random`, so runs are reproducible.
     """
 
+    #: The two entities the loop has to be *told* about, as opposed to discovering them. Everything
+    #: else (the extra sensory channels) is found by looking at what the adapter reports, so it
+    #: follows the mode automatically; these two come from `$FLYBRAIN_TEMPERATURE_ENTITY` and
+    #: `$FLYBRAIN_LIGHT_ENTITY`, which describe a *real* house. In mock mode those names exist
+    #: nowhere, the loop reads them as unavailable, and the dashboard renders and streams while
+    #: never making a decision -- a live-looking page with an empty colour chart. See
+    #: :func:`simulated_entities`, which is what stops that happening.
+    TEMPERATURE_ENTITY = "sensor.living_room_temperature"
+    LIGHT_ENTITY = "light.kitchen"
+
     #: Entity id -> unit of measurement.
     UNITS: ClassVar[dict[str, str]] = {
-        "sensor.living_room_temperature": "\u00b0C",
+        TEMPERATURE_ENTITY: "\u00b0C",
         "sensor.living_room_humidity": "%",
         "sensor.living_room_illuminance": "lx",
         "sensor.kitchen_power": "W",
@@ -215,19 +225,19 @@ class MockHomeAssistant:
         for entity_id in (
             "binary_sensor.hallway_motion",
             "binary_sensor.window_contact",
-            "light.kitchen",
+            self.LIGHT_ENTITY,
             "light.office",
             "switch.fan",
         ):
             self.attributes.setdefault(entity_id, {})
         self.states: dict[str, str] = {
-            "sensor.living_room_temperature": f"{self.scenario.temperature_start:.2f}",
+            self.TEMPERATURE_ENTITY: f"{self.scenario.temperature_start:.2f}",
             "sensor.living_room_humidity": f"{self.scenario.humidity_start:.2f}",
             "sensor.living_room_illuminance": f"{self.scenario.illuminance_off:.1f}",
             "sensor.kitchen_power": f"{self.scenario.power_idle:.2f}",
             "binary_sensor.hallway_motion": "off",
             "binary_sensor.window_contact": "off",
-            "light.kitchen": "off",
+            self.LIGHT_ENTITY: "off",
             "light.office": "off",
             "switch.fan": "off",
         }
@@ -302,14 +312,14 @@ class MockHomeAssistant:
             humidity += self._rng.gauss(0.0, noise)
         humidity = min(100.0, max(0.0, humidity))
 
-        self.states["sensor.living_room_temperature"] = f"{temperature:.2f}"
+        self.states[self.TEMPERATURE_ENTITY] = f"{temperature:.2f}"
         self.states["sensor.living_room_humidity"] = f"{humidity:.2f}"
 
         for entity_id, windows in self._events.items():
             active = any(start <= self.t < end for start, end in windows)
             self.states[entity_id] = "on" if active else "off"
 
-        kitchen_on = self.states.get("light.kitchen") == "on"
+        kitchen_on = self.states.get(self.LIGHT_ENTITY) == "on"
         illuminance = scenario.illuminance_on if kitchen_on else scenario.illuminance_off
         power = scenario.power_on if kitchen_on else scenario.power_idle
         if noise > 0:
@@ -547,6 +557,36 @@ def _parse_timestamp(item: dict[str, Any]) -> float:
         except ValueError:
             logger.debug("Home Assistant: unparseable timestamp %r", raw)
     return time.time()
+
+
+def simulated_entities(
+    temperature_entity: str, light_entity: str
+) -> tuple[str, str, tuple[str, ...]]:
+    """Point the two configured entities at the simulated house's own.
+
+    ``$FLYBRAIN_TEMPERATURE_ENTITY`` and ``$FLYBRAIN_LIGHT_ENTITY`` describe a **real** house —
+    that is the only thing they can describe, since the simulator's entities are fixed. So
+    ``HA_MODE=mock`` with a real-house ``.env`` used to name a sensor the simulator had never heard
+    of: the loop read it as unavailable, refused to act, and produced a dashboard that rendered,
+    streamed activity and never made a single decision, with an empty colour chart. Nothing warned,
+    because "no usable sensor reading" is also what a genuinely unplugged sensor looks like.
+
+    The mode wins here rather than the entity id, and the caller is told what changed so it can say
+    so out loud. Args are the configured ids; returns ``(temperature, light, overridden)``.
+    """
+    overridden = tuple(
+        name
+        for name, mock_name in (
+            (temperature_entity, MockHomeAssistant.TEMPERATURE_ENTITY),
+            (light_entity, MockHomeAssistant.LIGHT_ENTITY),
+        )
+        if name and name != mock_name
+    )
+    return (
+        MockHomeAssistant.TEMPERATURE_ENTITY,
+        MockHomeAssistant.LIGHT_ENTITY,
+        overridden,
+    )
 
 
 def make_home_assistant(mode: str | None = None) -> HomeAssistant:
