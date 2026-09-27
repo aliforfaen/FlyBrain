@@ -71,8 +71,15 @@ def _channel(entity_id="binary_sensor.hall_motion", indices=(10, 11, 12), **kw):
     )
 
 
-def _signal(entity_id, value, state="on", kind=SignalKind.MOTION):
-    return Signal(entity_id=entity_id, kind=kind, value=value, state=state, timestamp=0.0)
+def _signal(entity_id, value, state="on", kind=SignalKind.MOTION, attributes=None):
+    return Signal(
+        entity_id=entity_id,
+        kind=kind,
+        value=value,
+        state=state,
+        timestamp=0.0,
+        attributes=dict(attributes or {}),
+    )
 
 
 # ------------------------------------------------------------------ configuration
@@ -176,6 +183,94 @@ def test_temperature_still_drives_when_no_extra_channels_exist() -> None:
     loop, sim, _ = _loop()
     loop.drive_channels([_signal("sensor.living_room_temperature", 22.0, kind=SignalKind.TEMPERATURE)])
     assert set(sim.driven) == {0, 1}
+
+
+def test_unavailable_temperature_is_not_driven_at_its_fallback() -> None:
+    """The primary sensor gets the same dead-state check the extra channels always had.
+
+    Regression. ``HAClient`` substitutes a ``0.0`` fallback for an unavailable state, so an
+    offline thermometer arrived here as a plausible-looking 0 C and was driven like any other
+    reading — which could produce a real light action from a sensor that was not reporting.
+    The check below already existed for every channel *except* this one.
+    """
+    loop, sim, _ = _loop()
+    loop.drive_channels(
+        [
+            _signal(
+                "sensor.living_room_temperature",
+                0.0,
+                state="unavailable",
+                kind=SignalKind.TEMPERATURE,
+                attributes={"unavailable": True},
+            )
+        ]
+    )
+    assert sim.driven == {}
+    assert loop.reading_stale is True
+
+
+def test_unparseable_temperature_state_counts_as_missing() -> None:
+    """A state that is not a number is flagged ``unavailable`` without joining the dead list.
+
+    ``HAClient._parse_state`` sets the attribute when the value fails to parse, so a check on
+    the state *string* alone would let this through as the ``0.0`` fallback.
+    """
+    loop, sim, _ = _loop()
+    loop.drive_channels(
+        [
+            _signal(
+                "sensor.living_room_temperature",
+                0.0,
+                state="not-a-number",
+                kind=SignalKind.TEMPERATURE,
+                attributes={"unavailable": True},
+            )
+        ]
+    )
+    assert sim.driven == {}
+    assert loop.reading_stale is True
+
+
+def test_a_recovered_reading_clears_staleness() -> None:
+    """Staleness is a state the loop leaves again, not a latch."""
+    loop, sim, _ = _loop()
+    loop.drive_channels(
+        [
+            _signal(
+                "sensor.living_room_temperature",
+                0.0,
+                state="unavailable",
+                kind=SignalKind.TEMPERATURE,
+                attributes={"unavailable": True},
+            )
+        ]
+    )
+    assert loop.reading_stale is True
+
+    loop.drive_channels(
+        [_signal("sensor.living_room_temperature", 22.0, kind=SignalKind.TEMPERATURE)]
+    )
+    assert loop.reading_stale is False
+    assert loop.last_good_reading_at is not None
+    assert set(sim.driven) == {0, 1}
+
+
+def test_a_failed_fetch_clears_the_drive_rather_than_holding_it() -> None:
+    """An empty signal list means the fetch failed, not that nothing changed.
+
+    Regression. With no signals the drive was left exactly as it was, so the simulator kept
+    running on the previous window's input while ``decide`` decoded a colour from it — a
+    decision caused by a reading nobody supplied.
+    """
+    loop, sim, _ = _loop()
+    loop.drive_channels(
+        [_signal("sensor.living_room_temperature", 22.0, kind=SignalKind.TEMPERATURE)]
+    )
+    assert set(sim.driven) == {0, 1}
+
+    loop.drive_channels([])
+    assert sim.driven == {}
+    assert loop.reading_stale is True
 
 
 def test_missing_temperature_leaves_the_extras_driven() -> None:

@@ -57,6 +57,65 @@ def test_partial_trailing_row_is_dropped_not_fatal(tmp_path) -> None:
     assert open_recording(root).features.shape == (2, 3)
 
 
+def test_a_partial_row_is_repaired_before_the_next_append(tmp_path) -> None:
+    """The root cause: a fragment must never end up in the *middle* of the file.
+
+    Regression. The reader already dropped a trailing partial row, but the writer reopened in
+    append mode and wrote *after* it. From then on every row sat at a constant offset from
+    ``windows.jsonl``, and the row count still looked correct — so a sensor reading for one
+    moment would be silently paired with the spike vector from another.
+    """
+    root = _fill(tmp_path / "r5b", 2, dim=3)
+    with (root / "features.f32").open("ab") as fh:
+        fh.write(np.zeros(2, dtype=np.float32).tobytes())  # 2 of 3 floats: a torn write
+
+    with Recorder(root, 3, 300.0) as rec:
+        rec.record(np.full(3, 9.0, dtype=np.float32), sensors={"sensor.temp": 99.0}, t=5000.0)
+
+    rec = open_recording(root)
+    assert rec.features.shape == (3, 3)
+    # Without the repair this row read back as [0.0, 0.0, 9.0] — the fragment, then one float
+    # of the real row.
+    assert rec.features[2].tolist() == [9.0, 9.0, 9.0]
+    assert len(rec.windows) == 3
+    assert rec.windows[2]["sensors"]["sensor.temp"] == 99.0
+
+
+def test_an_extra_feature_row_is_not_paired_with_a_window(tmp_path) -> None:
+    """A crash between the feature write and the window write leaves one orphan row."""
+    root = _fill(tmp_path / "r5c", 3, dim=3)
+    with (root / "features.f32").open("ab") as fh:
+        fh.write(np.full(3, 77.0, dtype=np.float32).tobytes())  # row written, window line lost
+
+    rec = open_recording(root)
+    assert rec.paired_count() == 3
+    assert rec.features.shape[0] == 3
+    assert len(rec.windows) == 3
+
+
+def test_a_lost_feature_row_does_not_index_past_the_features(tmp_path) -> None:
+    """The dangerous direction: more windows than feature rows.
+
+    Regression. ``labelled`` indexes features using window positions, so a short feature file
+    raised ``IndexError`` — or, worse, paired windows with the wrong rows.
+    """
+    root = _fill(tmp_path / "r5d", 3, dim=3)
+    with Recorder(root, 3, 300.0) as rec:
+        rec.label("busy", t=1000.0)
+
+    # Drop a whole feature row, leaving three window lines behind it.
+    path = root / "features.f32"
+    path.write_bytes(path.read_bytes()[: 2 * 3 * 4])
+
+    rec = open_recording(root)
+    assert rec.features.shape[0] == 2
+    assert len(rec.windows) == 2
+
+    features, targets, _ = rec.labelled(horizon_s=1e9)
+    assert features.shape[0] == 2
+    assert len(targets) == 2
+
+
 def test_missing_sensor_reads_as_nan_not_zero(tmp_path) -> None:
     """An absent sensor is not a sensor reporting zero."""
     with Recorder(tmp_path / "r6", 2, 300.0) as rec:

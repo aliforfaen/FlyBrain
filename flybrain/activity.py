@@ -14,9 +14,34 @@ is how the fast engine will slot in later without touching the UI.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
+
+from flybrain.types import coerce_patch
+
+#: Rejection bounds for :class:`ActivitySettings`, checked by
+#: :meth:`ActivitySettings.validate_patch`. ``(low, high)``, inclusive; ``None`` means unbounded
+#: on that side.
+#:
+#: These are *rejection* bounds, not clamps, and the difference is deliberate. The control
+#: loop's sensitivity limits are clamped, because a value outside them still means something
+#: ("use as much of the range as is usable"). Here a negative gain or a frame rate of zero means
+#: nothing at all — it is a mistake — and silently clamping it to a legal value would hide the
+#: mistake rather than report it. A frame rate of zero is also the kind of setting whose failure
+#: mode is a dashboard that has quietly frozen.
+FIELD_BOUNDS: dict[str, tuple[float | None, float | None]] = {
+    "gain": (0.0, 1000.0),
+    "saturation": (0.01, 1e6),
+    "gamma": (0.01, 10.0),
+    "window_ms": (0.1, 10_000.0),
+    "fps": (1.0, 240.0),
+    "sparse_limit": (0.0, 1_000_000.0),
+    "background_drive_mv": (0.0, 1000.0),
+    "background_fraction": (0.0, 1.0),
+}
 
 
 @dataclass
@@ -56,6 +81,39 @@ class ActivitySettings:
     def from_dict(cls, d: dict) -> ActivitySettings:
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in d.items() if k in known})
+
+    @classmethod
+    def validate_patch(cls, patch: Mapping[str, Any]) -> dict[str, Any]:
+        """Coerce and range-check a patch, returning it **without applying it**.
+
+        The caller commits the whole result or none of it. The code this replaces cast each
+        field and assigned it inside the *same* loop, so ``{"fps": 30, "gain": "abc"}`` applied
+        the new frame rate and then failed: a partial update, reported to the operator as a
+        rejected one. There was also no range check at all, on either the REST or the WebSocket
+        path, so ``fps: 0`` or a negative gain were accepted and then silently papered over
+        downstream (``run_loop`` wraps fps in ``max(1.0, ...)``).
+
+        Raises:
+            KeyError: the patch names an unknown setting.
+            ValueError: a value is the wrong type, or outside :data:`FIELD_BOUNDS`.
+        """
+        coerced = coerce_patch(cls(), patch, allowed=set(cls.__dataclass_fields__))
+        for key, value in coerced.items():
+            lo, hi = FIELD_BOUNDS.get(key, (None, None))
+            if lo is not None and value < lo:
+                raise ValueError(f"{key} must be at least {lo}, got {value}")
+            if hi is not None and value > hi:
+                raise ValueError(f"{key} must be at most {hi}, got {value}")
+        return coerced
+
+    def apply_patch(self, patch: Mapping[str, Any]) -> None:
+        """Validate *patch* and commit it, or raise without changing anything.
+
+        The single entry point both the REST route and the WebSocket handler use, so the two
+        cannot drift apart again — they previously had separate, differently-broken loops.
+        """
+        for key, value in self.validate_patch(patch).items():
+            setattr(self, key, value)
 
 
 @dataclass

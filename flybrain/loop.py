@@ -43,15 +43,36 @@ from flybrain.experiment import (
     rate_for_temperature,
 )
 from flybrain.mapping import RoleResolver
-from flybrain.types import Action, Signal
+from flybrain.types import DEAD_STATES, Action, Signal, coerce_patch
 
 logger = logging.getLogger(__name__)
 
 READOUT_FILE = "colour_readout.npz"
 META_FILE = "colour_meta.json"
 
-#: States that mean "this sensor is not reporting". Kept in step with ``wiring.DEAD_STATES``.
-_DEAD_STATES = {"unavailable", "unknown", "none", ""}
+
+def _signal_is_dead(signal: Signal | None) -> bool:
+    """True when a signal is missing, or carries no usable reading.
+
+    Two checks, because they catch different things and neither alone is enough:
+
+    * the ``state`` string catches the literal values Home Assistant reports for a sensor
+      that is offline, unknown or never seen;
+    * the ``unavailable`` attribute is set by ``HAClient._parse_state`` whenever the state is
+      dead **or** the value failed to parse, so it also catches a state that is present but
+      not a number. Checking only the string would let that case through as the ``0.0``
+      fallback.
+
+    This helper exists because the temperature path used to check only that the entity was
+    *present*, while the extra-channel path two lines below checked the state. An
+    ``unavailable`` thermometer was therefore driven as a genuine 0 °C reading. See
+    ``types.DEAD_STATES`` for why the constant lives in one place now.
+    """
+    if signal is None:
+        return True
+    if signal.attributes.get("unavailable"):
+        return True
+    return signal.state.strip().lower() in DEAD_STATES
 
 
 class MissingReadout(RuntimeError):
@@ -188,19 +209,16 @@ class LoopConfig:
         }
 
     def apply(self, patch: dict) -> None:
-        """Apply a settings patch, coercing each value to its field's type."""
+        """Apply a settings patch, coercing each value to its field's type.
+
+        The patch is coerced *as a whole* before anything is assigned, so one bad value leaves
+        the settings exactly as they were rather than half-updated. This matters here more than
+        anywhere: ``dry_run`` lives in this dataclass, and a patch that half-applied could
+        change it while the caller is told the update failed.
+        """
         allowed = {f for f in self.__dataclass_fields__ if f != "history"}
-        unknown = set(patch) - allowed
-        if unknown:
-            raise KeyError(", ".join(sorted(unknown)))
-        for key, value in patch.items():
-            current = getattr(self, key)
-            if isinstance(current, bool):
-                setattr(self, key, bool(value))
-            elif isinstance(current, str):
-                setattr(self, key, str(value))
-            else:
-                setattr(self, key, float(value))
+        for key, value in coerce_patch(self, patch, allowed=allowed).items():
+            setattr(self, key, value)
 
 
 class LiveLoop:
@@ -243,6 +261,14 @@ class LiveLoop:
         self.observed_min_c: float | None = None
         self.observed_max_c: float | None = None
         self._last_sent_kelvin: float | None = None
+        #: True when the configured temperature entity had no usable reading in the most
+        #: recent window — offline, unknown, absent, or a state that is not a number. While
+        #: this is set :meth:`decide` refuses to act, because the colour readout has no input
+        #: and any output would be invented.
+        self.reading_stale: bool = False
+        #: Wall-clock time of the last usable temperature reading, so the dashboard can show
+        #: the *age* of what the loop is acting on rather than an unexplained frozen number.
+        self.last_good_reading_at: float | None = None
         #: Entity states captured by the most recent sensor read. Kept so the recorder can store
         #: what the house was doing without a second round-trip to Home Assistant.
         self.last_signals: list = []
@@ -369,6 +395,10 @@ class LiveLoop:
         self._last_rate_hz = rate
         self._active_source_c = smoothed
         self._active_brain_c = mapped
+        # Set here rather than in `drive_channels` because this is the only place a *value* is
+        # actually applied, and it is reached by both entry points. The dead-state check lives
+        # in `drive_channels`, which is the only caller that can see the sensor's state.
+        self.last_good_reading_at = time.time()
         return self.input_indices, current, rate
 
     def drive_temperature(self, celsius: float) -> None:
@@ -416,6 +446,14 @@ class LiveLoop:
         ``unavailable`` entity is not a sensor reading zero, and silently encoding it as one
         would teach the brain something false.
 
+        When **nothing** is readable — the usual cause being a failed ``/api/states`` fetch,
+        which returns an empty list — the drive is *cleared* rather than left as it was.
+        Leaving it would let the simulator keep running on the previous window's input while
+        :meth:`decide` decoded a colour from it: a decision caused by a reading nobody
+        supplied.
+
+        Sets :attr:`reading_stale`, which :meth:`decide` uses to suppress the action.
+
         Returns the per-channel rates actually applied, for the dashboard.
         """
         by_entity = {s.entity_id: s for s in signals}
@@ -424,15 +462,21 @@ class LiveLoop:
         rates: dict[str, float] = {}
 
         temperature = by_entity.get(self.loop.temperature_entity)
-        if temperature is not None:
+        # The primary sensor now gets the same dead-state check the extra channels always had.
+        # An ``unavailable`` thermometer arrives as its fallback *value*, which is a perfectly
+        # plausible-looking temperature — only the state distinguishes the two.
+        if not _signal_is_dead(temperature):
             idx, current, rate = self.temperature_drive(float(temperature.value))
             indices.append(idx)
             currents.append(np.broadcast_to(np.float32(current), idx.shape))
             rates[self.loop.temperature_entity] = rate
+            self.reading_stale = False
+        else:
+            self.reading_stale = True
 
         for channel in self.channels:
             signal = by_entity.get(channel.entity_id)
-            if signal is None or signal.state.strip().lower() in _DEAD_STATES:
+            if _signal_is_dead(signal):
                 continue
             rate = self.channel_rate(channel, signal.value)
             current = drive_current_for_rate(rate, self.sim.params.dt_ms, self.config)
@@ -448,6 +492,9 @@ class LiveLoop:
                 np.concatenate(indices),
                 np.concatenate([np.asarray(c, dtype=np.float32).reshape(-1) for c in currents]),
             )
+        else:
+            # Nothing readable at all. Clear rather than hold, so the brain falls quiet.
+            self.clear_drive()
         self.channel_rates = rates
         return rates
 
@@ -510,9 +557,35 @@ class LiveLoop:
         The window being decoded must already have been driven by :meth:`drive_temperature`;
         the reading reported here is the one that actually drove it, not a fresh read. That
         ordering is what makes the decision causal rather than prophetic.
+
+        Returns ``None`` only when there is genuinely nothing to report. A *stale* reading does
+        return an entry, deliberately: the dashboard has to be able to show that the loop has
+        stopped acting and why, and a silent gap is indistinguishable from a crash.
         """
-        if self._active_source_c is None:
+        if self._active_source_c is None and not self.reading_stale:
             return None
+
+        now = time.time()
+        if self.reading_stale:
+            # No usable input this window, so there is nothing to decode. Acting here would
+            # mean inventing a colour from a reading nobody supplied — which is exactly what
+            # used to happen, because an ``unavailable`` thermometer was encoded as 0 °C and
+            # then decoded like any other reading.
+            self.last_action = {
+                "entity_id": self.loop.light_entity,
+                "service": "turn_on",
+                "data": {},
+                "sent": False,
+                "suppressed": True,
+                "reason": "sensor_stale",
+                "dry_run": not self.loop.will_send,
+                "at": now,
+            }
+            # Deliberately *not* appended to ``history``: that is the X-Y plot of real
+            # decisions, and a row with no colour on it is a hole in the chart rather than an
+            # honest data point. The snapshot carries ``reading_stale`` and the age instead.
+            return {"t": now, "temperature_c": None, "kelvin": None, "band": None, "stale": True}
+
         temperature = self._active_source_c
         kelvin = self.decode(window_counts, window_ms)
 
@@ -617,6 +690,15 @@ class LiveLoop:
             "window_ms": self.config.window_ms,
             "decisions": self.decisions,
             "last_action": self.last_action,
+            # A missing or offline sensor used to be invisible here: the loop reported its last
+            # reading as though it were current and kept acting on it. The dashboard shows
+            # these two so "the number is frozen" and "the number is wrong" look different.
+            "reading_stale": bool(self.reading_stale),
+            "reading_age_s": (
+                None
+                if self.last_good_reading_at is None
+                else round(time.time() - self.last_good_reading_at, 1)
+            ),
             "temp_range_c": [self.config.temp_min_c, self.config.temp_max_c],
             "band_centres_k": {n: k for n, k in COLOUR_BANDS},
             "history": self.history,

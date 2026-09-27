@@ -865,6 +865,11 @@ function handleText(raw) {
     case 'pause':
       setPaused(!!msg.value);
       break;
+    case 'error':
+      // The server refused something this page sent (a bad settings value, most likely). Say
+      // so rather than leaving the controls showing a value the server never accepted.
+      showNotice(`Rejected by the backend: ${msg.error || 'unknown error'}`, 8000);
+      break;
     case 'pong':
     case 'metrics':
     case 'regions':

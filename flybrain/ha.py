@@ -27,16 +27,13 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 
 import httpx
 
-from flybrain.types import Signal, SignalKind
+from flybrain.types import DEAD_STATES, Signal, SignalKind
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8123"
 DEFAULT_TIMEOUT_S = 5.0
 DEFAULT_RETRIES = 2
-
-#: Raw HA states that carry no usable numeric value.
-UNAVAILABLE_STATES = frozenset({"unavailable", "unknown", "none", ""})
 
 #: Mapping of common non-numeric HA states onto a 0.0/1.0 float.
 BINARY_STATES: dict[str, float] = {
@@ -329,7 +326,7 @@ class MockHomeAssistant:
         for entity_id, state in self.states.items():
             attributes = dict(self.attributes.get(entity_id, {}))
             value = state_to_float(state, 0.0)
-            if state.strip().lower() in UNAVAILABLE_STATES:
+            if state.strip().lower() in DEAD_STATES:
                 attributes["unavailable"] = True
             signals.append(
                 Signal(
@@ -480,7 +477,7 @@ class RestHomeAssistant:
         unit = str(attributes.get("unit_of_measurement", ""))
 
         value = parse_state_value(state)
-        if state.strip().lower() in UNAVAILABLE_STATES or value is None:
+        if state.strip().lower() in DEAD_STATES or value is None:
             attributes["unavailable"] = True
             value = self.fallback
 

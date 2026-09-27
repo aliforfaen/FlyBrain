@@ -473,16 +473,19 @@ async def get_settings() -> dict:
 
 @app.post("/api/settings")
 async def post_settings(patch: dict) -> dict:
-    allowed = set(ActivitySettings.__dataclass_fields__)
-    unknown = set(patch) - allowed
-    if unknown:
-        raise HTTPException(400, f"unknown settings: {sorted(unknown)}")
-    for key, value in patch.items():
-        current = getattr(service.settings, key)
-        try:
-            setattr(service.settings, key, type(current)(value))
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(400, f"bad value for {key}: {value!r}") from exc
+    """Update the view settings, all-or-nothing.
+
+    The patch is validated in full *before* any of it is applied, so a rejected update cannot
+    leave the dashboard half-reconfigured. The previous version cast and assigned inside one
+    loop, which meant the earlier keys of a bad patch took effect and were then reported as
+    rejected.
+    """
+    try:
+        service.settings.apply_patch(patch)
+    except KeyError as exc:
+        raise HTTPException(400, f"unknown settings: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     await service.broadcast_json({"type": "settings", "settings": service.settings.to_dict()})
     return service.settings.to_dict()
 
@@ -563,6 +566,26 @@ async def post_fit_range() -> dict:
     return snapshot
 
 
+async def _apply_dashboard_settings(ws: WebSocket, msg: dict) -> None:
+    """Apply a settings patch from the dashboard, reporting a bad one instead of raising.
+
+    Extracted from the receive loop so the property that actually matters — a malformed message
+    is *reported* and the socket survives it — is testable without a live server. Letting the
+    error escape used to close the connection, and this socket is the dashboard's only view of
+    the brain: one bad number was a self-inflicted outage in which the picture simply froze.
+
+    Validation happens inside :meth:`ActivitySettings.apply_patch`, which commits all of a patch
+    or none of it, so a rejected message cannot leave the view half-reconfigured either.
+    """
+    try:
+        service.settings.apply_patch(msg.get("settings") or {})
+    except (KeyError, ValueError) as exc:
+        logger.warning("rejected dashboard settings patch: %s", exc)
+        await ws.send_text(json.dumps({"type": "error", "error": str(exc)}))
+        return
+    await service.broadcast_json({"type": "settings", "settings": service.settings.to_dict()})
+
+
 @app.websocket("/ws/activity")
 async def ws_activity(ws: WebSocket) -> None:
     await ws.accept()
@@ -589,9 +612,7 @@ async def ws_activity(ws: WebSocket) -> None:
             if kind == "pause":
                 service.set_paused(bool(msg.get("value", True)))
             elif kind == "settings":
-                for key, value in msg.get("settings", {}).items():
-                    if key in ActivitySettings.__dataclass_fields__:
-                        setattr(service.settings, key, type(getattr(service.settings, key))(value))
+                await _apply_dashboard_settings(ws, msg)
             elif kind == "drive":
                 await post_drive(msg)
             elif kind == "ping":

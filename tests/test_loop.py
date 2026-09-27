@@ -266,6 +266,58 @@ def test_deadband_suppresses_calls_but_still_reports_every_decision():
     assert loop.last_action["sent"] is True
 
 
+def test_a_stale_reading_stops_the_loop_acting_and_says_so():
+    """A sensor that stops reporting must stop the light, not freeze the last colour.
+
+    Regression. A failed fetch left ``_active_source_c`` holding the previous reading, so
+    ``decide`` kept decoding and could keep sending service calls driven by an input that no
+    longer existed. The loop must refuse to act *and* report why: on a dashboard, a silent gap
+    is indistinguishable from a crash.
+    """
+    import asyncio
+
+    class _StubHA:
+        def __init__(self):
+            self.calls = []
+
+        async def get_signals(self):
+            return []
+
+        async def call_service(self, entity_id, service, data=None):
+            self.calls.append((entity_id, service, dict(data or {})))
+            return True
+
+    n = 4
+    w = np.zeros(n + 1)
+    w[0] = 1.0
+    loop = _loop(dry_run=True, mode="mock", w=w)
+    loop.ha = _StubHA()
+    counts = np.array([1560, 0, 0, 0])            # 5200 K, inside the trained band
+
+    async def run():
+        loop.drive_temperature(20.0)              # a usable reading, and a real decision
+        first = await loop.decide(counts, window_ms=300.0)
+        assert first is not None
+        assert len(loop.ha.calls) == 1
+        assert loop.snapshot()["reading_age_s"] is not None
+
+        loop.drive_channels([])                   # the fetch failed: nothing is readable
+        stale = await loop.decide(counts, window_ms=300.0)
+        assert stale is not None
+        assert stale["stale"] is True
+        assert loop.last_action["sent"] is False
+        assert loop.last_action["reason"] == "sensor_stale"
+        assert len(loop.ha.calls) == 1            # no second call, on any window
+
+    asyncio.run(run())
+    assert loop.reading_stale is True
+    assert loop.decisions == 1                    # a refusal is not a decision
+    assert len(loop.history) == 1                 # the chart gets no colourless point
+    snap = loop.snapshot()
+    assert snap["reading_stale"] is True
+    assert snap["reading_age_s"] is not None
+
+
 class TestFromEnv:
     """Config from the environment: the only way to point the loop at a real house."""
 

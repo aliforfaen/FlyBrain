@@ -5,10 +5,23 @@ Every module imports its types from here. See CONTRACT.md.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+
+#: Entity states that mean "this sensor is not reporting".
+#:
+#: Defined **once**, here, because three modules had each grown their own identical copy
+#: (``ha.UNAVAILABLE_STATES``, ``wiring.DEAD_STATES``, ``loop._DEAD_STATES``). The copies being
+#: identical is precisely what made them dangerous: the primary temperature path in
+#: :meth:`flybrain.loop.LiveLoop.drive_channels` checked that the entity was *present* but
+#: forgot this set, while the extra-channel path a few lines below remembered it. An
+#: ``unavailable`` thermometer was therefore encoded as its ``0.0`` fallback and could drive a
+#: real light. A duplicated constant is an invitation to exactly that bug; a single import is
+#: not, which is why the old names are removed rather than aliased.
+DEAD_STATES = frozenset({"unavailable", "unknown", "none", ""})
 
 
 class SignalKind(str, Enum):
@@ -79,3 +92,47 @@ class Episode:
     features: np.ndarray
     target: np.ndarray
     context: dict = field(default_factory=dict)
+
+
+def _as_bool(value: object) -> bool:
+    """Coerce to ``bool`` the way the rest of the project reads boolean settings.
+
+    ``bool("false")`` is ``True``, which is the kind of surprise that turns a "yes, keep it
+    read-only" into a satisfied service call. Strings are therefore matched against the same
+    set of falsy words the environment loader uses.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def coerce_patch(instance: object, patch: Mapping[str, object], *, allowed: set[str]) -> dict:
+    """Coerce a settings patch to each field's type, **without applying it**.
+
+    Returns the coerced values so the caller can commit them in one go. Coercing first and
+    assigning second is the entire point: applying field-by-field means a bad value part-way
+    through a patch leaves the earlier fields already changed, and the caller reports an error
+    for an update that half happened. That matters most where a setting is safety-relevant — a
+    ``dry_run`` that half-applied is worse than one that refused outright.
+
+    Raises:
+        KeyError: the patch names a field that is not settable.
+        ValueError: a value cannot be coerced to its field's type.
+    """
+    unknown = set(patch) - set(allowed)
+    if unknown:
+        raise KeyError(", ".join(sorted(unknown)))
+
+    out: dict = {}
+    for key, value in patch.items():
+        current = getattr(instance, key)
+        try:
+            if isinstance(current, bool):
+                out[key] = _as_bool(value)
+            elif isinstance(current, str):
+                out[key] = str(value)
+            else:
+                out[key] = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"bad value for {key}: {value!r}") from exc
+    return out

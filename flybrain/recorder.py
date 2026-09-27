@@ -55,6 +55,27 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         fh.flush()
 
 
+def _repair_partial_row(path: Path, row_bytes: int) -> int:
+    """Truncate trailing bytes that do not form a whole row; returns how many were dropped.
+
+    A hard kill during ``write()`` can leave a fragment. Leaving it there is worse than it
+    sounds: the next ``record()`` appends *after* the fragment, so from that point on every row
+    is shifted by a constant offset relative to ``windows.jsonl``. The row *count* still looks
+    plausible, so nothing downstream notices — one moment's sensor reading is silently paired
+    with another moment's spike vector. Repairing on open is what stops the file ever getting a
+    partial row in the middle, which no reader could disentangle after the fact.
+    """
+    if not path.exists():
+        return 0
+    size = path.stat().st_size
+    usable = (size // row_bytes) * row_bytes
+    if usable == size:
+        return 0
+    with path.open("r+b") as fh:
+        fh.truncate(usable)
+    return size - usable
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -105,8 +126,20 @@ class Recorder:
         self._labels_path = self.root / LABELS_FILE
         self._meta_path = self.root / META_FILE
 
+        # Repair a partial trailing row *before* opening for append. This is the root-cause fix
+        # for the misalignment: once a fragment is there and the next row is appended after it,
+        # no reader can work out where the rows really start.
+        row_bytes = 4 * self.feature_dim
+        dropped = _repair_partial_row(self._features_path, row_bytes)
+        if dropped:
+            logger.warning(
+                "truncated %d stray byte(s) of a partial feature row in %s",
+                dropped,
+                self._features_path,
+            )
+
         self._fh = self._features_path.open("ab")
-        self._n_windows = self._features_path.stat().st_size // (4 * self.feature_dim)
+        self._n_windows = self._features_path.stat().st_size // row_bytes
 
         if not self._meta_path.exists():
             payload = {
@@ -192,19 +225,57 @@ class Recording:
         self.feature_dim = int(self.meta["feature_dim"])
         self.window_ms = float(self.meta.get("window_ms", 0.0))
 
+    def _feature_rows(self) -> int:
+        """Whole rows present in ``features.f32``, ignoring any trailing partial row."""
+        path = self.root / FEATURES_FILE
+        if not path.exists():
+            return 0
+        return path.stat().st_size // (4 * self.feature_dim)
+
+    def paired_count(self) -> int:
+        """How many rows are certainly paired across both files.
+
+        ``Recorder.record`` appends the feature row and *then* the matching ``windows.jsonl``
+        line, so a crash between the two writes leaves the files one apart — and nothing in
+        either file records which row is the orphan. Rather than guess, this takes the shorter
+        of the two. At worst one window is discarded, and it is discarded *deterministically*
+        instead of pairing one moment's sensor reading with another moment's spike vector.
+        """
+        return min(self._feature_rows(), len(_read_jsonl(self.root / WINDOWS_FILE)))
+
     @property
     def features(self) -> np.ndarray:
-        """``(n_windows, feature_dim)`` float32 firing rates, one row per window."""
+        """``(n_windows, feature_dim)`` float32 firing rates, one row per window.
+
+        Truncated to :meth:`paired_count` so it always lines up with :attr:`windows`. The rows
+        kept are the *first* n, because both files are append-only and any orphan is therefore
+        at the end.
+        """
         raw = np.fromfile(self.root / FEATURES_FILE, dtype=np.float32)
         usable = (raw.size // self.feature_dim) * self.feature_dim
         if usable != raw.size:
             # A kill during a write can leave a partial row; drop it rather than fail.
             logger.warning("dropping %d trailing floats from a partial window", raw.size - usable)
-        return raw[:usable].reshape(-1, self.feature_dim)
+        rows = usable // self.feature_dim
+        keep = min(rows, self.paired_count())
+        if keep < rows:
+            logger.warning(
+                "ignoring %d feature row(s) with no matching window (interrupted write?)",
+                rows - keep,
+            )
+        return raw[: keep * self.feature_dim].reshape(-1, self.feature_dim)
 
     @property
     def windows(self) -> list[dict[str, Any]]:
-        return _read_jsonl(self.root / WINDOWS_FILE)
+        """One row per window, truncated to :meth:`paired_count` to match :attr:`features`."""
+        rows = _read_jsonl(self.root / WINDOWS_FILE)
+        keep = min(len(rows), self.paired_count())
+        if keep < len(rows):
+            logger.warning(
+                "ignoring %d window row(s) with no matching feature row (interrupted write?)",
+                len(rows) - keep,
+            )
+        return rows[:keep]
 
     @property
     def labels(self) -> list[Label]:

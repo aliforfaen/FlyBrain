@@ -51,7 +51,7 @@ import numpy as np
 
 from flybrain.codec import ChannelSpec
 from flybrain.mapping import RoleResolver, default_sensor_roles
-from flybrain.types import Signal, SignalKind
+from flybrain.types import DEAD_STATES, Signal, SignalKind
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +112,6 @@ ROLE_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
         "touch and vibration: mechanosensory",
     ),
 )
-
-#: Entity states that mean "this sensor is not reporting". A pathway on one of these is real
-#: wiring with no data behind it yet, which is worth showing rather than silently dropping.
-DEAD_STATES = {"unavailable", "unknown", "none", ""}
-
 
 @dataclass(frozen=True)
 class Pathway:
