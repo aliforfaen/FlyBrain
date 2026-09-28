@@ -491,6 +491,8 @@ swatch cannot disagree.
 | `FLYBRAIN_POLL_S` | `5` | While waiting, how often to re-read the sensors looking for a change. Reading a sensor costs no GPU time. `0` disables the trigger |
 | `FLYBRAIN_BURST_S` | `10` | How long to keep running at full rate once a change fires the trigger |
 | `FLYBRAIN_TRIGGER_DELTA` | `0` | How far the primary sensor must move, **in its own units**, to count as an event. `0` turns the trigger off, leaving a plain heartbeat |
+| `FLYBRAIN_TRIGGER_COOLDOWN_S` | heartbeat | How often the trigger may **fire**, independently of how often it qualifies. Defaults to the heartbeat — at most one trigger burst per heartbeat window — which is what stops a fast-moving sensor (the demo room swings ~1.9 °C per 5 s poll) from turning adaptive pacing into flat out. `0` disables the cap |
+| `FLYBRAIN_ENGINE` | `dense` | `dense` (the validated reference) or `active` (same model and integrator, steps only neurons away from rest — bitwise-identical output, measured slower under real drive; see `docs/engine.md`) |
 
 All of it can also be changed at runtime from the dashboard, which overrides the environment.
 

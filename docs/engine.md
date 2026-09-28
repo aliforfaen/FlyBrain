@@ -5,10 +5,10 @@ The project runs **two** simulation backends behind one interface, deliberately.
 | Role | Engine | Why |
 |---|---|---|
 | Scientific reference | `ConnectomeSim` (`flybrain/sim.py`) — FlyWire v783, exact exponential integrator | Our own, fully inspected, mapped to real thermosensory and antennal populations, and validated against brian2 on identical networks and identical input. `recurrent_scale` is `1.0` and `w_scale_mv` is the published `0.275 mV` — there is no fudge factor. |
-| Real-time engine (planned) | Port of the **active-set integrator** from `fly-brain-minecraft` (MIT) | The only approach verified to reach real-time on a whole CNS. |
+| Real-time engine (built, opt-in) | `ActiveSetSim` (`flybrain/sim.py`) — the active-set integrator from `fly-brain-minecraft` (MIT), ported to our tensor ops | **Bitwise-identical to the reference on CPU and CUDA, and validated against brian2 (Jaccard 1.000) — but measured *slower* than the dense engine on this GPU under real drive.** Opt-in via `FLYBRAIN_ENGINE=active`; numbers and the reason below. The GPU path to real time is compiled per-step code, not tensor fusion. |
 
-Neither replaces the other. The reference answers "is this faithful?"; the fast engine answers
-"can it keep up?".
+Neither replaces the other. The reference answers "is this faithful?"; the fast engine was
+meant to answer "can it keep up?" — and the honest measured answer is "not this way".
 
 > **Resolved: the recurrent gain was never a gain problem.** Earlier revisions of this project
 > set `recurrent_scale` to a "provisional" `0.01` and warned that the published weight did not
@@ -33,9 +33,23 @@ Measured here, on the RTX 3070, full 138,639 neurons / 15,091,983 synapses at
 This matches the published benchmark for the same model: the PyTorch backend is the slowest of
 the six backends measured, roughly 0.10× realtime, while GeNN reaches ~2×.
 
-Why: every 0.1 ms timestep performs a `15,091,983`-element sparse matvec over **all 138,639
-neurons**, whether or not they are doing anything. At any moment the overwhelming majority are
-at rest.
+*(Re-measured after the constant-work below: **0.54 ms/step, 0.19× realtime**, same spike
+output. The published comparison stands.)*
+
+### What was actually banked: cheaper constants on the dense step
+
+Before any algorithmic change, three zero-risk changes took the dense step from 0.83 ms to
+**0.54 ms (1.5×)** with **bitwise-identical output** (same 52,957 spikes on the benchmark
+window):
+
+- **int32 CSR column indices.** torch builds them as int64, cuSPARSE accepts int32, and the
+  column array is read for all 15M synapses on every step — halving it halves the step's
+  dominant memory traffic.
+- **Persistent drive as GPU tensors built once** in `set_drive`, instead of Python lists plus
+  two H2D copies per step (~10k steps per second of brain time).
+- **In-place zeroing of the per-step drive buffer** instead of a fresh `zeros_like`.
+
+This is the baseline the active-set engine has to beat — and, measured, does not.
 
 ## The fix: integrate only what is active
 
@@ -65,6 +79,39 @@ At `dt = 0.1 ms` this reproduces Brian2 to `1e-13 mV`. That is the same integrat
 `ConnectomeSim` already uses (see `docs/architecture.md`), so the port is mostly about the
 active-set bookkeeping, not about the dynamics.
 
+### The port was built — and measured, it loses on GPU
+
+`ActiveSetSim` implements exactly this: a dense per-step mask finds every neuron that could
+deviate from rest (`v` away from rest, conductance above a 1e-30 floor **by magnitude** — the
+magnitude test matters: inhibitory conductance is negative, and the first version dropped
+neurons holding only inhibition, found by the bitwise equivalence test), delivery copies
+per-neuron journal ranges (the synapses reordered by presynaptic index) instead of running
+the matmul, and a **pending counter** keeps a resting target in the active set for the full
+`delay_steps` between a delivery and its read. On CPU it is **bitwise identical** to the
+dense engine; on CUDA likewise; and the brian2 harness passes with it (Jaccard 1.000,
+spike-count ratio 1.000).
+
+Measured on the RTX 3070, full connectome, identical drive and identical output:
+
+| Scenario | dense (int32) | active-set |
+|---|---|---|
+| quiet (no drive, no spikes) | 0.48 s/1000 | **0.42 s/1000** (1.15× faster) |
+| single column, 8 neurons driven | **0.46 s/1000** | 0.79 s/1000 (1.7× slower) |
+| busy, 256 neurons driven | **0.53 s/1000** | 0.85 s/1000 (1.6× slower) |
+
+Why it loses: the active list and the delivery size are data-dependent, so each step needs
+two `nonzero` calls and a length reduction — three device synchronisations that drain the
+pipeline the dense engine never drains — plus ~40 small kernel launches. That fixed host
+cost (~0.4 ms/step) is on the order of the entire dense step. And the work does not shrink
+as much as the synapse count suggests: in the busy regime ~39k neurons sit in the active set
+(conductance tails plus pending input), so delivery and integration still touch 28% of the
+brain. `fly-brain-minecraft` reaches real time on CPU because a compiled language has no
+per-op overhead and delivers on threads; CUDA graphs cannot capture the dynamic shapes.
+
+The engine stays in the tree, opt-in via `FLYBRAIN_ENGINE=active`: it is exact, validated,
+and the right foundation if the delivery kernel is ever written in CUDA. It is not the
+default anywhere, and nothing depends on it.
+
 ## Why not just switch to GeNN
 
 GeNN (PyGeNN 5.4.0, LGPL-2.1) is the fastest measured backend (~2× realtime on a 4070) and has
@@ -74,12 +121,14 @@ exactly the right integration surface:
 - readout: `spike_recording_enabled=True` + `pull_recording_buffers_from_device()` giving
   per-neuron spike identity once per control tick
 
-It remains a strong option, but it adds a CUDA code-generation toolchain and a second build
-system, and it was measured on a 4070 rather than a 3070 (**unverified** for our GPU). The
-active-set approach is a contained algorithmic change to code we already control and have
-validated, and it helps on CPU as well as GPU.
+It remains a strong option — stronger now: the tensor-level active-set port is built,
+validated and measured, and its loss is attributable precisely to the per-op host overhead
+that code generation eliminates. It adds a CUDA code-generation toolchain and a second build
+system, and it was measured on a 4070 rather than a 3070 (**unverified** for our GPU).
 
-Verdict: port active-set first; keep GeNN as the fallback if it is not enough.
+Verdict: **GeNN, or a hand-written CUDA step kernel, is now the primary path to real-time.**
+The dense engine with int32 indices is the baseline to beat; `ActiveSetSim` is the exactness
+reference for whatever replaces it.
 
 ## What "real-time" actually needs to mean
 

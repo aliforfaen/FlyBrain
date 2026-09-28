@@ -72,9 +72,13 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
    the harness — a green result is only meaningful if the thing measured is doing something.
    A previous "PASS" was degenerate: it agreed while producing zero recurrent spikes.
 
-5. **The engine, not the physics, is the remaining compromise.** 0.13× realtime. The fix is
-   an active-set integrator; batching does not help (measured: the GPU is already saturated
-   at batch 1). See [`docs/engine.md`](docs/engine.md).
+5. **The engine, not the physics, is the remaining compromise.** 0.19× realtime (was 0.13×
+   before int32 CSR indices and a few constant-work fixes, all bitwise-identical). The
+   tensor-level active-set integrator was built, validated bitwise-exact and against Brian2 —
+   and measured **slower** than dense under real drive (host-side syncs dominate); it stays
+   opt-in via `FLYBRAIN_ENGINE=active`. The GPU path to real-time is compiled per-step code
+   (GeNN or a CUDA kernel); batching does not help (measured: the GPU is already saturated at
+   batch 1). See [`docs/engine.md`](docs/engine.md).
 
 ## Layout
 

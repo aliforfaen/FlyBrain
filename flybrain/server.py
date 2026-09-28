@@ -224,10 +224,12 @@ class BrainService:
     # ----------------------------------------------------------------- setup
 
     def load(self) -> None:
-        from flybrain.sim import ConnectomeSim
+        from flybrain.sim import make_sim
 
         logger.info("loading connectome ...")
-        self.sim = ConnectomeSim().load()
+        # FLYBRAIN_ENGINE=dense (default, the validated reference) or 'active' — same model,
+        # same integrator, only what is awake gets stepped. See flybrain/sim.ActiveSetSim.
+        self.sim = make_sim(os.environ.get("FLYBRAIN_ENGINE", "dense")).load()
         self.brain = MemoryBrain(self.sim, self.settings)
         self.roles = RoleResolver.from_sim(self.sim)
         if POSITIONS.exists():

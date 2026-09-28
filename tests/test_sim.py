@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from flybrain.sim import ConnectomeSim, ShiuParams
+from flybrain.sim import ActiveSetSim, ConnectomeSim, ShiuParams, make_sim
 
 pytestmark = pytest.mark.filterwarnings("ignore")
 
@@ -190,3 +190,109 @@ class TestActivityDriver:
         assert regions, "region_usage returned nothing after a spiking window"
         assert sum(r["spikes"] for r in regions) > 0
         assert all("rate_hz" in r for r in regions)
+
+
+def _engine_pair(pre, post, weights, n: int):
+    """Build the same small network on both engines, CPU, for an equivalence check."""
+    sims = []
+    for cls in (ConnectomeSim, ActiveSetSim):
+        sim = cls(ShiuParams(), device="cpu")
+        sim.n_neurons = n
+        sim._torch = torch
+        sim._W = (
+            torch.sparse_coo_tensor(
+                torch.stack([torch.tensor(post), torch.tensor(pre)]),
+                torch.tensor(list(weights), dtype=torch.float32),
+                (n, n),
+            )
+            .coalesce()
+            .to_sparse_csr()
+        )
+        if isinstance(sim, ActiveSetSim):
+            sim._build_journal()
+        sim.reset()
+        sims.append(sim)
+    return sims
+
+
+class TestActiveSetEngine:
+    """The active-set engine must be indistinguishable from the dense reference.
+
+    It exists only because it might one day be faster; being a *different* simulation
+    would make it worthless. Both assertions below are bitwise, not approximate: on CPU
+    the delivery's summation order matches the dense matmul's, and adding exact zeros is
+    exact in floating point. (On CUDA index_add_ uses atomics and order can vary; the
+    Brian2 harness validates that path - it passes with Jaccard 1.000.)
+    """
+
+    def test_driven_chain_is_bitwise_identical(self):
+        sims = _engine_pair([0, 1], [1, 2], [100.0, 100.0], 3)
+        for _ in range(120):
+            for sim in sims:
+                sim.inject(np.array([0]), 68.75)
+            for sim in sims:
+                sim.step(1)
+        counts = [sim.spike_counts(reset=False) for sim in sims]
+        assert np.array_equal(counts[0], counts[1])
+        assert counts[0][2] > 0
+        assert np.array_equal(sims[0]._v.numpy(), sims[1]._v.numpy())
+
+    def test_random_network_is_bitwise_identical(self):
+        """800 neurons / 6k synapses with excitatory AND inhibitory weights, driven 40 times.
+
+        The inhibitory weights matter: the active-set mask must test conductance by
+        magnitude, and a network of only excitation would never catch that bug.
+        """
+        rng = np.random.default_rng(7)
+        n, k = 800, 6000
+        pre = rng.integers(0, n, k)
+        post = rng.integers(0, n, k)
+        weights = rng.uniform(0.05, 1.2, k) * rng.choice([-1.0, 1.0], k, p=[0.3, 0.7])
+        dense, active = _engine_pair(pre, post, weights, n)
+        for t in range(0, 1200, 37):
+            idx = rng.choice(n, size=20, replace=False).astype(np.int64)
+            cur = float(rng.uniform(5, 40))
+            dense.inject(idx, cur)
+            active.inject(idx, cur)
+            dense.step(1)
+            active.step(1)
+        assert np.array_equal(dense.spike_counts(reset=False), active.spike_counts(reset=False))
+        assert np.array_equal(dense._v.numpy(), active._v.numpy())
+
+    def test_delayed_input_reaches_a_resting_target(self):
+        """A resting neuron must stay in the active set until its delayed input lands.
+
+        The pending counter exists for exactly this: without it, a target at rest is dropped
+        the step after a presynaptic spike and the input, arriving `delay_steps` later, is
+        lost into a slot nobody reads.
+        """
+        dense, active = _engine_pair([0, 1], [1, 2], [100.0, 100.0], 3)
+        # Two hops, each behind the 18-step axonal delay, and each taking ~17 more steps for
+        # the alpha kernel to lift the target over threshold: 2*18 + 60 covers it exactly.
+        horizon = 2 * ShiuParams().delay_steps + 60
+        for sim in (dense, active):
+            sim.inject(np.array([0]), 68.75)
+            sim.step(1)
+            sim.step(horizon)
+        for sim in (dense, active):
+            counts = sim.spike_counts(reset=False)
+            assert counts[1] == 1, f"{type(sim).__name__} lost the first hop"
+            assert counts[2] == 1, f"{type(sim).__name__} lost the delayed delivery"
+
+    def test_batch_size_must_be_one(self):
+        sim = ActiveSetSim(ShiuParams(), device="cpu")
+        sim.n_neurons = 1
+        sim._torch = torch
+        sim._W = torch.sparse_coo_tensor(
+            torch.tensor([[0], [0]]), torch.tensor([1.0]), (1, 1)
+        ).coalesce().to_sparse_csr()
+        sim._build_journal()
+        with pytest.raises(ValueError):
+            sim.reset(batch_size=4)
+
+    def test_make_sim_factory(self):
+        assert type(make_sim()) is ConnectomeSim
+        assert type(make_sim("dense")) is ConnectomeSim
+        assert type(make_sim("active")) is ActiveSetSim
+        with pytest.raises(ValueError):
+            make_sim("genn")

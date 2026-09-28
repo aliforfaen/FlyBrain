@@ -476,6 +476,7 @@ class ConnectomeSim:
             "n_neurons": self.n_neurons,
             "n_synapses": int(self._W.values().numel()) if self._W is not None else 0,
             "device": self.device,
+            "engine": type(self).__name__,
             "batch_size": self.batch_size,
             "sim_time_ms": self.sim_time_ms,
             "annotations": self.annotation_table is not None,
@@ -484,3 +485,226 @@ class ConnectomeSim:
     def save_index_map(self, path: str | Path) -> None:
         """Persist the flywire-id -> index mapping for other tools."""
         Path(path).write_text(json.dumps(self._id_to_index))
+
+
+class ActiveSetSim(ConnectomeSim):
+    """The same network and the same exact integrator, run only on what is awake.
+
+    The dense engine steps all 138,639 neurons and scans all ~15M synapses every 0.1 ms,
+    whether or not anything is happening. At any moment the overwhelming majority of the
+    brain is exactly at rest with zero conductance and no input - and for those neurons the
+    step is the identity: ``v`` stays ``v_rest``, ``g`` stays 0, no spike is possible. This
+    class makes that identity explicit. It is the design the ``fly-brain-minecraft`` project
+    runs at real time on CPU (see ``docs/engine.md``), adapted to the tensor operations we
+    already have.
+
+    A neuron is **active** on a step when it could deviate from rest: its membrane is away
+    from ``v_rest``, its conductance is above a vanishing floor, it is refractory, it is
+    receiving drive, or it has **pending** delayed input - conductance written into its delay
+    slot that has not been read yet. The pending counter is what keeps a neuron in the active
+    set for the full ``delay_steps`` between a presynaptic spike and the input landing;
+    without it, a resting target would be dropped and the spike silently lost.
+
+    Exactness, stated precisely rather than assumed:
+
+    * For a neuron at rest with ``g = 0``, no drive and no pending input, the update
+      computes ``v_rest + 0 * decay + 0 * alpha = v_rest`` - skipping it changes nothing.
+    * Delivery sums only the contributions of spiking presynaptic neurons. The dense
+      matmul sums the same contributions plus exact zeros (`0.0 * w`), and adding a zero
+      is exact in floating point, so the sums agree - up to the *order* of addition.
+      On CPU the order matches the matmul's and results are bitwise identical; on CUDA
+      ``index_add_`` uses atomics, so sums can differ by ~1 ULP and a threshold crossing
+      sitting exactly on that knife edge can flip. The Brian2 harness result for each
+      engine is recorded separately for exactly this reason.
+    * The conductance floor ``G_FLOOR`` bounds the error of dropping a neuron: below it,
+      ``g * alpha`` is ~1e-33 mV, forty orders of magnitude under one ULP of ``v``. Without
+      a floor, ``g`` decays asymptotically and never reaches exactly zero, which would pin
+      every neuron that ever received a spike into the active set for hundreds of steps.
+
+    Cost per step is proportional to the number of *active* neurons rather than to the
+    network, plus one dense 138k-element mask pass and two device synchronisations (the
+    active list and the delivery size are data-dependent). **Measured on the RTX 3070 at
+    full connectome, that trade loses**: the syncs and ~40 small kernel launches per step
+    cost a fixed ~0.4 ms/step of host time, which is most of what the dense engine spends
+    on the matmul it eliminates. Quiet (zero drive) it is ~1.15x faster than dense; under
+    real drive it is ~1.6x slower, with spike output bitwise identical. The win here is
+    exactness plus the bookkeeping pattern, not speed: getting to real time on GPU needs
+    compiled per-step code (CUDA graphs cannot capture the dynamic shapes; GeNN can), which
+    is the fallback docs/engine.md already names. Kept opt-in via ``FLYBRAIN_ENGINE=active``
+    so the measured numbers stay reproducible; ``dense`` remains the default everywhere.
+
+    Batch size must be 1: the live loop runs one stream, and delivery is per-batch by
+    construction. Offline training that wants batches keeps using :class:`ConnectomeSim`.
+    """
+
+    #: Conductances below this are treated as zero. See the exactness note above.
+    G_FLOOR = 1e-30
+
+    def __init__(self, params: ShiuParams | None = None, device: str | None = None) -> None:
+        super().__init__(params=params, device=device, batch_size=1)
+        self._j_pre = None
+        self._j_post = None
+        self._j_w = None
+        self._j_ptr = None
+        self._pending = None
+
+    # ------------------------------------------------------------------ setup
+
+    def load(self, *args, **kwargs) -> ActiveSetSim:
+        """Load as usual, then build the presynaptic (CSC-order) delivery journal.
+
+        The dense engine's weight matrix is CSR with rows indexed by *postsynaptic* neuron,
+        which is the wrong axis for delivery: a spike needs the *out-edges* of the spiking
+        neuron. The journal is the same synapses reordered by presynaptic index with an
+        offset pointer per neuron, so delivering a spike means copying one contiguous range
+        per spiking neuron instead of scanning all 15M rows.
+        """
+        super().load(*args, **kwargs)
+        self._build_journal()
+        return self
+
+    def _build_journal(self) -> None:
+        import torch
+
+        n = self.n_neurons
+        device = self.device
+        csr = self._W.cpu()
+        crow = csr.crow_indices().to(torch.int64)
+        col = csr.col_indices().to(torch.int64)
+        # Expand the CSR row pointer into a post id per synapse, then reorder everything by
+        # presynaptic id. `stable=True` keeps each pre-neuron's edges in post order, which
+        # keeps delivery order deterministic.
+        post = torch.repeat_interleave(
+            torch.arange(n, dtype=torch.int64), crow[1:] - crow[:-1]
+        )
+        order = torch.sort(col, stable=True).indices
+        self._j_pre = col[order].to(torch.int32).to(device)
+        self._j_post = post[order].to(torch.int32).to(device)
+        self._j_w = csr.values()[order].to(device)
+        counts = torch.bincount(col, minlength=n)
+        self._j_ptr = torch.zeros(n + 1, dtype=torch.int64, device=device)
+        self._j_ptr[1:] = counts.cumsum(0)
+        self._max_fanout = int(counts.max().item())
+        import logging
+
+        logging.getLogger(__name__).info(
+            "delivery journal built: %d synapses, max fanout %d",
+            int(csr.values().numel()),
+            self._max_fanout,
+        )
+
+    def reset(self, batch_size: int | None = None) -> None:
+        import torch
+
+        if batch_size is not None and batch_size != 1:
+            raise ValueError("ActiveSetSim runs a single stream; use ConnectomeSim for batches")
+        super().reset(batch_size=1)
+        self._pending = torch.zeros(self.n_neurons, dtype=torch.float32, device=self.device)
+
+    # -------------------------------------------------------------- stepping
+
+    def step(self, n_steps: int = 1) -> None:
+        """Advance by ``n_steps`` timesteps, integrating and delivering only active neurons.
+
+        The per-step math is the same exact double-exponential solution as the dense engine
+        (see :meth:`ConnectomeSim.step` for the derivation and the traps). The differences
+        are bookkeeping: a dense mask finds the active set, delivery copies journal ranges
+        for spiking neurons, and the pending counter carries "input is in flight" between a
+        delivery and its read `delay_steps` later.
+        """
+        import math
+
+        import torch
+
+        p = self.params
+        device = self.device
+        decay_g = math.exp(-p.dt_ms / p.tau_syn_ms)
+        decay_v = math.exp(-p.dt_ms / p.tau_mem_ms)
+        alpha = p.tau_syn_ms / (p.tau_mem_ms - p.tau_syn_ms) * (decay_v - decay_g)
+        refractory_ms = float(p.t_refrac_ms)
+
+        for _ in range(n_steps):
+            self._schedule_persistent()
+
+            # ---- the active set: anyone who could deviate from rest this step
+            # Conductance is signed (inhibitory is negative), so the floor test is on its
+            # magnitude - `g > floor` would drop every neuron holding only inhibition, and
+            # the dropped g would stop decaying: divergence found by the equivalence test.
+            mask = (
+                (self._v[0] != p.v_rest_mv)
+                | (self._g[0].abs() > self.G_FLOOR)
+                | (self._refrac[0] > 0.0)
+                | (self._drive[0] != 0.0)
+                | (self._pending != 0.0)
+            )
+            act = mask.nonzero().flatten()  # data-dependent; one device sync
+            v_a = self._v[0].index_select(0, act)
+            g_a = self._g[0].index_select(0, act)
+            r_a = self._refrac[0].index_select(0, act)
+            d_a = self._drive[0].index_select(0, act)
+            in_a = self._delay_buf[0, self._head].index_select(0, act)
+            # The slot is consumed whether or not the neuron is refractory (a refractory
+            # neuron's input is suppressed below, exactly like the reference model's
+            # `delay_buffer * refractory` term - and exactly as destroyed).
+            self._pending.index_add_(0, act, -(in_a != 0.0).to(torch.float32))
+
+            # ---- the same exact update, restricted to the active rows
+            g_new = g_a * decay_g + in_a * (r_a <= 0.0).to(torch.float32)
+            v_new = p.v_rest_mv + (v_a + d_a - p.v_rest_mv) * decay_v + g_new * alpha
+            above = v_new > p.v_thresh_mv
+            blocked = r_a > 0.0
+            spikes = (above & ~blocked).to(torch.float32)
+            self._v[0, act] = torch.where(above, p.v_reset_mv, v_new)
+            self._g[0, act] = g_new - g_new * spikes
+            r_new = torch.clamp(r_a - p.dt_ms, min=0.0)
+            self._refrac[0, act] = torch.maximum(r_new, spikes * refractory_ms)
+
+            self._spike_counts_gpu.index_add_(0, act, spikes.to(torch.int64))
+
+            # ---- delivery: copy each spiking neuron's journal range into the slot
+            self._delay_buf[0, self._head].zero_()
+            spiking = (spikes > 0).nonzero().flatten()  # data-dependent; one device sync
+            k = spiking.numel()
+            if k:
+                spike_pre = act.index_select(0, spiking)
+                spike_val = spikes.index_select(0, spiking) * p.recurrent_scale
+                lengths = self._j_ptr[spike_pre.to(torch.int64) + 1] - self._j_ptr[
+                    spike_pre.to(torch.int64)
+                ]
+                total = int(lengths.sum().item())  # data-dependent; one device sync
+                if total:
+                    which = torch.repeat_interleave(
+                        torch.arange(k, device=device), lengths, output_size=total
+                    )
+                    starts = self._j_ptr.index_select(0, spike_pre.to(torch.int64))
+                    base = torch.repeat_interleave(starts, lengths, output_size=total)
+                    within = torch.arange(total, device=device) - torch.repeat_interleave(
+                        lengths.cumsum(0) - lengths, lengths, output_size=total
+                    )
+                    syn = base + within
+                    tgt = self._j_post[syn].to(torch.int64)
+                    w = self._j_w[syn] * spike_val.index_select(0, which)
+                    slot = self._delay_buf[0, self._head]
+                    slot.index_add_(0, tgt, w)
+                    # Input is now in flight toward these neurons; they stay active until the
+                    # slot is read, however many delay steps that takes.
+                    self._pending += (slot != 0.0).to(torch.float32)
+
+            self._drive.zero_()
+            self._head = (self._head + 1) % self._delay_buf.shape[1]
+            self._n_steps += 1
+
+
+def make_sim(engine: str = "dense", **kwargs) -> ConnectomeSim:
+    """Build a simulator engine by name: ``dense`` (reference) or ``active`` (real-time path).
+
+    Both run the same model and the same integrator; see :class:`ActiveSetSim` for what
+    differs. ``dense`` remains the default everywhere so that the validated reference
+    behaviour is what runs unless the operator asks for speed.
+    """
+    name = (engine or "dense").strip().lower()
+    if name == "dense":
+        return ConnectomeSim(**kwargs)
+    if name == "active":
+        return ActiveSetSim(**kwargs)
+    raise ValueError(f"unknown engine {engine!r} (expected 'dense' or 'active')")

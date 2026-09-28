@@ -30,7 +30,6 @@ sys.path.insert(0, str(ROOT))
 from flybrain.sim import (
     DEFAULT_COMPLETENESS,
     DEFAULT_CONNECTIVITY,
-    ConnectomeSim,
     ShiuParams,
 )
 
@@ -198,14 +197,16 @@ def run_brian2(sub, drive, real_neurons: int, n_drive: int, duration_ms: float):
 # --------------------------------------------------------------------- torch
 
 
-def run_torch(sub, drive, real_neurons: int, n_drive: int, duration_ms: float):
+def run_torch(sub, drive, real_neurons: int, n_drive: int, duration_ms: float, engine: str = "dense"):
     """Our simulator on the identical network and identical input schedule."""
     import torch
+
+    from flybrain.sim import make_sim
 
     _src, tgt, times, weight = drive
     n_neurons = real_neurons + n_drive
 
-    sim = ConnectomeSim(REF, device="cpu", batch_size=1)
+    sim = make_sim(engine, params=REF, device="cpu")
     sim.n_neurons = n_neurons
     sim._torch = torch
     sim._W = (
@@ -227,6 +228,10 @@ def run_torch(sub, drive, real_neurons: int, n_drive: int, duration_ms: float):
         .to_sparse_csr()
     )
     sim.reset()
+    if engine == "active":
+        # The subclass builds its delivery journal inside load(); this harness assembles the
+        # network by hand, so the journal has to be built explicitly.
+        sim._build_journal()
 
     dt = REF.dt_ms
     n_steps = round(duration_ms / dt)
@@ -256,6 +261,12 @@ def main() -> int:
     ap.add_argument("--duration", type=float, default=200.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
+        "--engine",
+        choices=["dense", "active"],
+        default="dense",
+        help="which simulator engine to validate in --mode ours (both must pass)",
+    )
+    ap.add_argument(
         "--no-augment",
         action="store_false",
         dest="augment",
@@ -281,9 +292,9 @@ def main() -> int:
         return 0
 
     if args.mode == "ours":
-        counts = run_torch(sub, schedule, real_neurons, n_drive, args.duration)
+        counts = run_torch(sub, schedule, real_neurons, n_drive, args.duration, args.engine)
         np.savez(args.ours_out, counts=counts)
-        print(f"[ours] total spikes: {int(counts.sum()):,} -> {args.ours_out}")
+        print(f"[ours:{args.engine}] total spikes: {int(counts.sum()):,} -> {args.ours_out}")
         return 0
 
     ref = np.load(args.ref_out)["counts"]
