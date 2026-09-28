@@ -151,6 +151,17 @@ class BrainService:
     """Owns the simulator and the stepping loop, decoupled from the web layer."""
 
     def __init__(self) -> None:
+        # .env has to be loaded *here*, before anything reads os.environ: FLYBRAIN_ALWAYS_ON,
+        # FLYBRAIN_RECORD and FLYBRAIN_RECORD_NAME are all read in this constructor, and the
+        # loop-level load_dotenv() in LoopConfig.from_env runs later, inside load(). With the
+        # old order, a fresh install with FLYBRAIN_ALWAYS_ON=1 in .env silently ran "off unless
+        # watched" and FLYBRAIN_RECORD=1 silently recorded nothing — the loop made decisions
+        # only while a dashboard was open, which looks exactly like working. load_dotenv()
+        # never overrides a real environment variable, so systemd units and exported shells
+        # keep winning.
+        from flybrain.env import load_dotenv
+
+        load_dotenv()
         self.sim = None
         self.brain: MemoryBrain | None = None
         self.settings = ActivitySettings()
