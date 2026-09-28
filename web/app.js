@@ -601,6 +601,18 @@ let lastTick = 0;
 let lastFpsPaint = 0;
 let lastChartPaint = 0;
 
+/* Render on demand. The server's frame rate is compute-bound (often ~2/s during a burst, zero
+ * while waiting for the heartbeat), so redrawing 138k points at 60 fps draws the same frame
+ * ~30 times over and burns laptop battery for nothing on a dashboard meant to be left open
+ * for days. The view renders only when something changed: a frame arrived, the camera moved
+ * (OrbitControls fires 'change' for drags, damping and auto-orbit alike), the afterimage is
+ * still fading, or a control touched the scene — everything routes through markViewDirty(). */
+let viewDirty = true;
+
+function markViewDirty() {
+  viewDirty = true;
+}
+
 function initThree() {
   renderer = new THREE.WebGLRenderer({
     canvas,
@@ -628,6 +640,7 @@ function initThree() {
   controls.autoRotate = state.autoRotate;
   controls.autoRotateSpeed = 0.42;
   controls.update();
+  controls.addEventListener('change', markViewDirty);
 
   resizeThree();
   window.addEventListener('resize', resizeThree);
@@ -643,6 +656,7 @@ function resizeThree() {
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   if (material) material.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+  markViewDirty();
   sizeChart();
 }
 
@@ -710,6 +724,7 @@ function buildCloud(positions) {
   helper.material.opacity = 0.30;
   helper.material.depthWrite = false;
   scene.add(helper);
+  markViewDirty();
 }
 
 /* The family palette comes from /api/groups, so there is exactly one place that decides what
@@ -875,8 +890,14 @@ function animate(now) {
 
   if (!document.hidden) {
     if (controls) controls.update();
-    decayGlow(dt);
-    if (renderer && scene && camera) renderer.render(scene, camera);
+    // The afterimage keeps its own render cadence: while any cell is still fading the scene
+    // changes every tick, so render until the last glow dies out.
+    const glowing = state.afterimage && recentCount > 0;
+    if (glowing) decayGlow(dt);
+    if (viewDirty || glowing) {
+      if (renderer && scene && camera) renderer.render(scene, camera);
+      viewDirty = false;
+    }
 
     if (now - lastChartPaint > 55) {
       lastChartPaint = now;
@@ -974,6 +995,7 @@ function clearGlow() {
   }
   recentCount = 0;
   intensityAttr.needsUpdate = true;
+  markViewDirty();
 }
 
 /* =========================================================== cell families */
@@ -1106,6 +1128,7 @@ function applySpotlight() {
   material.uniforms.uSpotFamily.value = state.spotFamily;
   material.uniforms.uSpotSense.value = state.spotSense;
   material.uniforms.uViewMode.value = viewModeCode();
+  markViewDirty();
   const active = state.spotFamily >= 0 || state.spotSense >= 0;
   for (const b of document.querySelectorAll('#sense-chips .sense-chip')) {
     b.setAttribute('aria-pressed', String(Number(b.dataset.sense) === state.spotSense));
@@ -1184,6 +1207,7 @@ function setViewMode(mode) {
     b.setAttribute('aria-pressed', String(b.dataset.view === mode));
   }
   if (material) material.uniforms.uViewMode.value = viewModeCode();
+  markViewDirty();
   const note = $('#view-note');
   if (note) {
     note.textContent = {
@@ -1261,6 +1285,7 @@ function buildOrientation() {
 function setMarkers(on) {
   state.markers = !!on;
   if (markerGroup) markerGroup.visible = state.markers;
+  markViewDirty();
   const btn = $('#btn-markers');
   if (btn) {
     btn.setAttribute('aria-pressed', String(state.markers));
@@ -1312,6 +1337,7 @@ async function showTrace(group) {
     traceGroup.add(label);
   }
   scene.add(traceGroup);
+  markViewDirty();
 }
 
 /* ============================================================ guided exploration */
@@ -2441,6 +2467,7 @@ function handleBinary(buf) {
     if (n < state.nNeurons) frameBase.fill(0, n);
     registerGlow(incoming, n);
     intensityAttr.needsUpdate = true;
+    markViewDirty();
   }
 
   const now = performance.now();

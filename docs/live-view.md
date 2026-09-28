@@ -123,9 +123,17 @@ time per published frame and displays the result at a comfortable rate, reportin
 `sim_ms` (brain time) and wall-clock FPS, so the ratio is always visible. Brain time and wall
 time are deliberately decoupled.
 
-The fix for actual real-time throughput is the **active-set integrator** — integrate only the
-neurons that are active rather than sweeping all 138k every 0.1 ms step. See
-[research/simulation-backends.md](research/simulation-backends.md).
+On the browser side the view **renders on demand**: the 3D scene is redrawn only when a frame
+arrives, the camera moves, the afterimage is still fading, or a control touched the scene —
+not at 60 fps regardless. The server's frame rate is compute-bound (often ~2/s during a burst,
+zero while waiting for the heartbeat), so a dashboard meant to be left open for days would
+otherwise redraw the same frame ~30 times over per frame received and spend laptop battery on
+nothing. The FPS meter still reports the animation tick; the WebGL redraws are fewer than that
+between frames.
+
+The fix for actual real-time throughput is a **compiled per-step kernel** (GeNN or CUDA) — the
+tensor-level active-set engine was built, validated bitwise-exact, and measured slower than
+dense on this GPU. See [engine.md](engine.md).
 
 ## Frontend files
 
