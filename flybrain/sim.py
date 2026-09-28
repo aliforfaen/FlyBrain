@@ -117,12 +117,17 @@ class ConnectomeSim:
         self._delay_buf = None
         self._head = 0
         self._drive = None
+        # The persistent drive as GPU tensors, built once in set_drive rather than per step:
+        # the drive is re-applied on every step of every window, and rebuilding Python lists
+        # plus two host->device copies for a few hundred indices 10,000 times per second of
+        # brain time was pure host overhead in the hot loop.
+        self._drive_idx = None
+        self._drive_vals = None
         self._spike_counts: np.ndarray | None = None
         self._spike_counts_gpu = None
         self.annotation_table = None
         self.flywire_ids: np.ndarray | None = None
         self._id_to_index: dict[int, int] = {}
-        self._persistent_drive: dict[int, float] = {}
 
     # ------------------------------------------------------------------ setup
 
@@ -184,7 +189,17 @@ class ConnectomeSim:
         )
         values = torch.from_numpy(weights.copy())
         coo = torch.sparse_coo_tensor(indices, values, (self.n_neurons, self.n_neurons))
-        self._W = coo.coalesce().to_sparse_csr().to(self.device)
+        csr = coo.coalesce().to_sparse_csr()
+        # 32-bit CSR indices: torch builds them as int64, but cuSPARSE accepts int32, and the
+        # column indices are read for every synapse on every step. Halving that array halves
+        # the dominant memory traffic of the step (measured here: 0.83 -> 0.77 ms/step), with
+        # no numerical difference - the indices are the same integers.
+        self._W = torch.sparse_csr_tensor(
+            csr.crow_indices().to(torch.int32),
+            csr.col_indices().to(torch.int32),
+            csr.values(),
+            csr.size(),
+        ).to(self.device)
         logger.info(
             "connectome loaded: %d neurons, %d synapses, device=%s",
             self.n_neurons,
@@ -275,14 +290,17 @@ class ConnectomeSim:
         idx = np.asarray(indices, dtype=np.int64)
         if idx.size == 0:
             return
-        self._persistent_drive = {}
+        torch = self._torch
         vals = np.broadcast_to(np.asarray(current_mv, dtype=np.float32), idx.shape)
-        for i, val in zip(idx.tolist(), vals.tolist()):
-            self._persistent_drive[int(i)] = float(val)
+        self._drive_idx = torch.as_tensor(idx, dtype=torch.long, device=self.device)
+        self._drive_vals = torch.as_tensor(
+            np.ascontiguousarray(vals), dtype=torch.float32, device=self.device
+        )
 
     def clear_drive(self) -> None:
         """Remove all persistent drive."""
-        self._persistent_drive = {}
+        self._drive_idx = None
+        self._drive_vals = None
 
     def inject(self, indices, current_mv: float | np.ndarray, batch: int = 0) -> None:
         """Add an immediate (undelayed) current for the next step only."""
@@ -298,17 +316,9 @@ class ConnectomeSim:
 
     def _schedule_persistent(self) -> None:
         """Queue the persistent drive to enter the delay line this step."""
-        if not self._persistent_drive:
+        if self._drive_idx is None:
             return
-        torch = self._torch
-        idx = torch.as_tensor(
-            list(self._persistent_drive.keys()), dtype=torch.long, device=self.device
-        )
-        vals = torch.as_tensor(
-            list(self._persistent_drive.values()), dtype=torch.float32, device=self.device
-        )
-        if idx.numel():
-            self._drive[:, idx] += vals
+        self._drive[:, self._drive_idx] += self._drive_vals
 
     # -------------------------------------------------------------- stepping
 
@@ -406,7 +416,10 @@ class ConnectomeSim:
             self._head = (self._head + 1) % self._delay_buf.shape[1]
 
             self._spike_counts_gpu += spikes.sum(dim=0).to(torch.int64)
-            self._drive = torch.zeros_like(self._drive)
+            # Reused in place. `zeros_like` here allocated a fresh 550 KB every step and made
+            # the caching allocator churn; the drive is always fully re-scheduled or zero, so
+            # zeroing in place is equivalent and allocation-free.
+            self._drive.zero_()
             self._n_steps += 1
 
     def run(self, duration_ms: float) -> None:

@@ -160,7 +160,7 @@ class TestActivityDriver:
         assert driver.advance().total_spikes > 0
 
         driver.clear_input_drive()
-        assert driver.sim._persistent_drive == {}, "simulator still holds a drive"
+        assert driver.sim._drive_idx is None, "simulator still holds a drive"
         # The first window may still contain spikes queued before the clear.
         for _ in range(3):
             driver.advance()
@@ -171,7 +171,7 @@ class TestActivityDriver:
         driver.set_input_drive(np.array([0]), 20.0)
         driver.advance()
         driver.set_input_drive(np.array([], dtype=np.int64), 20.0)
-        assert driver.sim._persistent_drive == {}
+        assert driver.sim._drive_idx is None
 
     def test_region_usage_reads_the_cached_window(self):
         """It must not read the simulator tensor that the advance loop has already reset."""

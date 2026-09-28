@@ -253,7 +253,7 @@ class MemoryBrain:
     def set_input_drive(self, indices, current_mv: float) -> None:
         """Apply a persistent drive to ``indices`` on every window.
 
-        The drive is held by the *simulator* (``ConnectomeSim._persistent_drive``), which
+        The drive is held by the *simulator* (``ConnectomeSim.set_drive``), which
         re-applies it on every step. Keeping only a local copy of the indices is not
         enough: it must be pushed through to the simulator, and cleared there as well.
         """
