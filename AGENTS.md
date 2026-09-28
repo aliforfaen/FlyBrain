@@ -23,7 +23,7 @@ population → learned ridge readout → colour temperature (K) → HA light.tur
 ```bash
 uv sync                                        # Python 3.11 → .venv (torch + CUDA wheels)
 .venv/bin/python tools/fetch_data.py           # connectome + annotations, ~140 MB, one time
-.venv/bin/python -m pytest tests/ -q           # 523 passing, 3 skipped (live Jev), no connectome needed
+.venv/bin/python -m pytest tests/ -q           # 564 passing, 3 skipped (live Jev), no connectome needed
 
 .venv/bin/python -m flybrain.experiment        # train the readout, ~50 s
 .venv/bin/python -m flybrain.server            # dashboard + live loop
@@ -106,9 +106,11 @@ covers linger, logs, the `WorkingDirectory`/recording trap and troubleshooting.
 | `flybrain/codec.py`, `learn.py`, `mapping.py`, `types.py`, `activity.py` | The rest of the package: spike encoding/decoding, the ridge learner, role → connectome-index resolution, the shared dataclasses every module imports, and the viewer's activity quantisation |
 | `CONTRACT.md` | **Historical, superseded.** The pre-implementation interface contract between parallel workstreams, kept as the record of what was planned. Some paths and names in it were never built (see its own status note and the annotations inline) — read `docs/architecture.md` for what actually exists |
 | `tools/fetch_data.py` | Downloads and byte-verifies the connectome and annotation tables |
+| `tools/benchmark.py` | Reproduces the engine numbers in `docs/engine.md`: throughput, VRAM, dense vs active, bitwise spike identity |
+| `deploy/` | The systemd user unit and its installer — `deploy/install-service.sh`, documented in [`docs/service.md`](docs/service.md) |
 | `web/` | three.js dashboard, no bundler, three.js vendored |
 | `validation/` | Brian2 comparison and a closed-form integrator test |
-| `tools/` | Probes: readout capacity, loop regime, loop accuracy |
+| `tools/` | Probes: readout capacity, loop regime, loop accuracy, and the engine benchmark |
 | `docs/` | The real documentation; screenshots in `docs/images/` |
 | `vendor/fly-brain/` | Upstream connectome **data only**, fetched not committed (gitignored) |
 

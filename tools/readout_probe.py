@@ -1,18 +1,24 @@
-"""Probe the readout population: does the brain state actually encode temperature?
+"""The measurement that replaced the band-collapsed readout — kept as the design record.
 
-The control loop collapsed the readout population into ``n_bands`` scalar rates, which
-throws away nearly all of the brain state. This tool measures what is actually
-recoverable *before* we change the readout, so the change is driven by a measurement
-rather than a guess.
+**Historical.** This is the probe that decided the readout's present shape. The control loop used
+to collapse the readout population into ``n_bands`` scalar rates, which throws away nearly all of
+the brain state; this tool measured what was actually recoverable, and the answer moved the readout
+to per-neuron rates with a direct Kelvin target (see the note at the top of ``experiment.py``). It
+is kept because that decision cites it, not because it describes the shipped artifact.
 
-Collection simulates the brain across a fine temperature sweep and caches the raw
-per-neuron rate vectors to ``/tmp/readout_probe.npz``; analysis is then free to re-run.
-Pass ``--reuse`` to skip collection.
+Collection simulates the brain across a fine temperature sweep and caches the raw per-neuron rate
+vectors to ``/tmp/readout_probe.npz``; analysis is then free to re-run. Pass ``--reuse`` to skip
+collection.
+
+One caveat against today's code: collection uses ``loop.sample()``, which is the **from-rest**
+regime, while the shipped readout is fitted on ``loop.sweep()`` (continuous — see
+``tools/loop_regime_probe.py``). The relative comparison this tool was built for still holds; its
+absolute errors describe the old regime, not the trained one.
 
 The generalisation numbers use a **held-out split** (train on even sweep indices, test on
 odd), with any feature selection done using training data only. That matters: with 512
 features and only a few dozen windows, an in-sample or selection-leaked number would look
-far better than the model really is.
+far better than the model really is. A ``top-512`` row is the whole pool, so it is not a real cut.
 
 Usage::
 

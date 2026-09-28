@@ -13,7 +13,7 @@ in a fly brain knows what a kitchen light is — that mapping is ours, and the c
 
 ![Python](https://img.shields.io/badge/python-3.11-3776ab)
 ![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-ee4c2c)
-![Tests](https://img.shields.io/badge/tests-523%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-564%20passing-brightgreen)
 ![Licence](https://img.shields.io/badge/licence-MIT%20code%20%2F%20CC%20BY--NC%204.0%20data-lightgrey)
 
 ![The FlyBrain dashboard: a 3D view of 138,639 neurons with live control panels](docs/images/dashboard.png)
@@ -31,9 +31,10 @@ room sensor (°C) → rate-coded drive → 138,639-neuron connectome (frozen) �
                           light.turn_on (colour temperature K) ← trained linear readout
 ```
 
-One decision consumes a **300 ms window of brain time**, which costs about **2.3 seconds of GPU
-work** — the simulator currently runs at **0.13× realtime**. Measured end to end against the
-ideal mapping: **31 K mean error, 104 K worst case, correlation 0.9971**.
+One decision consumes a **300 ms window of brain time**, which costs about **1.6 seconds of GPU
+work** — the simulator runs at **0.19× realtime** ([`tools/benchmark.py`](tools/benchmark.py)
+reproduces the step time, and the dense-vs-active comparison, on the full connectome). Measured end
+to end against the ideal mapping: **31 K mean error, 104 K worst case, correlation 0.9971**.
 
 That error sounds large next to a colour temperature, but it is **~1% of the 3800 K span** —
 below what anyone can see on a lamp.
@@ -69,7 +70,7 @@ temperature swings between about 11 °C and 34 °C on a three-minute cycle and y
 light follow it within a minute.
 
 ```bash
-.venv/bin/python -m pytest tests/ -q      # 523 passing, 3 skipped, no connectome needed
+.venv/bin/python -m pytest tests/ -q      # 564 passing, 3 skipped, no connectome needed
 .venv/bin/python -m flybrain.wiring       # propose a pathway map for your own house
 ```
 
@@ -146,8 +147,11 @@ without retraining, plus the code, tests and documentation.
    measured is doing something — a previous "PASS" was degenerate, agreeing while producing zero
    recurrent spikes.
 
-5. **The engine, not the physics, is the remaining compromise.** The fix is an active-set
-   integrator; batching does not help, because the GPU is already saturated at batch 1.
+5. **The engine, not the physics, is the remaining compromise.** The active-set integrator was
+   built and validated bitwise-exact — and measured *slower* than the dense engine under real
+   drive, so it stays opt-in (`FLYBRAIN_ENGINE=active`). Batching does not help, because the GPU is
+   already saturated at batch 1. The path to real time is compiled per-step code (GeNN or a CUDA
+   kernel), not tensor fusion. See [`docs/engine.md`](docs/engine.md).
 
 ### Validation against Brian2
 
@@ -164,7 +168,7 @@ pins the integrator itself: one synaptic event of weight `w` must deflect the me
 
 ## What it costs to leave running
 
-One decision costs ~2.3 s of GPU work, so the loop is paced by a wall-clock interval rather than
+One decision costs ~1.6 s of GPU work, so the loop is paced by a wall-clock interval rather than
 run flat out — the default is one decision every **15 s**. Measured on an RTX 3070:
 
 | Mode | Mean power |
@@ -230,14 +234,14 @@ learned from.
 
 | Piece | State |
 |---|---|
-| Connectome loading, sparse LIF simulation, GPU | **Working** — ~3 s load, ~184 MB weights, 0.13× realtime |
+| Connectome loading, sparse LIF simulation, GPU | **Working** — ~2.6 s load, ~116 MiB CSR weights, 0.19× realtime (`tools/benchmark.py`) |
 | Neuron-population mapping | **Working** — 13 roles, 138,625 of 138,639 neurons annotated |
 | Live 3D brain view (three.js + binary WebSocket) | **Working** — verified in a browser |
 | Temperature → light colour control loop | **Working end to end** — 31 K mean error, corr. 0.9971 |
 | Real Home Assistant wiring | **Working, read-only** — `HA_DRY_RUN=1` by default, never writes |
 | Second and further senses (motion, light level) | **Built, untrained** — wiring verified, readout not yet re-fitted |
 | Brian2 ground-truth validation | **Matching** — Jaccard 1.000 / 1.000 / 0.964 |
-| Real-time engine (active-set integrator) | **Not built** — see [`docs/engine.md`](docs/engine.md) |
+| Real-time engine | **Not reached** — the active-set integrator is built and validated bitwise-exact, but measured slower than dense under real drive, so it is opt-in (`FLYBRAIN_ENGINE=active`). See [`docs/engine.md`](docs/engine.md) |
 | Fly vision from a camera stream | **Designed only** — see [`docs/vision.md`](docs/vision.md) |
 
 ## Documentation
@@ -264,7 +268,7 @@ The interesting parts are the mistakes, so they are written down.
 
 ## Honest limitations
 
-- **It is not realtime.** 0.13× realtime means a 300 ms thought takes 2.3 s of wall clock.
+- **It is not realtime.** 0.19× realtime means a 300 ms thought takes about 1.6 s of wall clock.
 - **A frozen random network is not a classifier.** A fly connectome gives temporal memory,
   nonlinear expansion, and many outputs for one stepping cost. It does not reason or plan, and on
   any single narrow task it loses to a purpose-built model. The honest framing is *context*: let

@@ -255,7 +255,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Validate ConnectomeSim against Brian2.")
     ap.add_argument("--mode", choices=["ref", "ours", "compare"], default="compare")
     ap.add_argument("--ref-out", default=str(DEFAULT_REF_OUT))
-    ap.add_argument("--ours-out", default=str(DEFAULT_OURS_OUT))
+    ap.add_argument(
+        "--ours-out",
+        default=None,
+        help="where to write our spike counts; defaults to "
+        "data/validation/torch_out_<engine>.npz so a dense and an active run cannot clobber "
+        "each other",
+    )
     ap.add_argument("--neurons", type=int, default=4000)
     ap.add_argument("--drive", type=int, default=300)
     ap.add_argument("--duration", type=float, default=200.0)
@@ -264,7 +270,8 @@ def main() -> int:
         "--engine",
         choices=["dense", "active"],
         default="dense",
-        help="which simulator engine to validate in --mode ours (both must pass)",
+        help="which simulator engine to validate in --mode ours (write one file per engine, then "
+        "run --mode compare against each)",
     )
     ap.add_argument(
         "--no-augment",
@@ -273,6 +280,15 @@ def main() -> int:
         help="use only the real intra-slice synapses (no random edges)",
     )
     args = ap.parse_args()
+
+    # Per-engine by default. A single fixed path meant an `--engine active` run silently
+    # overwrote the dense counts, and `compare` could then only ever see whichever ran last —
+    # which is the opposite of "both must pass".
+    ours_out = (
+        Path(args.ours_out)
+        if args.ours_out
+        else DEFAULT_OURS_OUT.with_name(f"torch_out_{args.engine}.npz")
+    )
 
     _fly_ids, sub, drive_idx, real_neurons = build_subnetwork(
         args.neurons, args.drive, args.seed, augment=args.augment
@@ -293,12 +309,12 @@ def main() -> int:
 
     if args.mode == "ours":
         counts = run_torch(sub, schedule, real_neurons, n_drive, args.duration, args.engine)
-        np.savez(args.ours_out, counts=counts)
-        print(f"[ours:{args.engine}] total spikes: {int(counts.sum()):,} -> {args.ours_out}")
+        np.savez(ours_out, counts=counts)
+        print(f"[ours:{args.engine}] total spikes: {int(counts.sum()):,} -> {ours_out}")
         return 0
 
     ref = np.load(args.ref_out)["counts"]
-    ours = np.load(args.ours_out)["counts"]
+    ours = np.load(ours_out)["counts"]
     n = min(ref.size, ours.size)
     if ref.size != ours.size:
         print(f"note: sizes differ (brian2={ref.size}, ours={ours.size}); comparing first {n}")

@@ -103,7 +103,7 @@ document, which is why they are spelled out:
 
 | Fact | Measured | Consequence for this project |
 |---|---|---|
-| Latency, raw wall clock | 458–563 ms median | Too slow for 20 fps (50 ms), fine for a 2.3 s control tick |
+| Latency, raw wall clock | 458–563 ms median | Too slow for 20 fps (50 ms), fine for a ~1.6 s control tick |
 | Network floor alone | **198.8 ms** median (their machine) | "Anyone publishing a Jev latency number without measuring the floor is publishing their own geography" |
 | Latency, head-to-head median | 352 ms | Consistent with the raw range |
 | Cost per decision | **$0.0000153–$0.0000226** | ~20× *below* the $0.0004 figure in circulation |
@@ -254,7 +254,7 @@ send the raw 289-entity window when four summary numbers will do. See
 |---|---|---|
 | Render frame | 50 ms (20 fps) | **No** — 9× too slow |
 | Slow attention tick | ~15 s | Yes, comfortably |
-| Control loop decision | ~2.3 s | Yes, but see below |
+| Control loop decision | ~1.6 s | Yes, but see below |
 | Offline labeling | unbounded | Yes, and latency is irrelevant |
 
 **Jev never blocks a frame, a WebSocket message, or the control loop.** The wiring rules:

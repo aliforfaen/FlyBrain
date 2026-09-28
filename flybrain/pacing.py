@@ -75,16 +75,27 @@ FLAT_OUT = "flat_out"
 WAITING = "waiting"
 BURST = "burst"
 
-#: One decision consumes 300 ms of brain time, which costs ~2.34 s of GPU work at 0.13x
-#: realtime, and the measured power model is ``mean = IDLE_W + duty * LOAD_W``.
+#: One decision consumes 300 ms of brain time. Measured on 2026-09-28, on the shipped path
+#: (``MemoryBrain.advance()`` accumulated to a 300 ms window, dense engine, RTX 3070), that costs
+#: **1.60 s** of GPU work -- 0.53 ms/step over 3000 steps. The power model is
+#: ``mean = IDLE_W + duty * LOAD_W``.
 #:
-#: These numbers were re-verified on this machine with the pacing code in place: flat out measured
-#: 160 W total / 137 W above the paused floor, against the 165 / 146 below, and the floor here is
-#: 23.8 W rather than 19 W because a desktop compositor and other apps also hold the card. The
-#: *ratios* are the durable part, which is what the dashboard relies on — but note that what it
-#: shows is therefore a model of a machine, not a measurement of this one. docs/live-view.md owns
-#: the numbers and the method; change both together or neither.
-STEP_COST_S = 2.34
+#: The 2.34 s this constant used to hold was real when it was measured, and is the reason to keep
+#: the two facts apart: it was 0.78 ms/step *before* the int32 CSR indices and the constant-work
+#: fixes (``docs/engine.md``), so the dashboard was quoting the pre-optimisation cost and
+#: overstating the watts at any heartbeat. Re-measured with ``tools/benchmark.py`` (raw steps) and
+#: a window-path timing that agreed with it; the live loop's own decision path is what the constant
+#: describes, so if either changes, re-measure both.
+#:
+#: ``IDLE_W``/``LOAD_W`` are unchanged, and so are the measured wall watts below -- those were taken
+#: on 2026-09-27, *before* the step-time reduction, so at a given interval the current build should
+#: draw **less** than the table in ``docs/live-view.md``. flat out measured 160 W total / 137 W
+#: above the paused floor, against the 165 / 146 below, and the floor here is 23.8 W rather than
+#: 19 W because a desktop compositor and other apps also hold the card. The *ratios* are the durable
+#: part, which is what the dashboard relies on — but note that what it shows is therefore a model of
+#: a machine, not a measurement of this one. docs/live-view.md owns the numbers and the method;
+#: change both together or neither.
+STEP_COST_S = 1.60
 IDLE_W = 19.0
 LOAD_W = 146.0
 

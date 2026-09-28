@@ -69,8 +69,8 @@ is `frames × pixels ≤ ~10,000` and frame spacing near `tau_mem`.
 Set `window_ms` to ~50 ms and feed one frame per window, letting the recurrent state carry motion
 across windows.
 
-Attractive because it *also* raises the decision rate: 50 ms of brain time is ~385 ms of wall clock
-at 0.13×, so ~2.6 decisions/s instead of ~0.43. The costs: rate estimates per window get much
+Attractive because it *also* raises the decision rate: 50 ms of brain time is ~265 ms of wall clock
+at 0.19×, so ~3.8 decisions/s instead of ~0.6. The costs: rate estimates per window get much
 noisier (fewer spikes), and the trained readout is invalid — it was fitted on 300 ms windows.
 
 Route A is the better first move: no retraining of the window regime, no engine work.
@@ -79,7 +79,7 @@ Route A is the better first move: no retraining of the window regime, no engine 
 
 | Route | Rate | Notes |
 |---|---|---|
-| `GET /api/camera_proxy/<entity>` | **~1 fps** | Simplest. Already authenticated with the HA token, and read-only. Too slow for 8 frames per 2.3 s window (~2 frames), but fine for prototyping. |
+| `GET /api/camera_proxy/<entity>` | **~1 fps** | Simplest. Already authenticated with the HA token, and read-only. Too slow for 8 frames per 1.6 s window (~2 frames), but fine for prototyping. |
 | **RTSP substream** | any | The Tapo C120 exposes a substream (~640×360) as `stream2`. Needs a **camera account** created in the Tapo app — separate from the TP-Link cloud login. Pulling RTSP does not change camera state. |
 
 ```bash
@@ -107,18 +107,18 @@ The bottleneck is **not** the video path. It is the simulator.
 The simulator is **memory-bandwidth bound**, not compute bound:
 
 ```
-weights read per step : ~184 MB
-step time             : ~0.78 ms
-implied bandwidth     : ~236 GB/s
+weights read per step : ~116 MiB (int32 column indices + float32 values)
+step time             : ~0.53 ms
+implied bandwidth     : ~230 GB/s
 RTX 3070 peak         : ~448 GB/s
 ```
 
 Already at roughly half of peak bandwidth, reading the whole synapse matrix every step. A 4090
-(~1 TB/s) buys about **2.2×** — not the **~7.7×** needed for 1:1 realtime. So:
+(~1 TB/s) buys about **2.2×** — not the **~5.3×** needed for 1:1 realtime. So:
 
 - **Hardware does not solve realtime here.** The fix is algorithmic: the **active-set integrator**
   (only integrate neurons that can reach threshold), documented in [`engine.md`](engine.md).
-- **For the context layer, none of this matters.** At ~2.3 s per decision the brain is perfectly
+- **For the context layer, none of this matters.** At ~1.6 s per decision the brain is perfectly
   adequate for "the house is winding down", and the video path costs nothing extra. Realtime only
   matters if you want *reflexes* — and reflexes belong to Home Assistant automations anyway
   ([`roadmap.md`](roadmap.md#2-division-of-labour-ha-does-reflexes-the-fly-does-context)).

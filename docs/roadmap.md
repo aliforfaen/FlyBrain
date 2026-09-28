@@ -64,8 +64,8 @@ you will be disappointed.
 
 ## 2. Division of labour: HA does reflexes, the fly does context
 
-The hard constraint is speed. The simulator runs at **0.13× realtime** — a 300 ms window of brain
-time takes about **2.3 seconds** of wall clock. So:
+The hard constraint is speed. The simulator runs at **0.19× realtime** — a 300 ms window of brain
+time takes about **1.6 seconds** of wall clock. So:
 
 | Layer | Latency | Who does it |
 |---|---|---|
@@ -183,7 +183,7 @@ it alters the input distribution.
 
 ## 5. Applications, tiered
 
-Ranked by *actually useful* × *honest use of the reservoir* × *works at 0.13× realtime*.
+Ranked by *actually useful* × *honest use of the reservoir* × *works at 0.19× realtime*.
 
 ### Tier A — the context layer (best value, plays to the reservoir's strengths)
 
@@ -226,7 +226,7 @@ code is missing, but because the sensors are. This is what moved Tier A from "ni
 **B1. Cameras → `visual` (10,855 neurons) — half-unblocked.** The fly's motion pathway is its most
 famous circuit. Output a graded motion confidence plus per-hour novelty, so you are alerted when
 motion is *unusual for this time of day* rather than every time a cat walks past. Caveat: give the
-readout a longer window than 300 ms — motion is fast, and at 0.13× realtime the brain's own memory
+readout a longer window than 300 ms — motion is fast, and at 0.19× realtime the brain's own memory
 is short (see §6).
 
 **State as of the camera integration coming online:** the *streams* are up

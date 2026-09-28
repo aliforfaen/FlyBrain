@@ -9,6 +9,7 @@ and rescales it to roughly [-1, 1] so the renderer can use a simple camera.
 
 from __future__ import annotations
 
+import json
 import urllib.request
 from pathlib import Path
 
@@ -20,6 +21,10 @@ CODEX_DIR = ROOT / "data/codex"
 COORDS_GZ = CODEX_DIR / "coordinates.csv.gz"
 COMPLETENESS = ROOT / "vendor/fly-brain/data/2025_Completeness_783.csv"
 OUT = CODEX_DIR / "positions_normalized.npy"
+#: Provenance for the buffer, committed alongside the readout and documented in docs/data.md.
+#: It was written by hand once and the script stopped producing it, which is how a documented
+#: artifact goes stale; write it here so a regeneration cannot leave the two disagreeing.
+META = CODEX_DIR / "positions_meta.json"
 
 URL = "https://storage.googleapis.com/flywire-data/codex/data/fafb/783/coordinates.csv.gz"
 VOXEL_NM = np.array([4.0, 4.0, 40.0], dtype=np.float32)  # FlyWire FAFB voxel size
@@ -56,8 +61,23 @@ def main() -> int:
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     np.save(OUT, normalised.astype(np.float32))
+    # Deliberately byte-identical to the committed artifact, down to the integer nanometres and
+    # the absent trailing newline: if a regeneration produced a spurious diff, the file would stop
+    # being trustworthy as provenance for the buffer.
+    META.write_text(
+        json.dumps(
+            {
+                "n": int(normalised.shape[0]),
+                "scale_um": float(np.abs(microns).max()),
+                "voxel_nm": [int(v) for v in VOXEL_NM.tolist()],
+                "source": "codex fafb 783 coordinates.csv.gz",
+            },
+            indent=2,
+        )
+    )
     extent = (microns.max(axis=0) - microns.min(axis=0)).round(1)
     print(f"wrote {OUT}  shape={normalised.shape}  extent={extent.tolist()} um")
+    print(f"wrote {META}")
     return 0
 
 

@@ -1,30 +1,34 @@
-"""Does the colour readout survive being run as a live loop?
+"""The measurement that moved training from from-rest windows to a continuous sweep.
 
-The readout in ``flybrain/experiment.py`` is trained on windows that always start from a
-**resting** brain: ``sample()`` resets the simulator, drives at a fixed temperature for
-300 ms, and reads the spikes from that window.
+**Historical.** This is the probe whose result changed ``experiment.py``; it is kept because that
+finding is why *train and run in the same regime* is a rule here (``AGENTS.md`` #2), not because it
+still describes how the shipped readout is fitted.
 
-A live control loop does not work that way. The brain keeps running, the temperature drifts,
-and each decision reads the *most recent* 300 ms of an already-active network. A steady-state
-window is not the same as a transient-from-rest window, so the trained readout may simply not
-transfer.
+At the time, ``experiment.py`` trained on windows that always started from a **resting** brain:
+``sample()`` reset the simulator, drove at a fixed temperature for 300 ms, and read the spikes from
+that window. A live control loop does not work that way — the brain keeps running, the temperature
+drifts, and each decision reads the *most recent* 300 ms of an already-active network. This tool
+measured the difference directly, and the cross-over was bad enough that ``fit()`` now trains on
+``sweep()``, which is continuous by construction (see ``experiment.py``).
 
-This tool measures that directly. For each temperature it records two windows:
+It is still useful as a *contrast*. For each temperature it records two windows:
 
-* ``rest``   -- reset, drive for 300 ms, read that window (what ``experiment.py`` trains on)
-* ``live``   -- keep going another 300 ms, read that window (what a live loop would see)
+* ``rest`` -- reset, drive for 300 ms, read that window (the old training regime)
+* ``live`` -- keep going another 300 ms, read that window (what a live loop would see)
 
-then fits ridge readouts and reports held-out error for rest->rest, live->live, and the
-cross-over rest->live. If the cross-over is much worse, the readout has to be retrained in
-the regime the loop actually runs in.
+then fits ridge readouts and reports held-out error for rest->rest, live->live, and both
+cross-overs, plus a linear probe that tries to tell the two regimes apart. When that probe can
+separate them perfectly, pooling the two silently costs accuracy — which is what it found.
 
 Usage::
 
-    .venv/bin/python tools/loop_regime_probe.py
+    .venv/bin/python tools/loop_regime_probe.py            # collect + analyse
+    .venv/bin/python tools/loop_regime_probe.py --reuse    # analyse the cached windows
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -124,8 +128,18 @@ def analyse(d: dict) -> int:
     return 0
 
 
-def main() -> int:
-    if CACHE.exists() and "--reuse" in sys.argv:
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Compare the from-rest and continuous training regimes (historical probe)."
+    )
+    ap.add_argument(
+        "--reuse",
+        action="store_true",
+        help=f"analyse the cached windows in {CACHE} instead of re-simulating",
+    )
+    args = ap.parse_args(argv)
+
+    if CACHE.exists() and args.reuse:
         with np.load(CACHE) as z:
             d = {k: z[k] for k in ("temps", "ideal", "rest", "live")}
     else:

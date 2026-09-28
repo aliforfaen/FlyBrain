@@ -115,8 +115,9 @@ from there.
 
 ## Why the view is not a real-time brain
 
-`ConnectomeSim` runs the full 138,639-neuron network at about **0.13× realtime** on the RTX 3070
-(≈7 s of wall time per second of brain time). It cannot be driven at 20 Hz in real time.
+`ConnectomeSim` runs the full 138,639-neuron network at about **0.19× realtime** on the RTX 3070
+(≈5.2 s of wall time per second of brain time), measured by
+[`tools/benchmark.py`](../tools/benchmark.py). It cannot be driven at 20 Hz in real time.
 
 The dashboard handles this honestly rather than pretending: it advances a fixed window of brain
 time per published frame and displays the result at a comfortable rate, reporting both
@@ -256,6 +257,7 @@ But the number that matters is the one the *live loop* achieves, so it is measur
 continuously, one full three-minute cycle of the simulated room.
 
 ```
+$ .venv/bin/python tools/loop_accuracy.py --decisions 40
 decisions 40   mean |err| 31 K   max 104 K   correlation 0.9971
 mock service calls sent: 40
 ```
@@ -518,7 +520,7 @@ off vs −65…−112 K on) — but motion while detected and a lit room were **
 readout as unvalidated under real motion until it is re-fitted on recorded data. Details and
 numbers: [`wiring.md`](wiring.md#what-it-does-to-the-colour-readout-measured).
 
-The default is *off* for `FLYBRAIN_ALWAYS_ON` because the simulator runs at 0.13× realtime, so
+The default is *off* for `FLYBRAIN_ALWAYS_ON` because the simulator runs at 0.19× realtime, so
 keeping it turning permanently is a real cost. The consequence is worth stating plainly: **with
 the default settings the control loop only advances while the dashboard is open.** Set
 `FLYBRAIN_ALWAYS_ON=1` when it is meant to control something for real.
@@ -585,7 +587,10 @@ Measured on the RTX 3070 in this machine, sampling `nvidia-smi` power draw once 
 
 **Re-measured 2026-09-27, with the pacing code** — pause-then-interval, one probe at a time, and
 the browser closed (an earlier attempt was contaminated by a Chromium WebGL view of the point
-cloud, which alone holds the card around 49 W):
+cloud, which alone holds the card around 49 W). **This predates the 2026-09-28 step-time
+reduction**, so the "Model duty" column is the old `2.34 s / interval_s`; the current step costs
+**1.60 s**, which makes the model duty at 15 s ~11% instead of 15.6%. The *measured* watts below
+are still real, and are therefore an upper bound at any given interval for the current build:
 
 | `interval_s` | Model duty | Mean power | Above the floor | Model share | Measured share |
 |---|---|---|---|---|---|
@@ -598,14 +603,16 @@ holding the card), against the 19 W measured on an idle machine. So:
 
 - **The documented headroom holds.** Flat out measures 160 W total / 137 W attributable against the
   documented ~165 / ~146 — within about 6%. The `mean ≈ 19 W + duty × 146 W` model is sound.
-- **The default saves about 3.2×, not 4×.** 160 W → 50 W at a 15 s heartbeat on this machine, where
-  the floor is higher than the one the model was fitted on. The dashboard shows the model, not this
-  machine's floor; if that matters, it is one pair of constants in `flybrain/pacing.py`.
-- **1 Hz sampling cannot resolve a 3.9% duty cycle.** A decision is ~2.3 s of work, so a 55-sample
-  window catches roughly two of them and the mean is mostly floor. That row is *below the
-  resolution of the method*, not evidence against the model — and the `max` column is what shows
-  the work happening at all (126 W in an otherwise 24 W trace). Anyone re-measuring this should
-  sample faster or run longer than a minute.
+- **The default saved about 3.2× on this machine, not 4×, at the time it was measured.** 160 W →
+  50 W at a 15 s heartbeat here, where the floor is higher than the one the model was fitted on;
+  after the step-time reduction the same interval should land nearer the model's ~35 W. The
+  dashboard shows the model, not this machine's floor; if that matters, it is one pair of
+  constants in `flybrain/pacing.py`.
+- **1 Hz sampling cannot resolve a 3.9% duty cycle.** A decision was ~2.3 s of work at the time
+  (now ~1.6 s), so a 55-sample window catches roughly two of them and the mean is mostly floor.
+  That row is *below the resolution of the method*, not evidence against the model — and the `max`
+  column is what shows the work happening at all (126 W in an otherwise 24 W trace). Anyone
+  re-measuring this should sample faster or run longer than a minute.
 
 CPU is a non-issue throughout: **0.1%** of one core, live or paused.
 
@@ -617,16 +624,19 @@ meaningfully in two seconds. So `interval_s` defaults to **15 s**, and `FLYBRAIN
 puts flat out back for the demo.
 
 The arithmetic is simple, and worth stating because the window size is what makes it
-non-obvious. One decision consumes a **300 ms window of brain time**, which at ~0.78 ms per
-0.1 ms step costs about **2.3 s of GPU work**. So:
+non-obvious. One decision consumes a **300 ms window of brain time**, which at the measured
+**0.53 ms per 0.1 ms step** costs about **1.60 s of GPU work** (it was 2.34 s before the
+2026-09-28 constant-work fixes). So:
 
 ```
-duty cycle      = 2.34 s / interval_s
+duty cycle      = 1.60 s / interval_s
 mean power      ≈ 19 W + duty × 146 W
 ```
 
-Predicted 41.8 W at a 15 s interval; measured **39.8 W**. The model holds, which is why the
-dashboard can show the cost next to the control.
+The model predicts **41.8 W at a 15 s interval** using the old 2.34 s step cost, against a
+measured **39.8 W**; with the corrected 1.60 s it predicts **34.6 W**, and the measured figure
+for the current build has not been re-taken. The model holds, which is why the dashboard can show
+the cost next to the control — but it is a model, and its step cost is now the current one.
 
 `interval_s` is adjustable live from the dashboard (*Light connection* → *How often it
 decides*), which displays the estimated wattage as you change it.
@@ -692,7 +702,7 @@ more than the memory is worth.
 - The loop already does no GPU work at all when paused or when no client is connected and
   `FLYBRAIN_ALWAYS_ON` is unset.
 - Pacing also dilates brain time relative to wall clock: 300 ms of brain time per 15 s is
-  **0.02× realtime** rather than 0.13×. Fine for context, and the same knob discussed in
+  **0.02× realtime** rather than 0.19×. Fine for context, and the same knob discussed in
   [`roadmap.md`](roadmap.md#6-three-honest-constraints).
 - A poll passes `store=False` to `read_signals`. The snapshot the recorder writes must stay the
   reading that *drove* the window; a poll happens between decisions, so letting it become
@@ -806,8 +816,8 @@ Recorded so they do not have to be re-derived. Roughly in order of value per uni
   spotlight, which is what placement C would drive automatically. A slow loop that picks which
   family to emphasise would make the cloud readable on its own; it now has somewhere to plug in,
   since spotlighting is a single uniform.
-- **Real-time engine.** Everything above is cheap; this is not. 0.13× realtime means a decision
-  every ~2.3 s, which is fine for a thermostat and hopeless for anything that reacts. The
+- **Real-time engine.** Everything above is cheap; this is not. 0.19× realtime means a decision
+  every ~1.6 s, which is fine for a thermostat and hopeless for anything that reacts. The
   active-set integrator is the documented route (see `engine.md`).
 - ~~**A pet card, the three-layer explanation, a memory trail and trust controls.**~~ **Built** —
   see *The pet panels* above. ~~The click-through from a decision to a Jev verdict~~ **Built** —

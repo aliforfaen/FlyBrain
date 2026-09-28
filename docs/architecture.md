@@ -146,14 +146,23 @@ Measured on the RTX 3070 with the full 138,639-neuron / 15,091,983-synapse netwo
 
 | Quantity | Measured |
 |---|---|
-| load + build sparse matrix | 3.1 s |
-| VRAM for weights | ~184 MB (~200 MB peak while stepping) |
-| throughput | **0.13× realtime** — 0.78 s wall per 100 ms of brain time (≈7.7 s per 1 s) |
+| load + build sparse matrix | 2.6 s |
+| CSR weights (crow + int32 col + float32 values) | 115.7 MiB (57.6 MiB of values) |
+| CUDA peak, dense engine | 129 MiB |
+| throughput | **0.19× realtime** — 0.53 ms/step, 0.51–0.53 s wall per 100 ms of brain time (≈5.2 s per 1 s) |
+
+Re-measured 2026-09-28 by [`tools/benchmark.py`](../tools/benchmark.py), which reproduces the
+full table in [`engine.md`](engine.md). The older figures here (3.1 s load, ~184 MB for weights,
+0.13× realtime) were correct before the int32 column-index change halved the index array and the
+constant-work fixes took ~30% off the step; `engine.md` owns the before/after.
 
 This is why the design does not attempt naive real-time control. The reference benchmark
 results show the same story and identify the fix (see `docs/research/simulation-backends.md`):
 an **active-set integrator** that only integrates neurons which are actually active, rather
-than sweeping all 138k neurons every timestep.
+than sweeping all 138k neurons every timestep. That integrator was built and is bitwise-exact to
+the reference — and it is *slower* under real drive, because the per-step host overhead dominates
+when the network is busy (`engine.md`). The real-time path is compiled per-step code, not tensor
+surgery.
 
 The live view sidesteps this by publishing at a display rate while advancing a fixed window
 of brain time per frame; the control loop trains the readout offline over recorded episodes

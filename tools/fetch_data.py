@@ -89,18 +89,6 @@ def human(n: int) -> str:
     return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{n / 1e3:.0f} KB"
 
 
-def _expected_size(url: str) -> int | None:
-    """Ask the server how big the file should be; ``None`` if it will not say."""
-    try:
-        response = requests.head(url, allow_redirects=True, timeout=TIMEOUT_S)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"    ! could not reach the server: {exc}")
-        return None
-    raw = response.headers.get("Content-Length")
-    return int(raw) if raw and raw.isdigit() else None
-
-
 def download(source: Source, force: bool = False) -> bool:
     """Download one file if needed. Returns True if the file is present and complete."""
     dest = ROOT / source.dest

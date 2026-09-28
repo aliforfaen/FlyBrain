@@ -1,4 +1,4 @@
-"""Measure the live control loop end to end, exactly as the dashboard runs it.
+"""Measure the live control loop's *accuracy* end to end, against the mock house.
 
 ``flybrain.experiment`` reports a held-out error, but that is still an *offline* number:
 it sweeps the brain itself and never touches Home Assistant. This tool runs the real
@@ -9,9 +9,17 @@ reports the colour the loop actually emitted versus the ideal mapping.
 If this disagrees with the offline held-out figure, the offline figure is the one that is
 wrong, because this is the thing that ships.
 
+Scope, stated precisely because the obvious reading is wrong: this steps the brain **flat out**
+— one ``sim.step(window_ms)`` per decision, dense engine by default — and calls the loop's own
+``read_temperature`` / ``drive_temperature`` / ``decide``. It does *not* reproduce the dashboard's
+clock, which now steps ``MemoryBrain.advance()`` in 50 ms frames through the ``Pacer`` and selects
+the engine from ``FLYBRAIN_ENGINE``. What it measures is the readout's error on the decision path;
+what it does not measure is the loop's cadence or its power. For the engine itself, see
+``tools/benchmark.py``.
+
 Usage::
 
-    .venv/bin/python tools/loop_accuracy.py [--decisions 48] [--period 180]
+    .venv/bin/python tools/loop_accuracy.py [--decisions 48] [--period 180] [--engine dense]
 """
 
 from __future__ import annotations
@@ -28,11 +36,11 @@ sys.path.insert(0, str(ROOT))
 
 from flybrain.ha import Scenario
 from flybrain.loop import LoopConfig, build_loop
-from flybrain.sim import ConnectomeSim
+from flybrain.sim import make_sim
 
 
-async def run(decisions: int, period_s: float) -> int:
-    sim = ConnectomeSim().load()
+async def run(decisions: int, period_s: float, engine: str = "dense") -> int:
+    sim = make_sim(engine).load()
     loop = build_loop(sim, LoopConfig(mode="mock"))
     if loop is None:
         print("no trained readout - run `.venv/bin/python -m flybrain.experiment` first")
@@ -85,8 +93,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Measure the live loop end to end.")
     ap.add_argument("--decisions", type=int, default=48)
     ap.add_argument("--period", type=float, default=180.0)
+    ap.add_argument(
+        "--engine",
+        choices=["dense", "active"],
+        default="dense",
+        help="simulator engine; 'active' is bitwise-identical but slower under real drive",
+    )
     args = ap.parse_args()
-    return asyncio.run(run(args.decisions, args.period))
+    return asyncio.run(run(args.decisions, args.period, args.engine))
 
 
 if __name__ == "__main__":

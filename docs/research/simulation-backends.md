@@ -23,7 +23,7 @@ Target hardware and stack, assumed throughout: RTX 3070 (8 GB), Linux, Python 3.
 | Brian2GeNN | UNVERIFIED (CeCILL/GPL family) | 1.7.0 pins `Brian2<2.6` | Legacy 4.x CLI, `BRIAN2GENN_GENN_PATH`/`GENN_PATH` | **Avoid**; use direct PyGeNN. |
 | `flybrain` PyPI (`alextitonis/fly.ai`) | MIT | 0.1.0 (2026-09-13), `>=3.10` | CPU (numba) / GPU (CuPy); `flybrain/web.py` browser export | **Use as a library**; steal the browser export format. |
 | `nftechie/stonkfly` LIF kernel | MIT | Active | `ctypes` C++ kernel; direct `stimulation=[(indices, current)]` path | **Reuse as-is** (C++ kernel + state.py). |
-| Our `ConnectomeSim` (PyTorch sparse) | in-project | Working, 0.13x realtime | `inject`/`set_drive`, `spike_counts` | Kept; **not fast enough** for real-time without the active-set trick. |
+| Our `ConnectomeSim` (PyTorch sparse) | in-project | Working, 0.19x realtime | `inject`/`set_drive`, `spike_counts` | Kept; **not fast enough** for real-time without the active-set trick. |
 | Loihi 2 whole-FlyWire (Wang et al., Sandia, arXiv 2508.16792) | Likely restricted (UNVERIFIED) | Hardware demonstration | 992 dedicated spike counters, overcommitted | **Avoid** (no hardware, readout costs the speedup); steal SNN-dCSR. |
 | SpiNNaker whole-FlyWire | — | **No verified implementation found — UNVERIFIED / likely non-existent at whole-brain scale** | — | Ignore. |
 
@@ -52,8 +52,9 @@ Notes on the table:
 - A 3070 is expected to land near **0.8-1.4x realtime** for GeNN (UNVERIFIED on 3070; the 4070
   measurement is the evidence).
 
-**Why this matters for us:** our own `ConnectomeSim` measured 0.13x realtime on the 3070
-(see below), consistent with the PyTorch row. The benchmark says the win is not "more GPU" but
+**Why this matters for us:** our own `ConnectomeSim` measured 0.13x realtime on the 3070 when this
+survey was written, and **0.19x** after the 2026-09-28 int32-index and constant-work fixes (see
+below), consistent with the PyTorch row. The benchmark says the win is not "more GPU" but
 a different execution strategy — PyGeNN's code-generated kernels, or the active-set integrator
 below. Any plan that assumes the current PyTorch loop can be tuned into real time is wrong.
 
@@ -507,6 +508,11 @@ loop is ever closed from decoded motor commands into a physical fly. `eonsystems
 | peak VRAM during stepping | 208 MB |
 | throughput | 100 steps (10 ms brain) = 0.10 s wall; 1000 steps (100 ms) = 0.72 s wall |
 | realtime factor | **0.13x** (~7.7 s wall per 1 s brain) |
+
+*(Re-measured 2026-09-28, after the int32 CSR indices and constant-work fixes:
+2.6 s load, **115.7 MiB** CSR weights / 129 MiB CUDA peak, 0.53 ms/step, **0.19x realtime**.
+`tools/benchmark.py` reproduces it and `docs/engine.md` owns the before/after; the table above is
+the dated record of the state the survey was written against.)*
 
 The sparse weight matrix is built as COO -> `coalesce` -> `to_sparse_csr`; CSR `nnz` =
 15,091,983.

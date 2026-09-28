@@ -21,20 +21,23 @@ meant to answer "can it keep up?" — and the honest measured answer is "not thi
 ## Why the current engine is not enough
 
 Measured here, on the RTX 3070, full 138,639 neurons / 15,091,983 synapses at
-`dt = 0.1 ms`:
+`dt = 0.1 ms`, and reproduced by **`tools/benchmark.py`** (run it; it prints this table):
 
 | Measurement | Value |
 |---|---|
-| load + sparse matrix build | ~3 s |
-| VRAM for weights | ~184 MB (~200 MB peak while stepping) |
-| 1,000 steps (100 ms of brain time) | 0.78 s wall |
-| **throughput** | **0.13× realtime** |
+| load + sparse matrix build | ~2.6 s |
+| CSR weights (crow + int32 col + float32 values) | **115.7 MiB** (57.6 MiB of values) |
+| CUDA peak, dense engine | **129 MiB** |
+| 1,000 steps (100 ms of brain time) | 0.51–0.53 s wall |
+| **throughput** | **0.19× realtime** (0.53 ms/step) |
+
+*(The pre-optimisation figures were ~3 s load, **~184 MB for weights** — that was the same CSR
+structure with int64 column indices, which the int32 change below halved, so the number was right
+when written and is wrong now — 0.78 s/1000 steps and **0.13× realtime**. The published comparison
+stands.)*
 
 This matches the published benchmark for the same model: the PyTorch backend is the slowest of
 the six backends measured, roughly 0.10× realtime, while GeNN reaches ~2×.
-
-*(Re-measured after the constant-work below: **0.54 ms/step, 0.19× realtime**, same spike
-output. The published comparison stands.)*
 
 ### What was actually banked: cheaper constants on the dense step
 
@@ -91,18 +94,25 @@ the matmul, and a **pending counter** keeps a resting target in the active set f
 dense engine; on CUDA likewise; and the brian2 harness passes with it (Jaccard 1.000,
 spike-count ratio 1.000).
 
-Measured on the RTX 3070, full connectome, identical drive and identical output:
+Measured on the RTX 3070, full connectome, identical drive and identical output — re-measured
+2026-09-28 with `tools/benchmark.py`, which is the harness to trust now:
 
-| Scenario | dense (int32) | active-set |
-|---|---|---|
-| quiet (no drive, no spikes) | 0.48 s/1000 | **0.42 s/1000** (1.15× faster) |
-| single column, 8 neurons driven | **0.46 s/1000** | 0.79 s/1000 (1.7× slower) |
-| busy, 256 neurons driven | **0.53 s/1000** | 0.85 s/1000 (1.6× slower) |
+| Scenario | dense (int32) | active-set | spikes identical |
+|---|---|---|---|
+| quiet (no drive, no spikes) | 0.53 s/1000 | **0.34 s/1000** (1.60× faster) | yes (both zero) |
+| single column, 8 neurons driven | **0.51 s/1000** | 0.83 s/1000 (1.62× slower) | yes, Jaccard 1.000 |
+| busy, 256 neurons driven | **0.53 s/1000** | 0.80 s/1000 (1.49× slower) | yes, Jaccard 1.000 |
+
+The original measurement (quiet 0.48/0.42, column 0.46/0.79, busy 0.53/0.85) reached the same
+conclusion with slightly gentler ratios; the difference is warmup and the exact drive, which is
+why the harness is now committed rather than the numbers being carried by hand. The bitwise
+column is the point: the active engine is *not* fast here, but it is **exactly** the same network,
+so the loss is attributable to host overhead rather than to a changed model.
 
 Why it loses: the active list and the delivery size are data-dependent, so each step needs
 two `nonzero` calls and a length reduction — three device synchronisations that drain the
 pipeline the dense engine never drains — plus ~40 small kernel launches. That fixed host
-cost (~0.4 ms/step) is on the order of the entire dense step. And the work does not shrink
+cost (~0.3–0.4 ms/step) is on the order of the entire dense step. And the work does not shrink
 as much as the synapse count suggests: in the busy regime ~39k neurons sit in the active set
 (conductance tails plus pending input), so delivery and integration still touch 28% of the
 brain. `fly-brain-minecraft` reaches real time on CPU because a compiled language has no
@@ -134,8 +144,10 @@ reference for whatever replaces it.
 
 It is worth being precise, because full real-time is not required for the thing the user wants.
 
-- The **sensor→light** task needs a decision every few seconds, not every 100 ms. A 2 s control
-  tick with a 500 ms brain window is 25% duty cycle — already achievable.
+- The **sensor→light** task needs a decision every few seconds, not every 100 ms. At 0.19× realtime
+  a 300 ms window costs **~1.6 s** of GPU work, so a **5 s tick with a 300 ms window is a 32% duty
+  cycle and already achievable**. A 2 s tick with a 500 ms window is not, and the point is that it
+  does not need to be.
 - The **live view** publishes at 20 Hz while advancing a fixed window of brain time per frame,
   and reports both clocks so the decoupling is visible.
 - The **readout is trained offline** over recorded episodes, so training does not need to run
@@ -151,8 +163,9 @@ about stepping it faster. This section is about stepping it *less*, which requir
 
 ### Where the energy actually goes
 
-Measured here: one decision is 300 ms of brain time, which costs **~2.3 s of continuous GPU
-work** at 0.13× realtime. Flat out that is **~165 W continuously**. The shipped code no longer
+Measured here: one decision is 300 ms of brain time, which costs **~1.6 s of continuous GPU
+work** at 0.19× realtime (0.53 ms/step — re-measured 2026-09-28; it was ~2.3 s at the old
+0.13×). Flat out that is **~165 W continuously**. The shipped code no longer
 does that by default — `LoopConfig.interval_s` defaults to **15 s**, so an unconfigured install
 paces itself. Setting `FLYBRAIN_INTERVAL_S=0` puts flat out back, which is what the demo wants
 and what the live view was originally built around.
@@ -164,19 +177,26 @@ disagreeing about what a fresh install costs.)*
 
 `interval_s` gates the *decision*, and the loop genuinely does not advance the brain while it
 waits, so average power falls roughly with the duty cycle. The duty cycle is
-`2.34 s / interval_s`, and the measured model is `mean ≈ 19 W + duty × 146 W` — checked against
+`1.60 s / interval_s` (the `STEP_COST_S` in [`flybrain/pacing.py`](../flybrain/pacing.py), which
+the dashboard's estimate reads), and the model is `mean ≈ 19 W + duty × 146 W` — checked against
 the hardware in [`live-view.md`](live-view.md#why-the-default-is-paced),
 which owns the measurements:
 
 | `interval_s` | Duty cycle | Mean power | Energy per day |
 |---|---|---|---|
 | `0` (flat out) | 100% | ~165 W | **~4.0 kWh** |
-| `5` | 47% | ~86 W | ~2.1 kWh |
-| `15` | 16% | ~40 W | ~1.0 kWh |
-| `60` | 4% | ~25 W | **~0.6 kWh** |
+| `5` | 32% | ~66 W | ~1.6 kWh |
+| `15` | 11% | ~35 W | ~0.8 kWh |
+| `60` | 2.7% | ~23 W | **~0.6 kWh** |
 
-**One line in `.env` is worth roughly 4×.** `FLYBRAIN_INTERVAL_S=15` takes a multi-day recording
-from ~4 kWh/day to ~1 kWh/day, and a room does not change faster than that.
+*(The duty column uses the corrected 1.60 s step cost. The **measured** watts in
+`live-view.md` were taken on 2026-09-27, before the step-time reduction, so at a given interval
+the current build should draw no more than — and a little less than — those figures. The
+pre-speedup model agreed with those measurements to within a few percent, which is why correcting
+the constant is a small change in the estimate rather than a re-derivation of the model.)*
+
+**One line in `.env` is worth roughly 5×.** `FLYBRAIN_INTERVAL_S=15` takes a multi-day recording
+from ~4 kWh/day to ~0.8 kWh/day, and a room does not change faster than that.
 
 It is worth being clear about which knobs are *not* levers, because they look like they should
 be. `fps` barely matters: each iteration's `advance()` costs far more than the sleep it replaces,

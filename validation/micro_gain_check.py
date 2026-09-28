@@ -13,14 +13,18 @@ The reference model is::
     dv/dt = (v0 - v + g) / tau_m
     dg/dt = -g / tau_s
 
-For a step in which ``g`` is treated as constant (which is what Brian2's ``method='linear'``
-does -- it integrates the linear system exactly), the closed-form update is
+Brian2's ``method='linear'`` integrates the coupled ``(v, g)`` system exactly, so the per-step
+update is
 
-    v(t+dt) = v0 + g*(1 - exp(-dt/tau_m)) + (v(t) - v0)*exp(-dt/tau_m)
+    g(t+dt) = g(t)*exp(-dt/tau_s)
+    v(t+dt) = v0 + (v(t) + stim - v0)*exp(-dt/tau_m) + g(t)*alpha
+    alpha   = tau_s/(tau_m - tau_s) * (exp(-dt/tau_m) - exp(-dt/tau_s))
 
-Note the conductance coefficient is ``(1 - decay_v)``, which is ~0.005 for the published
-constants. It is *not* ``tau_m * (1 - decay_v)`` (~0.0998), which is a forward-Euler
-lookalike and over-weights every synapse by exactly ``tau_m`` = 20x.
+At the published constants ``alpha`` is **0.004938** mV per mV of ``g``. It is not the
+constant-``g`` approximation ``(1 - exp(-dt/tau_m))`` = 0.004988: that is only 1% larger, but it is
+a different model and 1% is measurable. And it is emphatically not the forward-Euler lookalike
+``tau_m * (1 - exp(-dt/tau_m))`` (~0.0998), which over-weights every synapse by exactly
+``tau_m`` = 20x.
 
 A single synaptic event of weight ``w`` produces a membrane deflection whose peak is
 (exact solution of the two-timescale linear system, from rest)::

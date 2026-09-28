@@ -427,8 +427,9 @@ class TestReporting:
         p = pacer(heartbeat_s=10.0)
         p.note_step(0.0)
         p.note_step(100.0)
-        # two steps * 2.34 s of work, over 100 s of wall clock
-        assert p.observed_duty(100.0) == pytest.approx(0.0468, abs=1e-4)
+        # two decisions * 1.60 s of measured GPU work, over 100 s of wall clock. The constant
+        # was 2.34 s before the 2026-09-28 step-time reduction; see flybrain/pacing.py.
+        assert p.observed_duty(100.0) == pytest.approx(0.032, abs=1e-4)
 
     def test_the_duty_cycle_cannot_exceed_one(self) -> None:
         p = pacer(heartbeat_s=1.0)
