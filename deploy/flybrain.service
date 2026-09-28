@@ -1,0 +1,61 @@
+# FlyBrain as a systemd *user* service.
+#
+# The path below assumes the README's clone location, `~/FlyBrain`. Install with
+# `deploy/install-service.sh`, which rewrites it to the real path of the checkout; to do it
+# by hand, either clone to `~/FlyBrain` or edit the path in the three places it appears, then:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/flybrain.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now flybrain.service
+#   journalctl --user -u flybrain -f
+#
+# The full guide — linger, configuration, GPU access, logs, upgrades, uninstall and the
+# traps — is docs/service.md. Read it before pointing this at a real house.
+
+[Unit]
+Description=FlyBrain — the FlyWire connectome driving a Home Assistant light
+Documentation=file://%h/FlyBrain/docs/service.md
+# Deliberately no After=network-online.target: user managers do not run that target, and the
+# Home Assistant client already catches transport errors and retries on the next poll, so the
+# service recovers by itself when the network or Home Assistant comes back.
+#
+# If it crash-loops, back off instead of hammering the GPU and filling the journal.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Load-bearing, not cosmetic: flybrain/recorder.py writes to the *relative* path
+# data/recordings, so without a working directory the recordings land somewhere in $HOME
+# instead of in the checkout. `.env` does not depend on this — flybrain/env.py resolves the
+# repository from its own location — but recording does.
+WorkingDirectory=%h/FlyBrain
+# There is deliberately no EnvironmentFile= here. The process loads `.env` itself, with one
+# set of quoting rules and one place to look, and `systemctl --user edit flybrain` is still
+# there for a real override. Environment= entries set here (or in a drop-in) win over `.env`,
+# because flybrain/env.py never overwrites a variable that is already set.
+#
+# Unbuffered, so `journalctl --user -u flybrain -f` shows a line as it happens rather than
+# whenever a pipe buffer happens to fill.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/FlyBrain/.venv/bin/python -m flybrain.server
+# uvicorn handles SIGTERM, and systemd signals the whole cgroup, so `systemctl --user stop
+# flybrain` is a clean shutdown rather than a `pkill` aimed by hand at a process id.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flybrain
+# The connectome is ~184 MB of weights plus ~1.8 GB of VRAM once loaded; nothing here caps
+# either, because a cap that is slightly too low turns into an OOM kill under a burst.
+NoNewPrivileges=true
+PrivateTmp=true
+# Do NOT add ProtectHome= or ProtectSystem=strict here. The trained readout, the neuron
+# positions and every recording are written *inside the checkout* under $HOME; making home
+# read-only makes recording fail, and it fails at the first window rather than at startup.
+
+[Install]
+WantedBy=default.target

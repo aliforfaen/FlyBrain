@@ -29,6 +29,8 @@ uv sync                                        # Python 3.11 → .venv (torch + 
 .venv/bin/python -m flybrain.server            # dashboard + live loop
 .venv/bin/python -m flybrain.wiring            # propose a pathway map for the house
 # → http://127.0.0.1:8765/
+
+deploy/install-service.sh --now               # or run it as a systemd user service (docs/service.md)
 ```
 
 **The large tables are not committed.** `tools/fetch_data.py` downloads the FlyWire v783
@@ -45,6 +47,11 @@ startup; real environment variables still win. `HA_DRY_RUN=1` keeps a real Home 
 **read-only** — the loop logs what it would send and changes nothing. Record windows for later
 training with `FLYBRAIN_RECORD=1`, and label a moment with
 `python -m flybrain.recorder --label busy`.
+
+Forgetting the `pkill` is not the only reason to run it under systemd: a foreground process dies
+with the terminal, and `FLYBRAIN_ALWAYS_ON=1` is required for it to step with no dashboard open.
+`deploy/install-service.sh` installs and enables a user service; [`docs/service.md`](docs/service.md)
+covers linger, logs, the `WorkingDirectory`/recording trap and troubleshooting.
 
 ## The five things worth knowing
 
@@ -113,6 +120,8 @@ training with `FLYBRAIN_RECORD=1`, and label a moment with
   configuration flag
 - [`docs/data.md`](docs/data.md) — schemas and provenance
 - [`docs/engine.md`](docs/engine.md) — performance and the real-time plan
+- [`docs/service.md`](docs/service.md) — running it as a systemd user service: linger, logs,
+  configuration precedence, the `WorkingDirectory`/recording trap, and troubleshooting
 - [`docs/roadmap.md`](docs/roadmap.md) — what to build next, and what the brain is honestly
   good for
 - [`docs/ha-inventory.md`](docs/ha-inventory.md) — the **real** house: which entities exist, and

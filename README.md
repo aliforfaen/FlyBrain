@@ -84,6 +84,25 @@ overrides the file.
 logs what it *would* send and changes nothing. Leave it on until you trust it; this project was
 developed against a live house and never wrote a single state.
 
+### Run it as a service
+
+A foreground terminal is fine for watching and wrong for a house: close the terminal and the
+brain is gone, and stopping it means matching a process id out of `ps`. Install it as a
+**systemd user service** instead:
+
+```bash
+deploy/install-service.sh --now      # install, enable, start
+systemctl --user status flybrain     # is it up?
+journalctl --user -u flybrain -f     # logs, no log file to rotate
+```
+
+It starts at login, restarts itself if it dies, and `systemctl --user stop flybrain` is a clean
+SIGTERM to the whole process instead of a `pkill` aimed by hand. One flag matters more than the
+rest: **`FLYBRAIN_ALWAYS_ON=1` in `.env`**, because a service has no dashboard open and without
+it the brain only steps while a browser is connected. Enable linger (`sudo loginctl enable-linger
+"$USER"`) to keep it running while you are logged out. The installer warns about all of this, and
+the traps are written up in [`docs/service.md`](docs/service.md).
+
 ## Which connectome this is
 
 | | |
@@ -230,6 +249,8 @@ The interesting parts are the mistakes, so they are written down.
 - **[`docs/live-view.md`](docs/live-view.md)** — the dashboard, the wire protocol, and every
   configuration flag
 - **[`docs/engine.md`](docs/engine.md)** — performance, power, and the real-time plan
+- **[`docs/service.md`](docs/service.md)** — running it as a systemd user service: autostart,
+  linger, logs, the `WorkingDirectory`/recording trap, upgrades and troubleshooting
 - **[`docs/data.md`](docs/data.md)** — schemas, provenance, parsing gotchas
 - **[`docs/wiring.md`](docs/wiring.md)** — which sensor drives which fly pathway, and why the order
   of those rules matters

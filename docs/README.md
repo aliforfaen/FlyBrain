@@ -27,6 +27,7 @@ See [`data.md`](data.md) for exactly what is fetched and from where.
 | [`live-view.md`](live-view.md) | The dashboard, the control loop, the WebSocket wire protocol, and every configuration flag |
 | [`data.md`](data.md) | How to fetch the data, schemas, provenance, parsing gotchas |
 | [`engine.md`](engine.md) | Performance, power draw, and the plan for a real-time engine |
+| [`service.md`](service.md) | Running it as a systemd **user service**: autostart, linger, logs, configuration precedence, the `WorkingDirectory`/recording trap, upgrades and troubleshooting |
 | [`wiring.md`](wiring.md) | Which Home Assistant entity drives which fly sensory pathway, and why the order of those rules matters |
 | [`jev.md`](jev.md) | The optional Jev judgment layer: **placement A (the decision inspector) is built and off by default**; placements B and C are design only. Most of it is the argument for where *not* to use a language model |
 | [`vision.md`](vision.md) | The camera → visual-column design. **Designed only, not built.** |
