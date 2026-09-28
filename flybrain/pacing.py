@@ -21,6 +21,23 @@ The scheme is a heartbeat plus a trigger:
 Both halves are load-bearing: the heartbeat is what makes the data learnable, the trigger is
 what makes it cheap.
 
+**A trigger firing buys one burst, not a licence.** Two failure modes were found in the live
+system in this exact configuration, and both are guarded here now:
+
+* **The stale-baseline refire.** Polling stops during a burst (it would only add Home Assistant
+  traffic), so the first poll after a burst compared against a *pre-burst* snapshot. Anything
+  that moved during the burst then fired a new burst immediately, chaining bursts forever. The
+  fix is in :meth:`Pacer.note_step`: when a burst expires, the comparison baseline is dropped,
+  so the next poll is a fresh baseline rather than a verdict on ten seconds of drift.
+* **The always-moving sensor.** A sensor whose reading moves by more than ``delta`` between
+  polls -- a fast demo scenario, a windy anemometer -- qualifies as "an event" on every poll,
+  and pacing silently becomes flat out: the most expensive possible misreading of the setting.
+  The cooldown caps this: a trigger can fire at most once per ``cooldown_s``, which defaults to
+  the heartbeat. That keeps the invariant the docs promise -- ``interval_s`` is the ceiling in
+  every mode, a trigger can only make decisions *sooner* -- while letting a genuinely busy
+  house still burst, once per heartbeat at most. Set
+  ``FLYBRAIN_TRIGGER_COOLDOWN_S=0`` to restore the unguarded behaviour.
+
 **The trigger is a comparison, not a model.** "Did something change?" is a local threshold
 question, and a threshold beats a model on it every time -- the same rule that keeps a model out
 of the regime probe. The intended long-term trigger is the reservoir's own prediction error
@@ -166,6 +183,7 @@ class Pacer:
         trigger_delta: float = 0.0,
         trigger: Trigger | None = None,
         primary_entity: str = "",
+        cooldown_s: float | None = None,
     ) -> None:
         """``heartbeat_s == 0`` means flat out, which is the pre-pacing behaviour exactly.
 
@@ -176,12 +194,22 @@ class Pacer:
         Passing an explicit ``trigger`` enables adaptive pacing regardless of ``trigger_delta``;
         that is the seam the A3 novelty trigger will use. With no trigger passed and a positive
         ``trigger_delta``, a :class:`ChangeTrigger` is built from ``primary_entity``.
+
+        ``cooldown_s`` caps how often the trigger may *fire*, independent of how often it
+        *qualifies*. ``None`` (the default) means the heartbeat: at most one trigger burst per
+        heartbeat window, which is what stops a fast-moving sensor from turning adaptive pacing
+        into flat out. ``0`` or negative disables the cap. The cap applies to any ``Trigger``,
+        injected ones included -- an A3 novelty trigger benefits from it just as much, since its
+        own error distribution can sit above threshold for minutes at a time.
         """
         self.heartbeat_s = max(0.0, float(heartbeat_s))
         self.poll_s = max(0.0, float(poll_s))
         self.burst_s = max(0.0, float(burst_s))
         self.trigger_delta = max(0.0, float(trigger_delta))
         self.primary_entity = primary_entity
+        # ``None`` means "track the heartbeat" rather than "no cooldown": a caller that leaves
+        # this unset gets the guarded behaviour, and only an explicit 0 opts out.
+        self.cooldown_s = self.heartbeat_s if cooldown_s is None else max(0.0, float(cooldown_s))
 
         if trigger is not None:
             self.trigger: Trigger | None = trigger
@@ -202,6 +230,7 @@ class Pacer:
         self._last_step: float | None = None
         self._last_poll: float | None = None
         self._burst_until: float | None = None
+        self._last_fire: float | None = None
         self._triggered = False
         self._previous: list[Signal] = []
         self._steps = 0
@@ -247,18 +276,31 @@ class Pacer:
         return (now - self._last_step) >= self.heartbeat_s
 
     def note_poll(self, now: float, signals: Sequence[Signal]) -> bool:
-        """Record a sensor poll; return whether it fired the trigger.
+        """Record a sensor poll; return whether it *started a burst*.
 
-        Firing starts the burst immediately, so the next :meth:`should_step` is ``True`` and the
-        event is captured from its first moment rather than up to a heartbeat later.
+        A trigger that qualifies while the cooldown is still running is deliberately reported
+        as ``False``: no burst happened, so callers must not treat this as an event. Firing
+        starts the burst immediately, so the next :meth:`should_step` is ``True`` and the event
+        is captured from its first moment rather than up to a heartbeat later.
         """
         self._last_poll = now
         fired = False
         if self.trigger is not None:
             fired = bool(self.trigger(self._previous, signals))
+            if (
+                fired
+                and self.cooldown_s > 0.0
+                and self._last_fire is not None
+                and (now - self._last_fire) < self.cooldown_s
+            ):
+                # The house moved again, but the last burst is still recent enough that this is
+                # more likely its tail than a new event. Not firing is not losing the event: the
+                # heartbeat still samples it, and `_previous` is refreshed below either way.
+                fired = False
         if fired:
             self._triggered = True
             self._burst_until = now + self.burst_s
+            self._last_fire = now
         self._previous = list(signals)
         return fired
 
@@ -271,6 +313,13 @@ class Pacer:
             self._started_at = now
         if self._burst_until is not None and now >= self._burst_until:
             self._burst_until = None
+            # The burst just ended and no polls happened during it, so `_previous` still holds
+            # the *pre-burst* reading. The next poll would compare ten-odd seconds of drift
+            # against `delta` and refire -- which is exactly how a burst becomes permanent.
+            # Dropping the baseline makes that poll a fresh start; the poll after it compares
+            # against something recent.
+            self._previous = []
+            self._last_poll = None
 
     def on_pause(self, now: float) -> None:
         """Reset the cadence so that resuming cannot fire a step instantly.
@@ -278,11 +327,13 @@ class Pacer:
         The previous *signals* are deliberately kept. A pause is not a change in the house, but
         the house may well have changed during one -- so the first poll after a resume compares
         against the pre-pause reading and bursts if it moved. That is the desirable behaviour:
-        the event happened, we simply were not looking.
+        the event happened, we simply were not looking. The cooldown, on the other hand, is
+        reset: a paused process was not spending, so there is nothing to be frugal about.
         """
         self._last_step = now
         self._last_poll = None
         self._burst_until = None
+        self._last_fire = None
         self._triggered = False
 
     def snapshot(self, now: float) -> dict:
@@ -316,6 +367,7 @@ class Pacer:
             "poll_s": self.poll_s,
             "burst_s": self.burst_s,
             "trigger_delta": self.trigger_delta,
+            "cooldown_s": self.cooldown_s,
             "trigger": type(self.trigger).__name__ if self.trigger is not None else None,
             "primary_entity": self.primary_entity,
             "triggered": self._triggered,

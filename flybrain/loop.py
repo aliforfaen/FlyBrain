@@ -153,6 +153,15 @@ class LoopConfig:
     #: reservoir's own prediction error (roadmap A3), which needs no threshold in degrees.
     trigger_delta: float = 0.0
 
+    #: How often the trigger may *fire*, in wall-clock seconds, independently of how often it
+    #: qualifies. ``None`` tracks the heartbeat: at most one trigger burst per heartbeat window.
+    #: This is the guard that stops a fast-moving sensor (a demo scenario swinging degrees per
+    #: second, a windy anemometer) from turning adaptive pacing into flat out -- measured live:
+    #: an 11 degC / 180 s mock swing against a 0.3 degC delta burst on literally every 5 s poll,
+    #: holding the GPU at ~85% / 161 W under a heartbeat configured for ~25 W. 0 disables the
+    #: cap. Pacing settings are part of the training regime, so this travels with ``to_dict()``.
+    trigger_cooldown_s: float | None = None
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> LoopConfig:
         """Build a config from environment variables.
@@ -184,6 +193,22 @@ class LoopConfig:
                 return float(raw)
             except ValueError:
                 # A typo in a unit file must not take the loop down; the default is safe.
+                logger.warning("ignoring non-numeric %s=%r", name, raw)
+                return default
+
+        def optional_number(name: str, default: float | None) -> float | None:
+            """Like ``number``, but an unset variable stays ``None`` instead of a number.
+
+            Some settings mean something different when they are absent than when they are
+            zero -- ``trigger_cooldown_s=None`` tracks the heartbeat, ``0`` disables the cap --
+            so "not in the environment" has to survive as its own value.
+            """
+            raw = e.get(name)
+            if raw is None or not raw.strip():
+                return default
+            try:
+                return float(raw)
+            except ValueError:
                 logger.warning("ignoring non-numeric %s=%r", name, raw)
                 return default
 
@@ -228,6 +253,9 @@ class LoopConfig:
             poll_s=number("FLYBRAIN_POLL_S", cls.poll_s),
             burst_s=number("FLYBRAIN_BURST_S", cls.burst_s),
             trigger_delta=number("FLYBRAIN_TRIGGER_DELTA", cls.trigger_delta),
+            trigger_cooldown_s=optional_number(
+                "FLYBRAIN_TRIGGER_COOLDOWN_S", cls.trigger_cooldown_s
+            ),
         )
 
     @property
@@ -260,6 +288,7 @@ class LoopConfig:
             "poll_s": self.poll_s,
             "burst_s": self.burst_s,
             "trigger_delta": self.trigger_delta,
+            "trigger_cooldown_s": self.trigger_cooldown_s,
         }
 
     def apply(self, patch: dict) -> None:
@@ -351,6 +380,7 @@ class LiveLoop:
             burst_s=self.loop.burst_s,
             trigger_delta=self.loop.trigger_delta,
             primary_entity=self.loop.temperature_entity,
+            cooldown_s=self.loop.trigger_cooldown_s,
         )
 
     # ------------------------------------------------------------ construction
@@ -878,6 +908,14 @@ class LiveLoop:
         for field_name in ("interval_s", "poll_s", "burst_s", "trigger_delta"):
             if getattr(self.loop, field_name) < 0:
                 setattr(self.loop, field_name, 0.0)
+        # None is a meaningful value for the cooldown ("track the heartbeat"), so it is kept
+        # out of the numeric floor above and floored here instead: a negative setting reads as
+        # "no cap", matching how the pacer clamps it.
+        if (
+            self.loop.trigger_cooldown_s is not None
+            and self.loop.trigger_cooldown_s < 0
+        ):
+            self.loop.trigger_cooldown_s = 0.0
         # Pacing settings were just replaced wholesale, so the pacer holds a stale copy of them.
         # Rebuilding rather than mutating keeps one definition of each setting: the config.
         self.pacer = self._build_pacer()

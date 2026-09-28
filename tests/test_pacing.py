@@ -265,6 +265,102 @@ class TestBurst:
         assert p.should_step(75.5) is True
 
 
+class TestTriggerCooldown:
+    """A trigger that qualifies on every poll must not turn pacing into flat out.
+
+    Measured live before the cooldown existed: the mock room swings ~1.9 degC between 5 s
+    polls against a 0.3 degC delta, so every poll fired, and a heartbeat configured for ~25 W
+    held the GPU at ~85% / 161 W. These tests pin the two guards: the cooldown caps how often
+    a trigger may *fire*, and the post-burst baseline refresh stops a burst from chaining into
+    the next one via a stale comparison.
+    """
+
+    def test_the_cooldown_defaults_to_the_heartbeat(self) -> None:
+        """One trigger burst per heartbeat window keeps interval_s the ceiling in every mode."""
+        p = pacer(heartbeat_s=60.0, trigger_delta=0.5)
+        assert p.cooldown_s == 60.0
+
+    def test_an_explicit_cooldown_overrides_the_default(self) -> None:
+        assert pacer(heartbeat_s=60.0, cooldown_s=3.0).cooldown_s == 3.0
+
+    def test_a_second_qualifying_move_within_the_cooldown_does_not_fire(self) -> None:
+        p = pacer(heartbeat_s=600.0, trigger_delta=0.5)  # cooldown tracks the 600 s heartbeat
+        p.note_step(0.0)
+        p.note_poll(0.0, [sig(TEMP, 20.0, "20.0")])
+        assert p.note_poll(5.0, [sig(TEMP, 21.0, "21.0")]) is True  # first fire
+        p.note_step(5.0)
+        # Polling resumes after the burst; the house keeps moving; the trigger keeps
+        # qualifying. The cooldown must keep every one of these from starting a burst.
+        p.note_poll(16.0, [sig(TEMP, 21.5, "21.5")])  # post-burst baseline (refresh test below)
+        assert p.note_poll(21.0, [sig(TEMP, 22.5, "22.5")]) is False
+        assert p.should_step(21.0) is False  # no burst was started
+        assert p.note_poll(26.0, [sig(TEMP, 23.5, "23.5")]) is False
+
+    def test_after_the_cooldown_the_trigger_fires_again(self) -> None:
+        p = pacer(heartbeat_s=60.0, trigger_delta=0.5)
+        p.note_step(0.0)
+        p.note_poll(0.0, [sig(TEMP, 20.0, "20.0")])
+        p.note_poll(5.0, [sig(TEMP, 21.0, "21.0")])  # fires; cooldown runs until 65
+        p.note_step(5.0)
+        p.note_poll(16.0, [sig(TEMP, 21.5, "21.5")])
+        assert p.note_poll(21.0, [sig(TEMP, 22.5, "22.5")]) is False  # 16 s in, still cooling
+        p.note_poll(26.0, [sig(TEMP, 23.5, "23.5")])
+        assert p.note_poll(66.0, [sig(TEMP, 24.5, "24.5")]) is True  # 61 s since the fire
+
+    def test_a_zero_cooldown_disables_the_cap(self) -> None:
+        """The pre-cooldown behaviour, kept reachable for anyone who wants the old semantics."""
+        p = pacer(heartbeat_s=600.0, trigger_delta=0.5, cooldown_s=0.0)
+        p.note_step(0.0)
+        p.note_poll(0.0, [sig(TEMP, 20.0, "20.0")])
+        p.note_poll(5.0, [sig(TEMP, 21.0, "21.0")])
+        p.note_step(5.0)
+        p.note_poll(16.0, [sig(TEMP, 21.5, "21.5")])
+        assert p.note_poll(21.0, [sig(TEMP, 22.5, "22.5")]) is True
+
+    def test_the_snapshot_reports_the_cooldown(self) -> None:
+        p = pacer(heartbeat_s=60.0, trigger_delta=0.5)
+        assert p.snapshot(1.0)["cooldown_s"] == 60.0
+
+    def test_a_pause_resets_the_cooldown(self) -> None:
+        """A paused process was not spending; resuming must not inherit frugality it didn't earn."""
+        p = pacer(heartbeat_s=600.0, trigger_delta=0.5)
+        p.note_poll(0.0, [sig(TEMP, 20.0, "20.0")])
+        p.note_poll(5.0, [sig(TEMP, 21.0, "21.0")])  # fires at 5
+        p.on_pause(6.0)
+        assert p.note_poll(100.0, [sig(TEMP, 30.0, "30.0")]) is True
+
+
+class TestBurstEndBaseline:
+    """Polling stops during a burst, so the post-burst comparison must not be stale.
+
+    Before the refresh existed, the first poll after a burst compared against the *pre-burst*
+    reading; ten seconds of drift later it refired, and bursts chained into each other forever.
+    """
+
+    def test_the_first_poll_after_a_burst_is_a_baseline(self) -> None:
+        p = pacer(heartbeat_s=600.0, burst_s=10.0, trigger_delta=0.5, cooldown_s=0.0)
+        p.note_poll(0.0, [sig(TEMP, 20.0, "20.0")])
+        p.note_poll(5.0, [sig(TEMP, 21.0, "21.0")])  # fires; burst until 15.0
+        p.note_step(5.0)
+        p.note_step(15.0)  # the step that expires the burst
+        assert p.should_poll(16.0) is True
+        # The house moved 1.4 degC during the burst. Compared against the pre-burst reading
+        # that fires; compared against nothing (a fresh baseline) it must not.
+        assert p.note_poll(16.0, [sig(TEMP, 21.4, "21.4")]) is False
+        # And the poll after it compares against something recent, as normal.
+        assert p.note_poll(21.0, [sig(TEMP, 21.6, "21.6")]) is False
+
+    def test_a_fresh_event_after_the_burst_still_fires(self) -> None:
+        """The refresh must not eat real events: a genuine move after the burst still bursts."""
+        p = pacer(heartbeat_s=600.0, burst_s=10.0, trigger_delta=0.5, cooldown_s=0.0)
+        p.note_poll(0.0, [sig(TEMP, 20.0, "20.0")])
+        p.note_poll(5.0, [sig(TEMP, 21.0, "21.0")])
+        p.note_step(5.0)
+        p.note_step(15.0)
+        p.note_poll(16.0, [sig(TEMP, 21.4, "21.4")])  # baseline
+        assert p.note_poll(21.0, [sig(TEMP, 22.5, "22.5")]) is True
+
+
 class TestPause:
     def test_resuming_waits_a_full_heartbeat(self) -> None:
         """A pause must not bank credit and fire the instant it resumes."""

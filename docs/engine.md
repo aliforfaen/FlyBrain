@@ -201,6 +201,7 @@ figures are not measured there because they cannot be.
 | `FLYBRAIN_POLL_S` | `5` | How often to re-read the sensors while waiting. Costs no GPU time |
 | `FLYBRAIN_BURST_S` | `10` | How long to run at full rate once something happens |
 | `FLYBRAIN_TRIGGER_DELTA` | `0` | How far the primary sensor must move, in its own units, to count as an event. `0` disables the trigger |
+| `FLYBRAIN_TRIGGER_COOLDOWN_S` | heartbeat | How often the trigger may *fire*, independently of how often it qualifies. Defaults to the heartbeat — at most one trigger burst per heartbeat window — which keeps `interval_s` the ceiling in every mode. `0` disables the cap |
 
 One field, one meaning: `interval_s` is the ceiling in every mode. A trigger can only make
 decisions *sooner*. A second, overlapping "mode" knob would be a way to express the same thing
@@ -213,6 +214,24 @@ state as its value — treating `"20.0" → "20.1"` as an event would make the t
 constantly and pacing would silently become "always burst", the most expensive possible
 misreading of the setting. Illuminance and humidity are *not* watched in v1; the multivariate
 answer is A3.
+
+**That failure arrived anyway, from the numeric side, and is now guarded.** Measured live:
+the mock room swings 11 °C over 180 s, so a 5 s poll saw ~1.9 °C of movement against a 0.3 °C
+delta — the trigger fired on *every* poll, and a heartbeat configured for ~25 W held the GPU at
+~85% / 161 W with the pet reporting "startled" 714 of 730 seconds. Two guards went in:
+
+- **Cooldown** (`FLYBRAIN_TRIGGER_COOLDOWN_S`, default = the heartbeat): a trigger can fire at
+  most once per cooldown window, however often it qualifies. This keeps the invariant above —
+  `interval_s` is the ceiling in every mode — while a genuinely busy house still bursts, once
+  per heartbeat at most. An injected A3 trigger is capped the same way.
+- **Burst-end baseline refresh**: polling stops during a burst, so the first post-burst poll
+  compared against a *pre-burst* snapshot and refired on the drift the burst itself had
+  captured. When a burst expires the comparison baseline is dropped, so that poll is a fresh
+  start and the chain is broken.
+
+Note the second guard matters even with the first: without the refresh, the first poll after
+every cooldown would compare against a minute-old baseline and fire on accumulated drift
+regardless of the threshold.
 
 The seam for A3 is the `Trigger` protocol. A trigger is an injected callable, so an A3 novelty
 trigger is constructed in `server.py` where the reservoir is in scope, closes over its own fitted
